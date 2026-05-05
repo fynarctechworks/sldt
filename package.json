@@ -1,0 +1,21 @@
+{
+  "name": "hoteldesk",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:web": "npm run dev --workspace=@hoteldesk/web",
+    "dev:api": "npm run dev --workspace=@hoteldesk/api",
+    "build:web": "npm run build --workspace=@hoteldesk/web",
+    "build:api": "npm run build --workspace=@hoteldesk/api",
+    "db:generate": "npm run db:generate --workspace=@hoteldesk/api",
+    "db:push": "npm run db:push --workspace=@hoteldesk/api",
+    "db:seed": "npm run db:seed --workspace=@hoteldesk/api"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

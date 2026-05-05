@@ -1,0 +1,97 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    @apply bg-bg text-textPrimary font-sans text-sm;
+  }
+}
+
+@layer components {
+  .card {
+    @apply bg-surface border border-borderc rounded-md p-4 shadow-[0_2px_8px_-2px_rgba(15,61,46,0.06)];
+  }
+  .btn-primary {
+    @apply bg-brand text-cream px-4 h-10 rounded-sm font-medium tracking-wide transition-colors hover:bg-brand-dark disabled:opacity-50 disabled:hover:bg-brand;
+  }
+  .btn-secondary {
+    @apply bg-surface text-brand border border-brand/40 px-4 h-10 rounded-sm font-medium transition-colors hover:bg-brand-soft hover:border-brand;
+  }
+  .btn-danger {
+    @apply bg-danger text-cream px-4 h-10 rounded-sm font-medium transition-colors hover:opacity-90;
+  }
+  .input {
+    @apply h-10 w-full border border-borderc bg-surface rounded-sm px-3 text-textPrimary outline-none transition-colors focus:border-brand focus:ring-2 focus:ring-brand/20 placeholder:text-textSecondary/60;
+  }
+  .label {
+    @apply text-[11px] font-semibold text-textSecondary uppercase tracking-[0.12em];
+  }
+  .table-base {
+    @apply w-full text-sm;
+  }
+  .table-base th {
+    @apply text-left font-semibold text-textSecondary text-[11px] uppercase tracking-[0.12em] px-3 py-2.5 border-b border-borderc bg-bg align-middle whitespace-nowrap;
+  }
+  .table-base td {
+    @apply px-3 py-2.5 border-b border-borderc align-middle;
+  }
+  .table-base tbody tr:nth-child(even) {
+    @apply bg-cream/40;
+  }
+  .table-base tbody tr:hover {
+    @apply bg-brand-soft/50;
+  }
+}
+
+@layer utilities {
+  @keyframes loader-spin-cw {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  @keyframes loader-spin-ccw {
+    to {
+      transform: rotate(-360deg);
+    }
+  }
+  @keyframes loader-pulse {
+    0%,
+    100% {
+      opacity: 0.4;
+      transform: scale(0.85);
+    }
+    50% {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+  @keyframes loader-shimmer {
+    0% {
+      background-position: -200% 0;
+    }
+    100% {
+      background-position: 200% 0;
+    }
+  }
+  .loader-shimmer-text {
+    background: linear-gradient(
+      90deg,
+      #666 0%,
+      #666 40%,
+      #1b2a4a 50%,
+      #666 60%,
+      #666 100%
+    );
+    background-size: 200% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    animation: loader-shimmer 2s linear infinite;
+  }
+}
