@@ -1,16 +1,12 @@
 import { boolean, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
 
 export const TEMPLATE_KEYS = [
-  "booking_created_guest_sms",
-  "booking_created_guest_email",
-  "booking_created_owner_sms",
   "checkin_guest_sms",
-  "checkin_guest_email",
   "checkin_owner_sms",
   "checkout_guest_sms",
-  "checkout_guest_email",
   "checkout_owner_sms",
   "otp_guest_sms",
+  "payment_reminder_guest_sms",
 ] as const;
 export type TemplateKey = (typeof TEMPLATE_KEYS)[number];
 

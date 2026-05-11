@@ -35,7 +35,7 @@ export type ReservationStatus = (typeof RESERVATION_STATUSES)[number];
 export const INVOICE_STATUSES = ["issued", "paid", "partial", "voided"] as const;
 export type InvoiceStatus = (typeof INVOICE_STATUSES)[number];
 
-export const PAYMENT_METHODS = ["cash", "upi", "card", "bank_transfer"] as const;
+export const PAYMENT_METHODS = ["cash", "upi", "card", "bank_transfer", "unpaid"] as const;
 export type PaymentMethod = (typeof PAYMENT_METHODS)[number];
 
 export const LINE_ITEM_TYPES = ["room_charge", "additional_charge"] as const;

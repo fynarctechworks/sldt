@@ -2,7 +2,7 @@ import { lazy, Suspense } from "react";
 import { Route, Routes } from "react-router-dom";
 import { AppShell } from "@/components/AppShell";
 import { Loader } from "@/components/Loader";
-import { ProtectedRoute, RoleGuard } from "@/auth/guards";
+import { PermissionGuard, ProtectedRoute } from "@/auth/guards";
 
 const Login = lazy(() => import("@/pages/Login"));
 const Dashboard = lazy(() => import("@/pages/Dashboard"));
@@ -19,6 +19,7 @@ const Reports = lazy(() => import("@/pages/Reports"));
 const Settings = lazy(() => import("@/pages/Settings"));
 const Messages = lazy(() => import("@/pages/Messages"));
 const Notifications = lazy(() => import("@/pages/Notifications"));
+const Collections = lazy(() => import("@/pages/Collections"));
 
 export default function App() {
   return (
@@ -42,9 +43,9 @@ export default function App() {
           element={
             <ProtectedRoute>
               <AppShell>
-                <RoleGuard allow={["admin", "frontdesk"]}>
+                <PermissionGuard any={["view_rooms"]}>
                   <Rooms />
-                </RoleGuard>
+                </PermissionGuard>
               </AppShell>
             </ProtectedRoute>
           }
@@ -54,9 +55,9 @@ export default function App() {
           element={
             <ProtectedRoute>
               <AppShell>
-                <RoleGuard allow={["admin"]}>
+                <PermissionGuard any={["edit_rooms"]}>
                   <RoomDetail />
-                </RoleGuard>
+                </PermissionGuard>
               </AppShell>
             </ProtectedRoute>
           }
@@ -67,9 +68,9 @@ export default function App() {
           element={
             <ProtectedRoute>
               <AppShell>
-                <RoleGuard allow={["admin", "frontdesk"]}>
+                <PermissionGuard any={["view_reservations"]}>
                   <Reservations />
-                </RoleGuard>
+                </PermissionGuard>
               </AppShell>
             </ProtectedRoute>
           }
@@ -79,9 +80,9 @@ export default function App() {
           element={
             <ProtectedRoute>
               <AppShell>
-                <RoleGuard allow={["admin", "frontdesk"]}>
+                <PermissionGuard any={["create_reservations"]}>
                   <NewReservation />
-                </RoleGuard>
+                </PermissionGuard>
               </AppShell>
             </ProtectedRoute>
           }
@@ -91,9 +92,9 @@ export default function App() {
           element={
             <ProtectedRoute>
               <AppShell>
-                <RoleGuard allow={["admin", "frontdesk"]}>
+                <PermissionGuard any={["view_reservations"]}>
                   <ReservationDetail />
-                </RoleGuard>
+                </PermissionGuard>
               </AppShell>
             </ProtectedRoute>
           }
@@ -104,9 +105,9 @@ export default function App() {
           element={
             <ProtectedRoute>
               <AppShell>
-                <RoleGuard allow={["admin", "frontdesk"]}>
+                <PermissionGuard any={["view_guests"]}>
                   <Guests />
-                </RoleGuard>
+                </PermissionGuard>
               </AppShell>
             </ProtectedRoute>
           }
@@ -116,9 +117,9 @@ export default function App() {
           element={
             <ProtectedRoute>
               <AppShell>
-                <RoleGuard allow={["admin", "frontdesk"]}>
+                <PermissionGuard any={["view_guests"]}>
                   <GuestProfile />
-                </RoleGuard>
+                </PermissionGuard>
               </AppShell>
             </ProtectedRoute>
           }
@@ -129,7 +130,9 @@ export default function App() {
           element={
             <ProtectedRoute>
               <AppShell>
-                <Housekeeping />
+                <PermissionGuard any={["view_housekeeping"]}>
+                  <Housekeeping />
+                </PermissionGuard>
               </AppShell>
             </ProtectedRoute>
           }
@@ -139,9 +142,9 @@ export default function App() {
           element={
             <ProtectedRoute>
               <AppShell>
-                <RoleGuard allow={["admin", "frontdesk"]}>
+                <PermissionGuard any={["view_activity"]}>
                   <Activity />
-                </RoleGuard>
+                </PermissionGuard>
               </AppShell>
             </ProtectedRoute>
           }
@@ -151,9 +154,9 @@ export default function App() {
           element={
             <ProtectedRoute>
               <AppShell>
-                <RoleGuard allow={["admin"]}>
+                <PermissionGuard any={["view_reports"]}>
                   <Reports />
-                </RoleGuard>
+                </PermissionGuard>
               </AppShell>
             </ProtectedRoute>
           }
@@ -163,9 +166,9 @@ export default function App() {
           element={
             <ProtectedRoute>
               <AppShell>
-                <RoleGuard allow={["admin"]}>
+                <PermissionGuard any={["manage_settings", "manage_staff", "manage_roles", "manage_templates"]}>
                   <Settings />
-                </RoleGuard>
+                </PermissionGuard>
               </AppShell>
             </ProtectedRoute>
           }
@@ -176,7 +179,9 @@ export default function App() {
           element={
             <ProtectedRoute>
               <AppShell>
-                <Messages />
+                <PermissionGuard any={["view_messages"]}>
+                  <Messages />
+                </PermissionGuard>
               </AppShell>
             </ProtectedRoute>
           }
@@ -186,7 +191,21 @@ export default function App() {
           element={
             <ProtectedRoute>
               <AppShell>
-                <Notifications />
+                <PermissionGuard any={["view_notifications"]}>
+                  <Notifications />
+                </PermissionGuard>
+              </AppShell>
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/collections"
+          element={
+            <ProtectedRoute>
+              <AppShell>
+                <PermissionGuard any={["view_collections"]}>
+                  <Collections />
+                </PermissionGuard>
               </AppShell>
             </ProtectedRoute>
           }

@@ -16,6 +16,7 @@ import {
 import { differenceInCalendarDays, format } from "date-fns";
 import { and, asc, desc, eq, gte, inArray, lte, sql } from "drizzle-orm";
 import { Router } from "express";
+import { z } from "zod";
 import { db } from "../db/client.js";
 import { additionalCharges, invoiceLineItems, invoices, payments } from "../db/schema/invoices.js";
 import { reservationRooms, reservations } from "../db/schema/reservations.js";
@@ -28,25 +29,25 @@ import {
 } from "../lib/availability.js";
 import { calcGstBreakdown, getGstRate } from "../lib/gst.js";
 import { invoiceNumber, reservationNumber } from "../lib/numbers.js";
-import { renderInvoicePdf } from "../lib/pdf.js";
+import { renderInvoicePdf, renderReceiptPdf } from "../lib/pdf.js";
 import { generateReceiptNumber } from "../lib/receipt.js";
+import { uploadPublicPdf } from "../lib/storage.js";
 import { dispatchNotification, notifyGuestEmail, notifyGuestSms, notifyOwner } from "../lib/notify.js";
 import { renderTemplate } from "../lib/templates.js";
 import { env } from "../config/env.js";
 import { invalidateDashboard } from "../lib/redis.js";
 import { fail, list, ok } from "../lib/response.js";
 import { getSettings } from "../lib/settings.js";
-import { requireAuth, requireRole } from "../middleware/auth.js";
+import { requireAuth, requirePermission } from "../middleware/auth.js";
 import { validate } from "../middleware/validate.js";
 import { guests } from "../db/schema/guests.js";
 
 const router = Router();
-const STAFF_ROLES = ["admin", "frontdesk"] as const;
 
 router.get(
   "/",
   requireAuth,
-  requireRole(...STAFF_ROLES),
+  requirePermission("view_reservations"),
   validate(reservationListQuerySchema, "query"),
   async (req, res) => {
     const { status, date, page, per_page } = req.query as unknown as {
@@ -89,7 +90,7 @@ router.get(
   },
 );
 
-router.get("/:id", requireAuth, requireRole(...STAFF_ROLES), async (req, res) => {
+router.get("/:id", requireAuth, requirePermission("view_reservations"), async (req, res) => {
   const id = req.params.id!;
   const r = await db.select().from(reservations).where(eq(reservations.id, id)).limit(1);
   if (!r.length) return fail(res, 404, "NOT_FOUND", "Reservation not found");
@@ -109,9 +110,11 @@ router.get("/:id", requireAuth, requireRole(...STAFF_ROLES), async (req, res) =>
   ]);
 
   const inv = await db.select().from(invoices).where(eq(invoices.reservationId, id)).limit(1);
-  const pays = inv.length
-    ? await db.select().from(payments).where(eq(payments.reservationId, id))
-    : [];
+  const pays = await db
+    .select()
+    .from(payments)
+    .where(eq(payments.reservationId, id))
+    .orderBy(desc(payments.paymentDate));
 
   const s = await getSettings();
 
@@ -130,7 +133,7 @@ router.get("/:id", requireAuth, requireRole(...STAFF_ROLES), async (req, res) =>
 router.post(
   "/",
   requireAuth,
-  requireRole(...STAFF_ROLES),
+  requirePermission("view_reservations"),
   validate(reservationCreateSchema),
   async (req, res) => {
     const input = req.body as import("@hoteldesk/shared").ReservationCreateInput;
@@ -163,7 +166,7 @@ router.post(
     const { gstAmount, grandTotal } = calcGstBreakdown(subtotal, gstRate);
     const balanceDue = +(grandTotal - input.advancePaid).toFixed(2);
 
-    const seq = await nextDailySequence("RES", `RES-${format(new Date(), "yyyyMMdd")}-%`);
+    const seq = await nextDailySequence("RES", `SLDT-RES-%`);
     const resNumber = reservationNumber(seq);
 
     const created = await db.transaction(async (tx) => {
@@ -233,19 +236,7 @@ router.post(
     void (async () => {
       try {
         const [g] = await db.select().from(guests).where(eq(guests.id, created.guestId)).limit(1);
-        const baseVars = {
-          hotel: env.HOTEL_DISPLAY_NAME,
-          guest_name: g?.fullName ?? "guest",
-          guest_phone: g?.phone ?? "",
-          guest_email: g?.email ?? "",
-          reservation_number: created.reservationNumber,
-          check_in_date: created.checkInDate,
-          check_out_date: created.checkOutDate,
-          nights: created.numNights ?? "",
-          total: created.grandTotal,
-          advance_paid: created.advancePaid,
-          balance: created.balanceDue,
-        };
+        // In-app notification only — no WhatsApp at booking creation (sent only on check-in/check-out).
         await dispatchNotification({
           type: "reservation_created",
           title: "New booking",
@@ -254,16 +245,6 @@ router.post(
           payload: { reservationId: created.id },
           recipientRoles: ["admin", "frontdesk"],
         });
-        if (g?.phone) {
-          const t = await renderTemplate("booking_created_guest_sms", baseVars);
-          if (t.enabled) await notifyGuestSms({ to: g.phone, text: t.body });
-        }
-        if (g?.email) {
-          const t = await renderTemplate("booking_created_guest_email", baseVars);
-          if (t.enabled) await notifyGuestEmail({ to: g.email, subject: t.subject ?? "", text: t.body });
-        }
-        const ownerT = await renderTemplate("booking_created_owner_sms", baseVars);
-        if (ownerT.enabled) await notifyOwner(ownerT.body);
       } catch {
         // best-effort, do not fail the booking
       }
@@ -277,7 +258,7 @@ router.post(
 router.post(
   "/:id/check-in",
   requireAuth,
-  requireRole(...STAFF_ROLES),
+  requirePermission("view_reservations"),
   validate(checkInSchema),
   async (req, res) => {
     const id = req.params.id!;
@@ -368,8 +349,56 @@ router.post(
         )
           .map((r) => r.n)
           .join(", ");
+
+        // Re-read fresh reservation totals (advance was just applied in the tx)
+        const [fresh] = await db.select().from(reservations).where(eq(reservations.id, id)).limit(1);
+        const total = fresh?.grandTotal ?? r[0]!.grandTotal;
+        const advancePaid = fresh?.advancePaid ?? r[0]!.advancePaid;
+        const balance = fresh?.balanceDue ?? r[0]!.balanceDue;
+
+        const settings = await getSettings();
+
+        // If an advance payment was just recorded, render & upload its receipt PDF
+        let receiptLink = "";
+        if ((input.advancePayment ?? 0) > 0) {
+          try {
+            const [latestPayment] = await db
+              .select()
+              .from(payments)
+              .where(eq(payments.reservationId, id))
+              .orderBy(desc(payments.createdAt))
+              .limit(1);
+            if (latestPayment) {
+              const pdf = await renderReceiptPdf({
+                payment: latestPayment,
+                reservation: r[0]!,
+                guest: g!,
+                invoice: null,
+                settings,
+              });
+              const url = await uploadPublicPdf(
+                `receipts/${latestPayment.receiptNumber ?? latestPayment.id}.pdf`,
+                pdf,
+              );
+              if (url) receiptLink = url;
+            }
+          } catch {
+            // best-effort; check-in message still goes
+          }
+        }
+
+        const wifiBlock =
+          settings.wifiSsid && settings.wifiPassword
+            ? `\n📶 Wi-Fi: ${settings.wifiSsid} / ${settings.wifiPassword}`
+            : "";
+        const receiptBlock = receiptLink ? `\n\nView receipt: ${receiptLink}` : "";
+
         const baseVars = {
           hotel: env.HOTEL_DISPLAY_NAME,
+          hotel_phone: settings.hotelPhone ?? "",
+          wifi_ssid: settings.wifiSsid ?? "",
+          wifi_password: settings.wifiPassword ?? "",
+          wifi_block: wifiBlock,
           guest_name: g?.fullName ?? "guest",
           guest_phone: g?.phone ?? "",
           guest_email: g?.email ?? "",
@@ -377,6 +406,11 @@ router.post(
           check_in_date: r[0]!.checkInDate,
           check_out_date: r[0]!.checkOutDate,
           room_numbers: roomNumbers,
+          total,
+          advance_paid: advancePaid,
+          balance,
+          receipt_link: receiptLink,
+          receipt_block: receiptBlock,
         };
         await dispatchNotification({
           type: "guest_checked_in",
@@ -389,10 +423,6 @@ router.post(
         if (g?.phone) {
           const t = await renderTemplate("checkin_guest_sms", baseVars);
           if (t.enabled) await notifyGuestSms({ to: g.phone, text: t.body });
-        }
-        if (g?.email) {
-          const t = await renderTemplate("checkin_guest_email", baseVars);
-          if (t.enabled) await notifyGuestEmail({ to: g.email, subject: t.subject ?? "", text: t.body });
         }
         const ownerT = await renderTemplate("checkin_owner_sms", baseVars);
         if (ownerT.enabled) await notifyOwner(ownerT.body);
@@ -409,7 +439,7 @@ router.post(
 router.post(
   "/:id/check-out",
   requireAuth,
-  requireRole(...STAFF_ROLES),
+  requirePermission("view_reservations"),
   validate(checkOutSchema),
   async (req, res) => {
     const id = req.params.id!;
@@ -491,14 +521,30 @@ router.post(
 
     const finalPayment = input.finalPayment ?? 0;
     const previouslyPaid = Number(r[0]!.advancePaid);
-    const totalPaid = +(previouslyPaid + finalPayment).toFixed(2);
+    const isUnpaid = input.paymentMethod === "unpaid";
+
+    // Require a method whenever any balance remains
+    const remainingBeforeFinal = +(grandTotal - previouslyPaid).toFixed(2);
+    if (remainingBeforeFinal > 0.009) {
+      if (!input.paymentMethod) {
+        return fail(res, 400, "PAYMENT_REQUIRED", "Payment method is required at check-out");
+      }
+      if (finalPayment <= 0.009) {
+        return fail(res, 400, "PAYMENT_REQUIRED", "Final payment amount is required at check-out");
+      }
+      if (isUnpaid && (!input.paymentNotes || input.paymentNotes.trim() === "")) {
+        return fail(res, 400, "NOTES_REQUIRED", "Notes are required for unpaid checkouts");
+      }
+    }
+
+    // Pending (unpaid) payments don't actually clear the balance
+    const realFinalPaid = isUnpaid ? 0 : finalPayment;
+    const totalPaid = +(previouslyPaid + realFinalPaid).toFixed(2);
     const balanceDue = +(grandTotal - totalPaid).toFixed(2);
     const invStatus =
       balanceDue <= 0.009 ? "paid" : totalPaid > 0 ? "partial" : "issued";
 
-    const invoiceSeq = await nextInvoiceSequence(
-      `${settings.invoicePrefix}-${format(new Date(), "yyyyMM")}-%`,
-    );
+    const invoiceSeq = await nextInvoiceSequence(`SLDT-INV-%`);
     const invNumber = invoiceNumber(settings.invoicePrefix, invoiceSeq);
     const cgstRate = +(roomGstRate / 2).toFixed(2);
     const sgstRate = +(roomGstRate / 2).toFixed(2);
@@ -546,7 +592,9 @@ router.post(
           reservationId: id,
           amount: String(finalPayment),
           paymentMethod: input.paymentMethod,
+          status: isUnpaid ? "pending" : "received",
           receivedBy: req.user!.id,
+          notes: input.paymentNotes ?? null,
         });
       }
 
@@ -573,61 +621,59 @@ router.post(
     void (async () => {
       try {
         const [g] = await db.select().from(guests).where(eq(guests.id, r[0]!.guestId)).limit(1);
+
+        // Generate invoice PDF and upload for public link
+        let invoiceLink = "";
+        try {
+          const [fullInv] = await db
+            .select()
+            .from(invoices)
+            .where(eq(invoices.invoiceNumber, invNumber))
+            .limit(1);
+          if (fullInv) {
+            const [items, pays, settings] = await Promise.all([
+              db.select().from(invoiceLineItems).where(eq(invoiceLineItems.invoiceId, fullInv.id)),
+              db.select().from(payments).where(eq(payments.invoiceId, fullInv.id)),
+              getSettings(),
+            ]);
+            const pdf = await renderInvoicePdf({
+              invoice: fullInv,
+              lineItems: items,
+              payments: pays,
+              settings,
+            });
+            const url = await uploadPublicPdf(`invoices/${invNumber}.pdf`, pdf);
+            if (url) invoiceLink = url;
+          }
+        } catch {
+          // best-effort; link stays blank, message still sends
+        }
+
+        const settingsCo = await getSettings();
         const baseVars = {
           hotel: env.HOTEL_DISPLAY_NAME,
+          hotel_phone: settingsCo.hotelPhone ?? "",
           guest_name: g?.fullName ?? "guest",
           guest_phone: g?.phone ?? "",
           guest_email: g?.email ?? "",
           reservation_number: r[0]!.reservationNumber,
+          check_out_date: r[0]!.checkOutDate,
           invoice_number: invNumber,
+          invoice_link: invoiceLink,
           total: r[0]!.grandTotal,
         };
+
         await dispatchNotification({
           type: "guest_checked_out",
           title: "Guest checked out",
           body: `${g?.fullName ?? "Guest"} (${r[0]!.reservationNumber}). Invoice ${invNumber}.`,
           href: `/reservations/${id}`,
-          payload: { reservationId: id, invoiceNumber: invNumber },
+          payload: { reservationId: id, invoiceNumber: invNumber, invoiceLink },
           recipientRoles: ["admin", "frontdesk", "housekeeping"],
         });
         if (g?.phone) {
           const t = await renderTemplate("checkout_guest_sms", baseVars);
           if (t.enabled) await notifyGuestSms({ to: g.phone, text: t.body });
-        }
-        if (g?.email) {
-          let attachments: { filename: string; content: Buffer }[] | undefined;
-          try {
-            const [fullInv] = await db
-              .select()
-              .from(invoices)
-              .where(eq(invoices.invoiceNumber, invNumber))
-              .limit(1);
-            if (fullInv) {
-              const [items, pays, settings] = await Promise.all([
-                db.select().from(invoiceLineItems).where(eq(invoiceLineItems.invoiceId, fullInv.id)),
-                db.select().from(payments).where(eq(payments.invoiceId, fullInv.id)),
-                getSettings(),
-              ]);
-              const pdf = await renderInvoicePdf({
-                invoice: fullInv,
-                lineItems: items,
-                payments: pays,
-                settings,
-              });
-              attachments = [{ filename: `${invNumber}.pdf`, content: pdf }];
-            }
-          } catch {
-            // PDF attach best-effort; email still goes
-          }
-          const t = await renderTemplate("checkout_guest_email", baseVars);
-          if (t.enabled) {
-            await notifyGuestEmail({
-              to: g.email,
-              subject: t.subject ?? "",
-              text: t.body,
-              attachments,
-            });
-          }
         }
         const ownerT = await renderTemplate("checkout_owner_sms", baseVars);
         if (ownerT.enabled) await notifyOwner(ownerT.body);
@@ -653,7 +699,7 @@ router.post(
 router.post(
   "/:id/cancel",
   requireAuth,
-  requireRole(...STAFF_ROLES),
+  requirePermission("view_reservations"),
   validate(cancelSchema),
   async (req, res) => {
     const id = req.params.id!;
@@ -700,7 +746,7 @@ router.post(
 router.post(
   "/:id/swap-room",
   requireAuth,
-  requireRole(...STAFF_ROLES),
+  requirePermission("view_reservations"),
   validate(swapRoomSchema),
   async (req, res) => {
     const id = req.params.id!;
@@ -760,7 +806,7 @@ router.post(
 router.post(
   "/:id/charges",
   requireAuth,
-  requireRole(...STAFF_ROLES),
+  requirePermission("view_reservations"),
   validate(additionalChargeSchema),
   async (req, res) => {
     const id = req.params.id!;
@@ -779,6 +825,7 @@ router.post(
       })
       .returning();
 
+    await recalcReservation(id);
     await logActivity({
       action: "charge_added",
       entityType: "reservation",
@@ -787,6 +834,7 @@ router.post(
       performedBy: req.user!.id,
       ipAddress: req.ip,
     });
+    await invalidateDashboard();
     return ok(res, created, 201);
   },
 );
@@ -794,7 +842,7 @@ router.post(
 router.post(
   "/:id/extend",
   requireAuth,
-  requireRole(...STAFF_ROLES),
+  requirePermission("view_reservations"),
   validate(extendReservationSchema),
   async (req, res) => {
     const id = req.params.id!;
@@ -824,38 +872,16 @@ router.post(
       }
     }
 
-    const settings = await getSettings();
-    const newNights = differenceInCalendarDays(
-      new Date(input.newCheckOutDate),
-      new Date(current.checkInDate),
-    );
-
     const perRoomRate = input.ratePerNight ?? Number(current.ratePerNight);
-    const subtotal = +(perRoomRate * newNights * assigned.length).toFixed(2);
-    const gstRate = getGstRate(perRoomRate, {
-      exemptBelow: Number(settings.gstSlabExemptBelow),
-      lowRate: Number(settings.gstSlabLowRate),
-      lowMax: Number(settings.gstSlabLowMax),
-      highRate: Number(settings.gstSlabHighRate),
-    });
-    const { gstAmount, grandTotal } = calcGstBreakdown(subtotal, gstRate);
-    const balanceDue = +(grandTotal - Number(current.advancePaid)).toFixed(2);
 
-    const [updated] = await db
+    await db
       .update(reservations)
       .set({
         checkOutDate: input.newCheckOutDate,
-        numNights: newNights,
         ratePerNight: String(perRoomRate.toFixed(2)),
-        subtotal: String(subtotal),
-        gstRate: String(gstRate),
-        gstAmount: String(gstAmount),
-        grandTotal: String(grandTotal),
-        balanceDue: String(balanceDue),
         updatedAt: new Date(),
       })
-      .where(eq(reservations.id, id))
-      .returning();
+      .where(eq(reservations.id, id));
 
     if (input.ratePerNight) {
       await db
@@ -863,6 +889,13 @@ router.post(
         .set({ ratePerNight: String(input.ratePerNight) })
         .where(eq(reservationRooms.reservationId, id));
     }
+
+    await recalcReservation(id);
+    const [updated] = await db
+      .select()
+      .from(reservations)
+      .where(eq(reservations.id, id))
+      .limit(1);
 
     await logActivity({
       action: "reservation_extended",
@@ -881,7 +914,7 @@ router.post(
 router.post(
   "/:id/late-checkout",
   requireAuth,
-  requireRole(...STAFF_ROLES),
+  requirePermission("view_reservations"),
   validate(lateCheckoutSchema),
   async (req, res) => {
     const id = req.params.id!;
@@ -936,7 +969,7 @@ router.post(
 router.post(
   "/:id/add-room",
   requireAuth,
-  requireRole(...STAFF_ROLES),
+  requirePermission("view_reservations"),
   validate(addRoomSchema),
   async (req, res) => {
     const id = req.params.id!;
@@ -1058,21 +1091,26 @@ async function recalcReservation(id: string) {
 
   const settings = await getSettings();
   const avgRate = assigned.length ? roomSubtotal / (nights * assigned.length) : 0;
-  const gstRate = getGstRate(avgRate, {
+  const roomGstRate = getGstRate(avgRate, {
     exemptBelow: Number(settings.gstSlabExemptBelow),
     lowRate: Number(settings.gstSlabLowRate),
     lowMax: Number(settings.gstSlabLowMax),
     highRate: Number(settings.gstSlabHighRate),
   });
-  const { gstAmount, grandTotal } = calcGstBreakdown(subtotal, gstRate);
+  const roomGst = +(roomSubtotal * (roomGstRate / 100)).toFixed(2);
+  const chargesGst = charges.reduce(
+    (a, c) => a + +(Number(c.amount) * (Number(c.gstRate) / 100)).toFixed(2),
+    0,
+  );
+  const gstAmount = +(roomGst + chargesGst).toFixed(2);
+  const grandTotal = +(subtotal + gstAmount).toFixed(2);
   const balanceDue = +(grandTotal - Number(current.advancePaid)).toFixed(2);
 
   await db
     .update(reservations)
     .set({
-      numNights: nights,
       subtotal: String(subtotal),
-      gstRate: String(gstRate),
+      gstRate: String(roomGstRate),
       gstAmount: String(gstAmount),
       grandTotal: String(grandTotal),
       balanceDue: String(balanceDue),
@@ -1094,7 +1132,7 @@ async function hasInvoice(reservationId: string) {
 router.patch(
   "/:id/rooms/:roomId",
   requireAuth,
-  requireRole(...STAFF_ROLES),
+  requirePermission("view_reservations"),
   validate(editRoomRateSchema),
   async (req, res) => {
     const { id, roomId } = req.params as { id: string; roomId: string };
@@ -1129,7 +1167,7 @@ router.patch(
 router.patch(
   "/:id/charges/:chargeId",
   requireAuth,
-  requireRole(...STAFF_ROLES),
+  requirePermission("view_reservations"),
   validate(editChargeSchema),
   async (req, res) => {
     const { id, chargeId } = req.params as { id: string; chargeId: string };
@@ -1180,7 +1218,7 @@ router.patch(
 router.delete(
   "/:id/charges/:chargeId",
   requireAuth,
-  requireRole(...STAFF_ROLES),
+  requirePermission("view_reservations"),
   async (req, res) => {
     const { id, chargeId } = req.params as { id: string; chargeId: string };
     if (await hasInvoice(id)) {
@@ -1208,7 +1246,7 @@ router.delete(
 router.patch(
   "/:id/dates",
   requireAuth,
-  requireRole(...STAFF_ROLES),
+  requirePermission("view_reservations"),
   validate(editDatesSchema),
   async (req, res) => {
     const id = req.params.id!;
@@ -1252,7 +1290,7 @@ router.patch(
   },
 );
 
-router.get("/:id/charges", requireAuth, requireRole(...STAFF_ROLES), async (req, res) => {
+router.get("/:id/charges", requireAuth, requirePermission("view_reservations"), async (req, res) => {
   const id = req.params.id!;
   const rows = await db
     .select()
@@ -1261,5 +1299,237 @@ router.get("/:id/charges", requireAuth, requireRole(...STAFF_ROLES), async (req,
     .orderBy(asc(additionalCharges.createdAt));
   return ok(res, rows);
 });
+
+router.get(
+  "/:id/invoice-preview",
+  requireAuth,
+  requirePermission("view_reservations"),
+  async (req, res) => {
+    const id = req.params.id!;
+    const r = await db.select().from(reservations).where(eq(reservations.id, id)).limit(1);
+    if (!r.length) return fail(res, 404, "NOT_FOUND", "Reservation not found");
+
+    const settings = await getSettings();
+    const guest = (await db.select().from(guests).where(eq(guests.id, r[0]!.guestId)).limit(1))[0]!;
+    const resRooms = await db
+      .select({ rr: reservationRooms, room: rooms })
+      .from(reservationRooms)
+      .innerJoin(rooms, eq(rooms.id, reservationRooms.roomId))
+      .where(eq(reservationRooms.reservationId, id));
+    const charges = await db
+      .select()
+      .from(additionalCharges)
+      .where(eq(additionalCharges.reservationId, id));
+
+    const nights = Number(r[0]!.numNights);
+    const roomGstRate = Number(r[0]!.gstRate);
+
+    let subtotal = 0;
+    const lineItems = [] as Array<{
+      id: string;
+      invoiceId: string;
+      description: string;
+      sacCode: string;
+      quantity: number;
+      rate: string;
+      amount: string;
+      gstRate: string;
+      gstAmount: string;
+      itemType: "room_charge" | "additional_charge";
+      createdAt: Date;
+    }>;
+    const now = new Date();
+
+    for (const rr of resRooms) {
+      const rate = Number(rr.rr.ratePerNight);
+      const amount = +(rate * nights).toFixed(2);
+      const gstAmount = +(amount * (roomGstRate / 100)).toFixed(2);
+      subtotal += amount;
+      lineItems.push({
+        id: `preview-${rr.room.id}`,
+        invoiceId: "preview",
+        description: `Room ${rr.room.roomNumber} - ${rr.room.roomType} (${nights} nights)`,
+        sacCode: "9963",
+        quantity: nights,
+        rate: String(rate),
+        amount: String(amount),
+        gstRate: String(roomGstRate),
+        gstAmount: String(gstAmount),
+        itemType: "room_charge",
+        createdAt: now,
+      });
+    }
+
+    let totalGst = +(subtotal * (roomGstRate / 100)).toFixed(2);
+    for (const c of charges) {
+      const amount = Number(c.amount);
+      const gstAmount = +(amount * (Number(c.gstRate) / 100)).toFixed(2);
+      subtotal += amount;
+      totalGst += gstAmount;
+      lineItems.push({
+        id: `preview-${c.id}`,
+        invoiceId: "preview",
+        description: c.description,
+        sacCode: "9963",
+        quantity: c.quantity,
+        rate: String(c.rate),
+        amount: String(amount),
+        gstRate: String(c.gstRate),
+        gstAmount: String(gstAmount),
+        itemType: "additional_charge",
+        createdAt: now,
+      });
+    }
+
+    subtotal = +subtotal.toFixed(2);
+    totalGst = +totalGst.toFixed(2);
+    const cgst = +(totalGst / 2).toFixed(2);
+    const sgst = +(totalGst - cgst).toFixed(2);
+    const grandTotal = +(subtotal + totalGst).toFixed(2);
+    const totalPaid = Number(r[0]!.advancePaid);
+    const balanceDue = +(grandTotal - totalPaid).toFixed(2);
+    const status: "issued" | "partial" | "paid" =
+      balanceDue <= 0.009 ? "paid" : totalPaid > 0 ? "partial" : "issued";
+
+    const previewInvoice = {
+      id: "preview",
+      invoiceNumber: "PREVIEW (not issued)",
+      reservationId: id,
+      guestId: r[0]!.guestId,
+      hotelName: settings.hotelName,
+      hotelAddress: settings.hotelAddress,
+      hotelGstin: settings.hotelGstin,
+      guestName: guest.fullName,
+      guestAddress: guest.address ?? null,
+      guestGstin: guest.gstin ?? null,
+      subtotal: String(subtotal),
+      cgstRate: String(+(roomGstRate / 2).toFixed(2)),
+      cgstAmount: String(cgst),
+      sgstRate: String(+(roomGstRate / 2).toFixed(2)),
+      sgstAmount: String(sgst),
+      grandTotal: String(grandTotal),
+      totalPaid: String(totalPaid),
+      balanceDue: String(balanceDue),
+      status,
+      notes: null as string | null,
+      reissuedFrom: null as string | null,
+      voidedReason: null as string | null,
+      voidedBy: null as string | null,
+      issuedBy: req.user!.id,
+      issueDate: now,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const existingPays = await db
+      .select()
+      .from(payments)
+      .where(eq(payments.reservationId, id))
+      .orderBy(desc(payments.paymentDate));
+
+    const pdf = await renderInvoicePdf({
+      invoice: previewInvoice as never,
+      lineItems: lineItems as never,
+      payments: existingPays,
+      settings,
+    });
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `inline; filename="${r[0]!.reservationNumber}-preview.pdf"`,
+    );
+    return res.send(pdf);
+  },
+);
+
+const advancePaymentSchema = z.object({
+  amount: z.coerce.number().positive(),
+  paymentMethod: z.enum(["cash", "upi", "card", "bank_transfer"]),
+  notes: z.string().max(500).optional(),
+});
+
+router.post(
+  "/:id/payments",
+  requireAuth,
+  requirePermission("view_reservations"),
+  validate(advancePaymentSchema),
+  async (req, res) => {
+    const id = req.params.id!;
+    const input = req.body as z.infer<typeof advancePaymentSchema>;
+
+    const r = await db.select().from(reservations).where(eq(reservations.id, id)).limit(1);
+    if (!r.length) return fail(res, 404, "NOT_FOUND", "Reservation not found");
+    if (r[0]!.status === "cancelled") {
+      return fail(res, 409, "CANCELLED", "Reservation is cancelled");
+    }
+
+    const existingInvoice = await db
+      .select()
+      .from(invoices)
+      .where(eq(invoices.reservationId, id))
+      .limit(1);
+
+    const created = await db.transaction(async (tx) => {
+      const rcpNum = await generateReceiptNumber();
+      const [pay] = await tx
+        .insert(payments)
+        .values({
+          receiptNumber: rcpNum,
+          invoiceId: existingInvoice[0]?.id ?? null,
+          reservationId: id,
+          amount: String(input.amount),
+          paymentMethod: input.paymentMethod,
+          status: "received",
+          receivedBy: req.user!.id,
+          notes: input.notes ?? null,
+        })
+        .returning();
+
+      if (existingInvoice.length) {
+        const inv = existingInvoice[0]!;
+        const newTotalPaid = +(Number(inv.totalPaid) + input.amount).toFixed(2);
+        const newBalance = +(Number(inv.grandTotal) - newTotalPaid).toFixed(2);
+        const newStatus = newBalance <= 0.009 ? "paid" : "partial";
+        await tx
+          .update(invoices)
+          .set({
+            totalPaid: String(newTotalPaid),
+            balanceDue: String(newBalance),
+            status: newStatus,
+            updatedAt: new Date(),
+          })
+          .where(eq(invoices.id, inv.id));
+        await tx
+          .update(reservations)
+          .set({ balanceDue: String(newBalance), updatedAt: new Date() })
+          .where(eq(reservations.id, id));
+      } else {
+        const newAdvance = +(Number(r[0]!.advancePaid) + input.amount).toFixed(2);
+        const newBalance = +(Number(r[0]!.grandTotal) - newAdvance).toFixed(2);
+        await tx
+          .update(reservations)
+          .set({
+            advancePaid: String(newAdvance),
+            balanceDue: String(newBalance),
+            updatedAt: new Date(),
+          })
+          .where(eq(reservations.id, id));
+      }
+      return pay!;
+    });
+
+    await logActivity({
+      action: "payment_recorded",
+      entityType: "reservation",
+      entityId: id,
+      description: `Payment ₹${input.amount} via ${input.paymentMethod} on ${r[0]!.reservationNumber}`,
+      performedBy: req.user!.id,
+      ipAddress: req.ip,
+    });
+    await invalidateDashboard();
+    return ok(res, created, 201);
+  },
+);
 
 export default router;

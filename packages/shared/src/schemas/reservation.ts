@@ -43,6 +43,7 @@ export const checkInSchema = z.object({
 export const checkOutSchema = z.object({
   finalPayment: z.coerce.number().min(0).optional(),
   paymentMethod: z.enum(PAYMENT_METHODS).optional(),
+  paymentNotes: z.string().max(500).optional(),
 });
 
 export const cancelSchema = z.object({

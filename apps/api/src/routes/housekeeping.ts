@@ -6,7 +6,7 @@ import { rooms } from "../db/schema/rooms.js";
 import { logActivity } from "../lib/activity.js";
 import { invalidateDashboard } from "../lib/redis.js";
 import { fail, ok } from "../lib/response.js";
-import { requireAdmin, requireAuth } from "../middleware/auth.js";
+import { requireAuth, requirePermission } from "../middleware/auth.js";
 import { validate } from "../middleware/validate.js";
 
 const router = Router();
@@ -18,6 +18,10 @@ const statusUpdate = z.object({
 
 const maintenanceFlag = z.object({
   reason: z.string().min(1).max(500),
+});
+
+const notesUpdate = z.object({
+  notes: z.string().max(500).nullable(),
 });
 
 router.get("/", requireAuth, async (req, res) => {
@@ -105,7 +109,33 @@ router.post(
   },
 );
 
-router.post("/:roomId/resolve", requireAuth, requireAdmin, async (req, res) => {
+router.patch("/:roomId/notes", requireAuth, validate(notesUpdate), async (req, res) => {
+  const roomId = req.params.roomId!;
+  const { notes } = req.body as { notes: string | null };
+  const trimmed = notes && notes.trim() ? notes.trim() : null;
+
+  const [updated] = await db
+    .update(rooms)
+    .set({ notes: trimmed, updatedAt: new Date() })
+    .where(eq(rooms.id, roomId))
+    .returning();
+  if (!updated) return fail(res, 404, "NOT_FOUND", "Room not found");
+
+  await logActivity({
+    action: trimmed ? "room_note_updated" : "room_note_cleared",
+    entityType: "room",
+    entityId: roomId,
+    description: trimmed
+      ? `Room ${updated.roomNumber} note: ${trimmed}`
+      : `Room ${updated.roomNumber} note cleared`,
+    performedBy: req.user!.id,
+    ipAddress: req.ip,
+  });
+  await invalidateDashboard();
+  return ok(res, updated);
+});
+
+router.post("/:roomId/resolve", requireAuth, requirePermission("resolve_maintenance"), async (req, res) => {
   const roomId = req.params.roomId!;
   const [updated] = await db
     .update(rooms)

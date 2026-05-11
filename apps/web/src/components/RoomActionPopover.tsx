@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { ArrowRight, Loader2, Undo2, Wrench, X } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
+import { useToast } from "@/components/Toast";
 
 type HkStatus = "dirty" | "clean" | "inspected" | "available" | "maintenance";
 
@@ -68,6 +69,7 @@ export function RoomActionPopover({ roomId, roomNumber, status, trigger, onChang
   const [open, setOpen] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);
   const qc = useQueryClient();
+  const { toast } = useToast();
 
   const update = useMutation({
     mutationFn: (next: HkStatus) => api.patch(`/housekeeping/${roomId}`, { status: next }),
@@ -93,7 +95,7 @@ export function RoomActionPopover({ roomId, roomNumber, status, trigger, onChang
         for (const [qk, data] of entries) qc.setQueryData(qk, data);
       });
       const msg = e instanceof ApiError ? e.message : "Update failed";
-      alert(msg);
+      toast(msg, "error");
     },
     onSettled: () => {
       const keys = invalidateKeys ?? [["dashboard"], ["reservation"]];

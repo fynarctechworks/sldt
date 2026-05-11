@@ -11,13 +11,13 @@ import { renderInvoicePdf } from "../lib/pdf.js";
 import { invalidateDashboard } from "../lib/redis.js";
 import { getSettings } from "../lib/settings.js";
 import { fail, list, ok } from "../lib/response.js";
-import { requireAdmin, requireAuth, requireRole } from "../middleware/auth.js";
+import { requireAuth, requirePermission } from "../middleware/auth.js";
 import { validate } from "../middleware/validate.js";
 
 const router = Router();
 const STAFF = ["admin", "frontdesk"] as const;
 
-router.get("/", requireAuth, requireRole(...STAFF), async (req, res) => {
+router.get("/", requireAuth, requirePermission("view_invoices"), async (req, res) => {
   const { status, date_from, date_to } = req.query as Record<string, string | undefined>;
   const page = Math.max(1, Number(req.query.page ?? 1));
   const per_page = Math.min(100, Math.max(1, Number(req.query.per_page ?? 25)));
@@ -44,7 +44,7 @@ router.get("/", requireAuth, requireRole(...STAFF), async (req, res) => {
   return list(res, rows, { total: total[0]?.count ?? 0, page, per_page });
 });
 
-router.get("/:id", requireAuth, requireRole(...STAFF), async (req, res) => {
+router.get("/:id", requireAuth, requirePermission("view_invoices"), async (req, res) => {
   const id = req.params.id!;
   const inv = await db.select().from(invoices).where(eq(invoices.id, id)).limit(1);
   if (!inv.length) return fail(res, 404, "NOT_FOUND", "Invoice not found");
@@ -55,7 +55,7 @@ router.get("/:id", requireAuth, requireRole(...STAFF), async (req, res) => {
   return ok(res, { ...inv[0], lineItems: items, payments: pays });
 });
 
-router.get("/:id/pdf", requireAuth, requireRole(...STAFF), async (req, res) => {
+router.get("/:id/pdf", requireAuth, requirePermission("view_invoices"), async (req, res) => {
   const id = req.params.id!;
   const inv = await db.select().from(invoices).where(eq(invoices.id, id)).limit(1);
   if (!inv.length) return fail(res, 404, "NOT_FOUND", "Invoice not found");
@@ -65,15 +65,19 @@ router.get("/:id/pdf", requireAuth, requireRole(...STAFF), async (req, res) => {
   ]);
   const settings = await getSettings();
   const pdf = await renderInvoicePdf({ invoice: inv[0]!, lineItems: items, payments: pays, settings });
+  const inline = req.query.disposition === "inline";
   res.setHeader("Content-Type", "application/pdf");
-  res.setHeader("Content-Disposition", `attachment; filename="${inv[0]!.invoiceNumber}.pdf"`);
+  res.setHeader(
+    "Content-Disposition",
+    `${inline ? "inline" : "attachment"}; filename="${inv[0]!.invoiceNumber}.pdf"`,
+  );
   return res.send(pdf);
 });
 
 router.patch(
   "/:id",
   requireAuth,
-  requireAdmin,
+  requirePermission("reissue_invoices"),
   validate(editInvoiceSchema),
   async (req, res) => {
     const id = req.params.id!;
@@ -109,7 +113,7 @@ router.patch(
 router.post(
   "/:id/reissue",
   requireAuth,
-  requireAdmin,
+  requirePermission("reissue_invoices"),
   validate(voidInvoiceSchema),
   async (req, res) => {
     const id = req.params.id!;
@@ -125,10 +129,8 @@ router.post(
       .from(invoiceLineItems)
       .where(eq(invoiceLineItems.invoiceId, id));
 
-    const prefix = original.invoiceNumber.split("-")[0]!;
-    const monthPart = original.invoiceNumber.split("-")[1] ?? "";
-    const nextSeq = await nextInvoiceSequence(`${prefix}-${monthPart}-%`);
-    const newNumber = invoiceNumber(prefix, nextSeq);
+    const nextSeq = await nextInvoiceSequence(`SLDT-INV-%`);
+    const newNumber = invoiceNumber("SLDT", nextSeq);
 
     const created = await db.transaction(async (tx) => {
       await tx
@@ -209,7 +211,7 @@ router.post(
 router.post(
   "/:id/void",
   requireAuth,
-  requireAdmin,
+  requirePermission("void_invoices"),
   validate(voidInvoiceSchema),
   async (req, res) => {
     const id = req.params.id!;

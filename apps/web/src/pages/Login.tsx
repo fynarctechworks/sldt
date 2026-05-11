@@ -10,9 +10,11 @@ import {
   ShieldCheck,
 } from "lucide-react";
 import { useAuth } from "@/auth/AuthContext";
+import { useDialog } from "@/components/Dialog";
 
 export default function Login() {
   const { signIn, session } = useAuth();
+  const dialog = useDialog();
   const location = useLocation();
   const emailId = useId();
   const pwId = useId();
@@ -179,7 +181,13 @@ export default function Login() {
               <button
                 type="button"
                 className="text-xs text-accentBlue hover:underline"
-                onClick={() => alert("Contact your administrator to reset your password.")}
+                onClick={() =>
+                  dialog.alert({
+                    title: "Reset your password",
+                    message: "Please contact your administrator to reset your password.",
+                    okLabel: "Got it",
+                  })
+                }
               >
                 Forgot password?
               </button>

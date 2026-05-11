@@ -11,7 +11,7 @@ import { rooms } from "../db/schema/rooms.js";
 import { logger } from "../lib/logger.js";
 import { dashboardKey, redis } from "../lib/redis.js";
 import { ok } from "../lib/response.js";
-import { requireAuth, requireRole } from "../middleware/auth.js";
+import { requireAuth, requirePermission } from "../middleware/auth.js";
 
 const router = Router();
 const TTL_SECONDS = 30;
@@ -121,7 +121,7 @@ async function buildDashboard() {
   };
 }
 
-router.get("/", requireAuth, requireRole("admin", "frontdesk"), async (_req, res) => {
+router.get("/", requireAuth, requirePermission("view_dashboard"), async (_req, res) => {
   try {
     const cached = await redis.get<string>(dashboardKey);
     if (cached) {

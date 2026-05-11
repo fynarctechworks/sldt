@@ -20,6 +20,8 @@ export interface CheckInReceiptData {
   };
   rooms: { roomNumber: string; roomType: string; ratePerNight: string }[];
   subtotal: string;
+  gstRate: string;
+  gstAmount: string;
   grandTotal: string;
   advancePaid: string;
   balanceDue: string;
@@ -281,12 +283,31 @@ export function CheckInReceiptModal({ data, onClose }: Props) {
           )}
 
           <div className="mt-4 flex justify-end">
-            <table className="w-full max-w-[16rem] text-[11px]">
+            <table className="w-full max-w-[18rem] text-[11px]">
               <tbody>
                 <tr>
                   <td className="py-1 text-textSecondary">Subtotal ({data.numNights}n)</td>
                   <td className="py-1 text-right font-mono">{inr(data.subtotal)}</td>
                 </tr>
+                {(() => {
+                  const gstRate = Number(data.gstRate);
+                  const gstAmt = Number(data.gstAmount);
+                  if (!gstRate || !gstAmt) return null;
+                  const half = +(gstAmt / 2).toFixed(2);
+                  const halfRate = +(gstRate / 2).toFixed(2);
+                  return (
+                    <>
+                      <tr>
+                        <td className="py-1 text-textSecondary">CGST @ {halfRate}%</td>
+                        <td className="py-1 text-right font-mono">{inr(half)}</td>
+                      </tr>
+                      <tr>
+                        <td className="py-1 text-textSecondary">SGST @ {halfRate}%</td>
+                        <td className="py-1 text-right font-mono">{inr(gstAmt - half)}</td>
+                      </tr>
+                    </>
+                  );
+                })()}
                 <tr className="border-t border-brand/30">
                   <td className="py-1.5 pt-2 font-bold text-brand-dark">Grand Total</td>
                   <td className="py-1.5 pt-2 text-right font-mono font-bold text-brand-dark">

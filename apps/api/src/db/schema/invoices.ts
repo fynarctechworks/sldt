@@ -68,6 +68,7 @@ export const payments = pgTable(
       .references(() => reservations.id),
     amount: numeric("amount", { precision: 10, scale: 2 }).notNull(),
     paymentMethod: text("payment_method", { enum: PAYMENT_METHODS }).notNull(),
+    status: text("status", { enum: ["received", "pending"] }).notNull().default("received"),
     paymentDate: timestamp("payment_date", { withTimezone: true }).notNull().defaultNow(),
     receivedBy: uuid("received_by")
       .notNull()

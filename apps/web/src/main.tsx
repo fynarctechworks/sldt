@@ -5,6 +5,7 @@ import { BrowserRouter } from "react-router-dom";
 import App from "./App";
 import { AuthProvider } from "./auth/AuthContext";
 import { ToastProvider } from "./components/Toast";
+import { DialogProvider } from "./components/Dialog";
 import "./styles.css";
 
 const qc = new QueryClient({
@@ -23,7 +24,9 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
       <QueryClientProvider client={qc}>
         <AuthProvider>
           <ToastProvider>
-            <App />
+            <DialogProvider>
+              <App />
+            </DialogProvider>
           </ToastProvider>
         </AuthProvider>
       </QueryClientProvider>

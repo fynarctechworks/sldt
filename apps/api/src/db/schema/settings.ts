@@ -8,6 +8,8 @@ export const settings = pgTable("settings", {
   hotelEmail: text("hotel_email"),
   ownerPhone: text("owner_phone"),
   ownerNotifyEnabled: boolean("owner_notify_enabled").notNull().default(true),
+  wifiSsid: text("wifi_ssid"),
+  wifiPassword: text("wifi_password"),
   hotelGstin: text("hotel_gstin").notNull(),
   hotelLogoUrl: text("hotel_logo_url"),
   checkInTime: time("check_in_time").notNull().default("12:00"),

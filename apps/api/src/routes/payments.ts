@@ -11,7 +11,7 @@ import { generateReceiptNumber } from "../lib/receipt.js";
 import { invalidateDashboard } from "../lib/redis.js";
 import { getSettings } from "../lib/settings.js";
 import { fail, ok } from "../lib/response.js";
-import { requireAdmin, requireAuth, requireRole } from "../middleware/auth.js";
+import { requireAuth, requirePermission } from "../middleware/auth.js";
 import { validate } from "../middleware/validate.js";
 
 const router = Router();
@@ -20,7 +20,7 @@ const STAFF = ["admin", "frontdesk"] as const;
 router.post(
   "/",
   requireAuth,
-  requireRole(...STAFF),
+  requirePermission("record_payments"),
   validate(paymentSchema),
   async (req, res) => {
     const input = req.body as import("@hoteldesk/shared").PaymentInput;
@@ -78,7 +78,7 @@ router.post(
   },
 );
 
-router.get("/", requireAuth, requireAdmin, async (req, res) => {
+router.get("/", requireAuth, requirePermission("view_collections"), async (req, res) => {
   const { date_from, date_to, method } = req.query as Record<string, string | undefined>;
   const conditions = [];
   if (date_from) conditions.push(gte(payments.paymentDate, new Date(date_from)));
@@ -94,7 +94,7 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
   return ok(res, rows);
 });
 
-router.get("/:id/receipt", requireAuth, requireRole(...STAFF), async (req, res) => {
+router.get("/:id/receipt", requireAuth, requirePermission("record_payments"), async (req, res) => {
   const id = req.params.id!;
   const pay = await db.select().from(payments).where(eq(payments.id, id)).limit(1);
   if (!pay.length) return fail(res, 404, "NOT_FOUND", "Payment not found");
@@ -119,10 +119,11 @@ router.get("/:id/receipt", requireAuth, requireRole(...STAFF), async (req, res) 
     invoice: inv[0] ?? null,
     settings,
   });
+  const inline = req.query.disposition === "inline";
   res.setHeader("Content-Type", "application/pdf");
   res.setHeader(
     "Content-Disposition",
-    `attachment; filename="${pay[0]!.receiptNumber ?? "receipt"}.pdf"`,
+    `${inline ? "inline" : "attachment"}; filename="${pay[0]!.receiptNumber ?? "receipt"}.pdf"`,
   );
   return res.send(pdf);
 });
@@ -130,7 +131,7 @@ router.get("/:id/receipt", requireAuth, requireRole(...STAFF), async (req, res) 
 router.patch(
   "/:id",
   requireAuth,
-  requireAdmin,
+  requirePermission("record_payments"),
   validate(editPaymentSchema),
   async (req, res) => {
     const id = req.params.id!;
@@ -171,7 +172,7 @@ router.patch(
 router.post(
   "/:id/void",
   requireAuth,
-  requireAdmin,
+  requirePermission("void_payments"),
   validate(voidPaymentSchema),
   async (req, res) => {
     const id = req.params.id!;
@@ -224,6 +225,77 @@ router.post(
       entityType: "payment",
       entityId: id,
       description: `Payment ₹${existing[0]!.amount} voided: ${reason}`,
+      performedBy: req.user!.id,
+      ipAddress: req.ip,
+    });
+    await invalidateDashboard();
+    return ok(res, { success: true });
+  },
+);
+
+// Mark a pending (unpaid) payment as received with the actual method
+router.post(
+  "/:id/mark-received",
+  requireAuth,
+  requirePermission("record_payments"),
+  async (req, res) => {
+    const id = req.params.id!;
+    const body = req.body as { paymentMethod?: string; notes?: string };
+    const validMethods = ["cash", "upi", "card", "bank_transfer"] as const;
+    if (!body.paymentMethod || !validMethods.includes(body.paymentMethod as never)) {
+      return fail(res, 400, "INVALID_METHOD", "Choose cash / upi / card / bank_transfer");
+    }
+
+    const [existing] = await db.select().from(payments).where(eq(payments.id, id)).limit(1);
+    if (!existing) return fail(res, 404, "NOT_FOUND", "Payment not found");
+    if (existing.status !== "pending") {
+      return fail(res, 400, "NOT_PENDING", "Payment is not pending");
+    }
+    if (existing.voided) return fail(res, 400, "VOIDED", "Payment is voided");
+
+    const amount = Number(existing.amount);
+
+    await db.transaction(async (tx) => {
+      await tx
+        .update(payments)
+        .set({
+          status: "received",
+          paymentMethod: body.paymentMethod as "cash" | "upi" | "card" | "bank_transfer",
+          paymentDate: new Date(),
+          receivedBy: req.user!.id,
+          notes: body.notes ? body.notes : existing.notes,
+        })
+        .where(eq(payments.id, id));
+
+      if (existing.invoiceId) {
+        const [inv] = await tx.select().from(invoices).where(eq(invoices.id, existing.invoiceId)).limit(1);
+        if (inv) {
+          const newTotalPaid = +(Number(inv.totalPaid) + amount).toFixed(2);
+          const newBalance = +(Number(inv.grandTotal) - newTotalPaid).toFixed(2);
+          const newStatus = newBalance <= 0.009 ? "paid" : newTotalPaid > 0 ? "partial" : "issued";
+          await tx
+            .update(invoices)
+            .set({
+              totalPaid: String(newTotalPaid),
+              balanceDue: String(Math.max(0, newBalance)),
+              status: newStatus,
+              updatedAt: new Date(),
+            })
+            .where(eq(invoices.id, inv.id));
+
+          await tx
+            .update(reservations)
+            .set({ balanceDue: String(Math.max(0, newBalance)), updatedAt: new Date() })
+            .where(eq(reservations.id, existing.reservationId));
+        }
+      }
+    });
+
+    await logActivity({
+      action: "payment_marked_received",
+      entityType: "payment",
+      entityId: id,
+      description: `Pending ₹${existing.amount} marked received via ${body.paymentMethod}`,
       performedBy: req.user!.id,
       ipAddress: req.ip,
     });

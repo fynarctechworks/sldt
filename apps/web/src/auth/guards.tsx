@@ -12,18 +12,47 @@ export function ProtectedRoute({ children }: { children: ReactNode }) {
   return <>{children}</>;
 }
 
+// Legacy role guard. Still used by some pages until Phase 5 cleanup.
+// Prefer PermissionGuard for new code.
 export function RoleGuard({ allow, children }: { allow: Role[]; children: ReactNode }) {
   const { profile } = useAuth();
   if (!profile) return null;
   if (!allow.includes(profile.role)) {
+    return <Forbidden detail={`Your role (${profile.role}) doesn't have access to this page.`} />;
+  }
+  return <>{children}</>;
+}
+
+// Permission-driven guard. Pass one or more permission keys; the user must have any of them.
+// Admin (god mode) always passes.
+export function PermissionGuard({
+  any,
+  all,
+  children,
+}: {
+  any?: string[];
+  all?: string[];
+  children: ReactNode;
+}) {
+  const { profile, can } = useAuth();
+  if (!profile) return null;
+  const ok =
+    (any && any.some((k) => can(k))) ||
+    (all && all.every((k) => can(k))) ||
+    (!any && !all);
+  if (!ok) {
     return (
-      <div className="p-8">
-        <h1 className="text-xl font-semibold">403 Forbidden</h1>
-        <p className="text-textSecondary mt-2">
-          Your role ({profile.role}) doesn't have access to this page.
-        </p>
-      </div>
+      <Forbidden detail="You don't have permission to access this page." />
     );
   }
   return <>{children}</>;
+}
+
+function Forbidden({ detail }: { detail: string }) {
+  return (
+    <div className="p-8 max-w-md">
+      <h1 className="text-xl font-semibold text-brand-dark">403 Forbidden</h1>
+      <p className="text-textSecondary mt-2 text-sm">{detail}</p>
+    </div>
+  );
 }

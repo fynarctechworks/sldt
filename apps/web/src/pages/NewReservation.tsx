@@ -251,6 +251,8 @@ export default function NewReservation() {
             numAdults: number;
             numChildren: number;
             subtotal: string;
+            gstRate: string;
+            gstAmount: string;
             grandTotal: string;
             advancePaid: string;
             balanceDue: string;
@@ -308,6 +310,8 @@ export default function NewReservation() {
             ratePerNight: r.ratePerNight,
           })),
           subtotal: detail.subtotal,
+          gstRate: detail.gstRate,
+          gstAmount: detail.gstAmount,
           grandTotal: detail.grandTotal,
           advancePaid: detail.advancePaid,
           balanceDue: detail.balanceDue,
@@ -820,7 +824,8 @@ export default function NewReservation() {
                 className="input"
                 type="number"
                 min={0}
-                value={advance}
+                value={advance || ""}
+                placeholder="0"
                 onChange={(e) => setAdvance(Number(e.target.value))}
               />
             </div>

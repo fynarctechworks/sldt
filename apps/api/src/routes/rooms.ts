@@ -13,7 +13,7 @@ import { logActivity } from "../lib/activity.js";
 import { findAvailableRooms } from "../lib/availability.js";
 import { invalidateDashboard } from "../lib/redis.js";
 import { fail, ok } from "../lib/response.js";
-import { requireAdmin, requireAuth } from "../middleware/auth.js";
+import { requireAuth, requirePermission } from "../middleware/auth.js";
 import { validate } from "../middleware/validate.js";
 
 const router = Router();
@@ -54,7 +54,7 @@ router.get("/:id", requireAuth, async (req, res) => {
   return ok(res, found[0]);
 });
 
-router.post("/", requireAuth, requireAdmin, validate(roomCreateSchema), async (req, res) => {
+router.post("/", requireAuth, requirePermission("edit_rooms"), validate(roomCreateSchema), async (req, res) => {
   const input = req.body;
   try {
     const [created] = await db
@@ -82,7 +82,7 @@ router.post("/", requireAuth, requireAdmin, validate(roomCreateSchema), async (r
   }
 });
 
-router.put("/:id", requireAuth, requireAdmin, validate(roomUpdateSchema), async (req, res) => {
+router.put("/:id", requireAuth, requirePermission("edit_rooms"), validate(roomUpdateSchema), async (req, res) => {
   const id = req.params.id!;
   const input = req.body;
   const update: Record<string, unknown> = { ...input, updatedAt: new Date() };

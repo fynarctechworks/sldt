@@ -10,3 +10,4 @@ export * from "./otps.js";
 export * from "./notifications.js";
 export * from "./messages.js";
 export * from "./messageTemplates.js";
+export * from "./rbac.js";

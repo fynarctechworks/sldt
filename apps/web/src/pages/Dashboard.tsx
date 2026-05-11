@@ -80,7 +80,22 @@ export default function Dashboard() {
             const availPct = g.total > 0 ? (g.available / g.total) * 100 : 0;
             const occPct = g.total > 0 ? (g.occupied / g.total) * 100 : 0;
             const resPct = g.total > 0 ? (g.reserved / g.total) * 100 : 0;
-            const othPct = g.total > 0 ? (g.other / g.total) * 100 : 0;
+            const dirtyPct = g.total > 0 ? (g.dirty / g.total) * 100 : 0;
+            const cleanPct = g.total > 0 ? (g.clean / g.total) * 100 : 0;
+            const inspPct = g.total > 0 ? (g.inspected / g.total) * 100 : 0;
+            const maintPct = g.total > 0 ? (g.maintenance / g.total) * 100 : 0;
+
+            // Always-visible primary chips, then conditional housekeeping chips
+            const chips: { label: string; count: number; bgTint: string; dot: string }[] = [
+              { label: "Available", count: g.available, bgTint: "bg-brand/10", dot: "bg-brand" },
+              { label: "Occupied", count: g.occupied, bgTint: "bg-[#B23A2E]/10", dot: "bg-[#B23A2E]" },
+              { label: "Reserved", count: g.reserved, bgTint: "bg-[#E6A532]/15", dot: "bg-[#E6A532]" },
+            ];
+            if (g.dirty > 0) chips.push({ label: "Dirty", count: g.dirty, bgTint: "bg-warning/10", dot: "bg-warning" });
+            if (g.clean > 0) chips.push({ label: "Clean", count: g.clean, bgTint: "bg-cream", dot: "bg-brass" });
+            if (g.inspected > 0) chips.push({ label: "Inspected", count: g.inspected, bgTint: "bg-brand-mid/15", dot: "bg-brand-mid" });
+            if (g.maintenance > 0) chips.push({ label: "Maintenance", count: g.maintenance, bgTint: "bg-[#2A2A2A]/10", dot: "bg-[#2A2A2A]" });
+
             return (
               <div key={g.type} className="border border-borderc rounded-md p-4 bg-surface">
                 <div className="flex justify-between items-baseline mb-3">
@@ -97,40 +112,22 @@ export default function Dashboard() {
                   {availPct > 0 && <div className="bg-brand" style={{ width: `${availPct}%` }} title={`Available ${g.available}`} />}
                   {occPct > 0 && <div className="bg-[#B23A2E]" style={{ width: `${occPct}%` }} title={`Occupied ${g.occupied}`} />}
                   {resPct > 0 && <div className="bg-[#E6A532]" style={{ width: `${resPct}%` }} title={`Reserved ${g.reserved}`} />}
-                  {othPct > 0 && <div className="bg-[#2A2A2A]" style={{ width: `${othPct}%` }} title={`Other ${g.other}`} />}
+                  {dirtyPct > 0 && <div className="bg-warning" style={{ width: `${dirtyPct}%` }} title={`Dirty ${g.dirty}`} />}
+                  {cleanPct > 0 && <div className="bg-brass" style={{ width: `${cleanPct}%` }} title={`Clean ${g.clean}`} />}
+                  {inspPct > 0 && <div className="bg-brand-mid" style={{ width: `${inspPct}%` }} title={`Inspected ${g.inspected}`} />}
+                  {maintPct > 0 && <div className="bg-[#2A2A2A]" style={{ width: `${maintPct}%` }} title={`Maintenance ${g.maintenance}`} />}
                 </div>
 
                 <div className="grid grid-cols-3 gap-2 mt-3">
-                  <div className="flex items-center gap-2 px-2 py-1.5 rounded bg-brand/10">
-                    <span className="w-2.5 h-2.5 rounded-full bg-brand shrink-0" />
-                    <div className="min-w-0">
-                      <div className="text-[10px] uppercase tracking-wide text-textSecondary leading-none">Available</div>
-                      <div className="text-sm font-semibold text-brand-dark leading-tight">{g.available}</div>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2 px-2 py-1.5 rounded bg-[#B23A2E]/10">
-                    <span className="w-2.5 h-2.5 rounded-full bg-[#B23A2E] shrink-0" />
-                    <div className="min-w-0">
-                      <div className="text-[10px] uppercase tracking-wide text-textSecondary leading-none">Occupied</div>
-                      <div className="text-sm font-semibold text-brand-dark leading-tight">{g.occupied}</div>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2 px-2 py-1.5 rounded bg-[#E6A532]/15">
-                    <span className="w-2.5 h-2.5 rounded-full bg-[#E6A532] shrink-0" />
-                    <div className="min-w-0">
-                      <div className="text-[10px] uppercase tracking-wide text-textSecondary leading-none">Reserved</div>
-                      <div className="text-sm font-semibold text-brand-dark leading-tight">{g.reserved}</div>
-                    </div>
-                  </div>
-                  {g.other > 0 && (
-                    <div className="flex items-center gap-2 px-2 py-1.5 rounded bg-[#2A2A2A]/10 col-span-3">
-                      <span className="w-2.5 h-2.5 rounded-full bg-[#2A2A2A] shrink-0" />
-                      <div>
-                        <div className="text-[10px] uppercase tracking-wide text-textSecondary leading-none">Other</div>
-                        <div className="text-sm font-semibold text-brand-dark leading-tight">{g.other}</div>
+                  {chips.map((c) => (
+                    <div key={c.label} className={`flex items-center gap-2 px-2 py-1.5 rounded ${c.bgTint}`}>
+                      <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${c.dot}`} />
+                      <div className="min-w-0">
+                        <div className="text-[10px] uppercase tracking-wide text-textSecondary leading-none">{c.label}</div>
+                        <div className="text-sm font-semibold text-brand-dark leading-tight">{c.count}</div>
                       </div>
                     </div>
-                  )}
+                  ))}
                 </div>
 
                 <div className="flex flex-wrap gap-2 mt-4">
@@ -294,11 +291,36 @@ interface RoomGridRow {
 }
 
 function groupByType(rooms: RoomGridRow[]) {
-  const map = new Map<string, { type: string; total: number; available: number; occupied: number; reserved: number; other: number; rooms: RoomGridRow[] }>();
+  const map = new Map<
+    string,
+    {
+      type: string;
+      total: number;
+      available: number;
+      occupied: number;
+      reserved: number;
+      dirty: number;
+      clean: number;
+      inspected: number;
+      maintenance: number;
+      rooms: RoomGridRow[];
+    }
+  >();
   for (const r of rooms) {
     const key = r.room_type || "untyped";
     if (!map.has(key)) {
-      map.set(key, { type: key, total: 0, available: 0, occupied: 0, reserved: 0, other: 0, rooms: [] });
+      map.set(key, {
+        type: key,
+        total: 0,
+        available: 0,
+        occupied: 0,
+        reserved: 0,
+        dirty: 0,
+        clean: 0,
+        inspected: 0,
+        maintenance: 0,
+        rooms: [],
+      });
     }
     const g = map.get(key)!;
     g.total++;
@@ -306,7 +328,10 @@ function groupByType(rooms: RoomGridRow[]) {
     if (r.status === "available") g.available++;
     else if (r.status === "occupied") g.occupied++;
     else if (r.status === "reserved") g.reserved++;
-    else g.other++;
+    else if (r.status === "dirty") g.dirty++;
+    else if (r.status === "clean") g.clean++;
+    else if (r.status === "inspected") g.inspected++;
+    else if (r.status === "maintenance") g.maintenance++;
   }
   return Array.from(map.values())
     .map((g) => ({ ...g, rooms: g.rooms.sort((a, b) => a.room_number.localeCompare(b.room_number, undefined, { numeric: true })) }))

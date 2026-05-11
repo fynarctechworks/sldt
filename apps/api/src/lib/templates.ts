@@ -9,27 +9,9 @@ export interface TemplateDefault {
 }
 
 export const TEMPLATE_DEFAULTS: Record<TemplateKey, TemplateDefault> = {
-  booking_created_guest_sms: {
-    body:
-      "{hotel}: Booking {reservation_number} confirmed for {check_in_date}. We look forward to your stay.",
-  },
-  booking_created_guest_email: {
-    subject: "Booking confirmed: {reservation_number}",
-    body:
-      "Dear {guest_name},\n\nYour booking at {hotel} is confirmed.\n\nReference: {reservation_number}\nCheck-in: {check_in_date}\nCheck-out: {check_out_date}\nTotal: ₹{total}\n\nWe look forward to hosting you.\n\n— {hotel}",
-  },
-  booking_created_owner_sms: {
-    body:
-      "New booking {reservation_number}: {guest_name} ({guest_phone}), {check_in_date} to {check_out_date}, ₹{total}",
-  },
   checkin_guest_sms: {
     body:
       "{hotel}: Welcome! Check-in confirmed for {reservation_number}. Enjoy your stay.",
-  },
-  checkin_guest_email: {
-    subject: "Welcome to {hotel} — {reservation_number}",
-    body:
-      "Dear {guest_name},\n\nWelcome to {hotel}.\nYour check-in for {reservation_number} is confirmed.\nCheck-out: {check_out_date}.\n\nIf you need anything during your stay, please reach out at the front desk.\n\n— {hotel}",
   },
   checkin_owner_sms: {
     body: "Checked in: {guest_name} ({guest_phone}), {reservation_number}",
@@ -38,11 +20,6 @@ export const TEMPLATE_DEFAULTS: Record<TemplateKey, TemplateDefault> = {
     body:
       "{hotel}: Thank you for staying with us. Invoice {invoice_number} has been generated.",
   },
-  checkout_guest_email: {
-    subject: "Invoice {invoice_number} from {hotel}",
-    body:
-      "Dear {guest_name},\n\nThank you for staying at {hotel}.\nInvoice {invoice_number} has been issued for {reservation_number}.\nThe invoice is attached as a PDF.\n\nWe hope to see you again.\n\n— {hotel}",
-  },
   checkout_owner_sms: {
     body: "Checked out: {guest_name}, {reservation_number}. Invoice {invoice_number}.",
   },
@@ -50,32 +27,28 @@ export const TEMPLATE_DEFAULTS: Record<TemplateKey, TemplateDefault> = {
     body:
       "{hotel}: Your check-in OTP is {otp_code}. Valid for {otp_minutes} minutes. Do not share.",
   },
+  payment_reminder_guest_sms: {
+    body:
+      "🙏 Hello {guest_name},\n\nThis is a friendly reminder from {hotel} about a pending balance from your stay.\n\nAmount due: ₹{balance}\n\nWe'd appreciate it if you could settle this at your convenience. For any clarification, please reach us on {hotel_phone}.\n\nThank you,\n— {hotel}, Sabbavaram",
+  },
 };
 
 export const TEMPLATE_VARS: Record<TemplateKey, readonly string[]> = {
-  booking_created_guest_sms: ["hotel", "guest_name", "reservation_number", "check_in_date", "check_out_date", "total"],
-  booking_created_guest_email: ["hotel", "guest_name", "guest_phone", "reservation_number", "check_in_date", "check_out_date", "nights", "total", "advance_paid", "balance"],
-  booking_created_owner_sms: ["hotel", "guest_name", "guest_phone", "reservation_number", "check_in_date", "check_out_date", "total"],
-  checkin_guest_sms: ["hotel", "guest_name", "reservation_number", "check_out_date"],
-  checkin_guest_email: ["hotel", "guest_name", "reservation_number", "check_out_date", "room_numbers"],
-  checkin_owner_sms: ["hotel", "guest_name", "guest_phone", "reservation_number", "room_numbers"],
-  checkout_guest_sms: ["hotel", "guest_name", "reservation_number", "invoice_number", "total"],
-  checkout_guest_email: ["hotel", "guest_name", "reservation_number", "invoice_number", "total"],
-  checkout_owner_sms: ["hotel", "guest_name", "reservation_number", "invoice_number", "total"],
+  checkin_guest_sms: ["hotel", "guest_name", "guest_phone", "reservation_number", "check_in_date", "check_out_date", "room_numbers", "total", "advance_paid", "balance", "receipt_link", "hotel_phone", "wifi_ssid", "wifi_password"],
+  checkin_owner_sms: ["hotel", "guest_name", "guest_phone", "reservation_number", "check_in_date", "room_numbers", "total", "advance_paid", "balance"],
+  checkout_guest_sms: ["hotel", "guest_name", "reservation_number", "invoice_number", "invoice_link", "total", "hotel_phone"],
+  checkout_owner_sms: ["hotel", "guest_name", "reservation_number", "invoice_number", "check_out_date", "total"],
   otp_guest_sms: ["hotel", "otp_code", "otp_minutes"],
+  payment_reminder_guest_sms: ["hotel", "hotel_phone", "guest_name", "guest_phone", "balance"],
 };
 
 export const TEMPLATE_LABELS: Record<TemplateKey, { group: string; label: string; channel: "sms" | "email"; recipient: "guest" | "owner" }> = {
-  booking_created_guest_sms: { group: "Booking confirmed", label: "SMS to guest", channel: "sms", recipient: "guest" },
-  booking_created_guest_email: { group: "Booking confirmed", label: "Email to guest", channel: "email", recipient: "guest" },
-  booking_created_owner_sms: { group: "Booking confirmed", label: "SMS to owner", channel: "sms", recipient: "owner" },
-  checkin_guest_sms: { group: "Check-in", label: "SMS to guest", channel: "sms", recipient: "guest" },
-  checkin_guest_email: { group: "Check-in", label: "Email to guest", channel: "email", recipient: "guest" },
-  checkin_owner_sms: { group: "Check-in", label: "SMS to owner", channel: "sms", recipient: "owner" },
-  checkout_guest_sms: { group: "Check-out", label: "SMS to guest", channel: "sms", recipient: "guest" },
-  checkout_guest_email: { group: "Check-out", label: "Email to guest", channel: "email", recipient: "guest" },
-  checkout_owner_sms: { group: "Check-out", label: "SMS to owner", channel: "sms", recipient: "owner" },
-  otp_guest_sms: { group: "OTP verification", label: "SMS to guest", channel: "sms", recipient: "guest" },
+  checkin_guest_sms: { group: "Check-in", label: "WhatsApp to guest", channel: "sms", recipient: "guest" },
+  checkin_owner_sms: { group: "Check-in", label: "WhatsApp to owner", channel: "sms", recipient: "owner" },
+  checkout_guest_sms: { group: "Check-out", label: "WhatsApp to guest", channel: "sms", recipient: "guest" },
+  checkout_owner_sms: { group: "Check-out", label: "WhatsApp to owner", channel: "sms", recipient: "owner" },
+  otp_guest_sms: { group: "OTP verification", label: "WhatsApp to guest", channel: "sms", recipient: "guest" },
+  payment_reminder_guest_sms: { group: "Payment reminder", label: "WhatsApp to guest", channel: "sms", recipient: "guest" },
 };
 
 const cache = new Map<TemplateKey, { subject?: string | null; body: string; enabled: boolean }>();

@@ -31,7 +31,18 @@ router.post("/logout", requireAuth, async (_req, res) => {
 });
 
 router.get("/me", requireAuth, async (req, res) => {
-  return ok(res, { profile: req.user });
+  const u = req.user!;
+  return ok(res, {
+    profile: {
+      id: u.id,
+      email: u.email,
+      role: u.role,
+      fullName: u.fullName,
+      rbacRoleKey: u.rbacRoleKey,
+      isGodMode: u.isGodMode,
+      permissions: Array.from(u.permissions),
+    },
+  });
 });
 
 export default router;

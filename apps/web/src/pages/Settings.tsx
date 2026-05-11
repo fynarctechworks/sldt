@@ -1,11 +1,13 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, Trash2, UserPlus } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { useDialog } from "@/components/Dialog";
 import { Loader } from "@/components/Loader";
+import { useToast } from "@/components/Toast";
 import { api } from "@/lib/api";
 import { inr } from "@/lib/utils";
 
-type Tab = "hotel" | "documents" | "messages" | "room-types" | "staff";
+type Tab = "hotel" | "documents" | "messages" | "room-types" | "staff" | "roles";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "hotel", label: "Hotel Profile" },
@@ -13,6 +15,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "messages", label: "Messages" },
   { id: "room-types", label: "Room Types" },
   { id: "staff", label: "Staff" },
+  { id: "roles", label: "Roles & Permissions" },
 ];
 
 export default function Settings() {
@@ -40,6 +43,7 @@ export default function Settings() {
       {tab === "messages" && <MessagesTab />}
       {tab === "room-types" && <RoomTypesTab />}
       {tab === "staff" && <StaffTab />}
+      {tab === "roles" && <RolesTab />}
     </div>
   );
 }
@@ -56,6 +60,8 @@ interface HotelSettings {
   checkOutTime: string;
   ownerPhone: string | null;
   ownerNotifyEnabled: boolean;
+  wifiSsid: string | null;
+  wifiPassword: string | null;
 }
 
 function HotelTab() {
@@ -88,6 +94,8 @@ function HotelTab() {
         hotelEmail: f.hotelEmail && f.hotelEmail.trim() !== "" ? f.hotelEmail : null,
         ownerPhone: f.ownerPhone && f.ownerPhone.trim() !== "" ? f.ownerPhone : null,
         ownerNotifyEnabled: f.ownerNotifyEnabled,
+        wifiSsid: f.wifiSsid && f.wifiSsid.trim() !== "" ? f.wifiSsid : null,
+        wifiPassword: f.wifiPassword && f.wifiPassword.trim() !== "" ? f.wifiPassword : null,
       };
       for (const k of Object.keys(payload)) {
         if (payload[k] === "" || payload[k] === undefined) delete payload[k];
@@ -178,6 +186,31 @@ function HotelTab() {
               />
               <span className="text-sm">Enabled</span>
             </label>
+          </Field>
+        </div>
+      </div>
+
+      <div className="border-t border-borderc pt-4 mt-2 space-y-3">
+        <h3 className="font-semibold text-brand-dark">Guest Wi-Fi</h3>
+        <p className="text-xs text-textSecondary -mt-2">
+          Shown in the check-in WhatsApp message so guests don't have to ask the front desk.
+        </p>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Network name (SSID)">
+            <input
+              className="input"
+              placeholder="SLDT_Guest"
+              value={form.wifiSsid ?? ""}
+              onChange={(e) => set("wifiSsid", e.target.value)}
+            />
+          </Field>
+          <Field label="Password">
+            <input
+              className="input"
+              placeholder="sldt2026"
+              value={form.wifiPassword ?? ""}
+              onChange={(e) => set("wifiPassword", e.target.value)}
+            />
           </Field>
         </div>
       </div>
@@ -594,7 +627,7 @@ function MessagesTab() {
   return (
     <div className="space-y-5">
       <div className="card text-sm text-textSecondary">
-        Edit the SMS templates sent to guests and the owner via Twilio. Use{" "}
+        Edit the WhatsApp templates sent to guests and the owner via Twilio. Use{" "}
         <code className="bg-bg px-1 rounded font-mono text-xs">{"{variable}"}</code> placeholders —
         click an available variable to insert it. Disable a template to stop sending it without
         deleting the wording.
@@ -685,12 +718,8 @@ function TemplateCard({ row, onSaved }: { row: TemplateRow; onSaved: () => void 
       <div className="flex items-center justify-between gap-3">
         <div className="flex items-center gap-2">
           <span className="font-semibold text-textPrimary">{row.label}</span>
-          <span
-            className={`text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded font-semibold ${
-              row.channel === "sms" ? "bg-brand/10 text-brand" : "bg-accentBlue/10 text-accentBlue"
-            }`}
-          >
-            {row.channel}
+          <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded font-semibold bg-success/10 text-success">
+            WhatsApp
           </span>
           {!enabled && (
             <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded font-semibold bg-warning/15 text-warning">
@@ -787,6 +816,7 @@ interface RoomTypeRow {
 
 function RoomTypesTab() {
   const qc = useQueryClient();
+  const dialog = useDialog();
   const { data: types = [] } = useQuery({
     queryKey: ["room-types", true],
     queryFn: () => api.get<RoomTypeRow[]>("/settings/room-types", { all: "true" }),
@@ -867,10 +897,14 @@ function RoomTypesTab() {
                     {t.isActive && (
                       <button
                         className="text-danger text-xs hover:underline inline-flex items-center gap-1"
-                        onClick={() => {
-                          if (confirm(`Archive "${t.label}"? Existing rooms keep the type; it'll be hidden from new-room forms.`)) {
-                            archive.mutate(t.id);
-                          }
+                        onClick={async () => {
+                          const ok = await dialog.confirm({
+                            title: `Archive "${t.label}"?`,
+                            message: "Existing rooms keep the type; it'll be hidden from new-room forms.",
+                            okLabel: "Archive",
+                            tone: "danger",
+                          });
+                          if (ok) archive.mutate(t.id);
                         }}
                       >
                         <Trash2 className="w-3 h-3" /> Archive
@@ -1043,6 +1077,8 @@ interface Staff {
 
 function StaffTab() {
   const qc = useQueryClient();
+  const dialog = useDialog();
+  const { toast } = useToast();
   const [showAdd, setShowAdd] = useState(false);
   const [editing, setEditing] = useState<Staff | null>(null);
   const { data = [] } = useQuery({
@@ -1061,7 +1097,7 @@ function StaffTab() {
   const hardDelete = useMutation({
     mutationFn: (id: string) => api.del(`/staff/${id}/hard`),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["staff"] }),
-    onError: (e: Error) => alert(e.message),
+    onError: (e: Error) => toast(e.message, "error"),
   });
 
   return (
@@ -1102,10 +1138,14 @@ function StaffTab() {
                     {s.isActive && (
                       <button
                         className="text-warning hover:underline text-xs inline-flex items-center gap-1"
-                        onClick={() => {
-                          if (confirm(`Deactivate ${s.fullName}? They will lose access but their history is kept.`)) {
-                            deactivate.mutate(s.id);
-                          }
+                        onClick={async () => {
+                          const ok = await dialog.confirm({
+                            title: `Deactivate ${s.fullName}?`,
+                            message: "They will lose access but their history is kept.",
+                            okLabel: "Deactivate",
+                            tone: "warning",
+                          });
+                          if (ok) deactivate.mutate(s.id);
                         }}
                       >
                         Deactivate
@@ -1121,9 +1161,16 @@ function StaffTab() {
                     )}
                     <button
                       className="text-danger hover:underline text-xs inline-flex items-center gap-1"
-                      onClick={() => {
-                        const txt = `Permanently DELETE ${s.fullName}?\n\nThis removes them from auth and the database. Only works if they have no reservations, invoices, payments, or activity history.\n\nType DELETE to confirm:`;
-                        const ans = prompt(txt);
+                      onClick={async () => {
+                        const ans = await dialog.prompt({
+                          title: `Permanently delete ${s.fullName}?`,
+                          message:
+                            "This removes them from auth and the database. Only works if they have no reservations, invoices, payments, or activity. Type DELETE to confirm.",
+                          placeholder: "Type DELETE",
+                          okLabel: "Delete forever",
+                          tone: "danger",
+                          required: true,
+                        });
                         if (ans === "DELETE") hardDelete.mutate(s.id);
                       }}
                     >
@@ -1147,7 +1194,6 @@ function EditStaffModal({ staff, onClose }: { staff: Staff; onClose: () => void 
   const [form, setForm] = useState({
     fullName: staff.fullName,
     email: staff.email,
-    role: staff.role,
     phone: staff.phone ?? "",
   });
   const [newPassword, setNewPassword] = useState("");
@@ -1155,24 +1201,79 @@ function EditStaffModal({ staff, onClose }: { staff: Staff; onClose: () => void 
   const [err, setErr] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
 
+  const { data: rbacRoles } = useQuery({
+    queryKey: ["rbac-roles"],
+    queryFn: () => api.get<RbacRole[]>("/rbac/roles"),
+  });
+  const { data: catalog } = useQuery({
+    queryKey: ["rbac-catalog"],
+    queryFn: () => api.get<PermissionDef[]>("/rbac/permissions"),
+  });
+  const { data: effective } = useQuery({
+    queryKey: ["rbac-effective", staff.id],
+    queryFn: () =>
+      api.get<{ roleKey: string | null; isGodMode: boolean; permissions: string[] }>(
+        `/rbac/users/${staff.id}/effective`,
+      ),
+  });
+  const { data: existingOverrides } = useQuery({
+    queryKey: ["rbac-overrides", staff.id],
+    queryFn: () =>
+      api.get<{ permissionKey: string; effect: "grant" | "deny" }[]>(
+        `/rbac/users/${staff.id}/overrides`,
+      ),
+  });
+
+  const [selectedRoleId, setSelectedRoleId] = useState<string | null>(null);
+  const [overrides, setOverrides] = useState<Record<string, "grant" | "deny">>({});
+  const [showAdvanced, setShowAdvanced] = useState(false);
+
+  // Initialise selectedRoleId once rbacRoles + effective have loaded
+  useEffect(() => {
+    if (selectedRoleId || !rbacRoles || !effective) return;
+    const cur = rbacRoles.find((r) => r.key === effective.roleKey);
+    setSelectedRoleId(cur?.id ?? null);
+  }, [rbacRoles, effective, selectedRoleId]);
+
+  // Initialise overrides from server once
+  useEffect(() => {
+    if (!existingOverrides) return;
+    const map: Record<string, "grant" | "deny"> = {};
+    for (const o of existingOverrides) map[o.permissionKey] = o.effect;
+    setOverrides(map);
+  }, [existingOverrides]);
+
   const save = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
+      // 1. Profile patch (name/email/phone/password)
       const patch: Record<string, unknown> = {};
       if (form.fullName !== staff.fullName) patch.fullName = form.fullName;
       if (form.email !== staff.email) patch.email = form.email;
-      if (form.role !== staff.role) patch.role = form.role;
       const newPhone = form.phone || null;
       if (newPhone !== (staff.phone ?? null)) patch.phone = newPhone;
       if (newPassword) patch.password = newPassword;
-      if (Object.keys(patch).length === 0) {
-        return Promise.reject(new Error("No changes"));
+      if (Object.keys(patch).length > 0) {
+        await api.put(`/staff/${staff.id}`, patch);
       }
-      return api.put(`/staff/${staff.id}`, patch);
+
+      // 2. RBAC role
+      if (selectedRoleId && selectedRoleId !== rbacRoles?.find((r) => r.key === effective?.roleKey)?.id) {
+        await api.put(`/rbac/users/${staff.id}/role`, { roleId: selectedRoleId });
+      }
+
+      // 3. Overrides
+      const arr = Object.entries(overrides).map(([permissionKey, effect]) => ({
+        permissionKey,
+        effect,
+      }));
+      await api.put(`/rbac/users/${staff.id}/overrides`, { overrides: arr });
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["staff"] });
+      qc.invalidateQueries({ queryKey: ["rbac-effective", staff.id] });
+      qc.invalidateQueries({ queryKey: ["rbac-overrides", staff.id] });
       setMsg("Saved");
-      setTimeout(onClose, 800);
+      setTimeout(onClose, 700);
     },
     onError: (e: Error) => setErr(e.message),
   });
@@ -1187,46 +1288,169 @@ function EditStaffModal({ staff, onClose }: { staff: Staff; onClose: () => void 
     setShowPw(true);
   }
 
+  const selectedRole = rbacRoles?.find((r) => r.id === selectedRoleId) ?? null;
+  const baseRolePerms = new Set(
+    selectedRole?.permissions.includes("*")
+      ? (catalog ?? []).map((c) => c.key)
+      : selectedRole?.permissions ?? [],
+  );
+  const effectivePerms = (() => {
+    const set = new Set(baseRolePerms);
+    for (const [k, eff] of Object.entries(overrides)) {
+      if (eff === "grant") set.add(k);
+      else if (eff === "deny") set.delete(k);
+    }
+    return set;
+  })();
+
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={onClose}>
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={onClose}>
       <div
-        className="bg-surface rounded-md w-full max-w-md p-5 space-y-3"
+        className="bg-surface rounded-md w-full max-w-2xl max-h-[90vh] overflow-hidden flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
-        <h2 className="text-lg font-semibold text-brand-dark">Edit Staff</h2>
-        <Field label="Full Name">
-          <input
-            className="input"
-            value={form.fullName}
-            onChange={(e) => setForm({ ...form, fullName: e.target.value })}
-          />
-        </Field>
-        <Field label="Email">
-          <input
-            className="input"
-            type="email"
-            value={form.email}
-            onChange={(e) => setForm({ ...form, email: e.target.value })}
-          />
-        </Field>
-        <Field label="Role">
-          <select
-            className="input"
-            value={form.role}
-            onChange={(e) => setForm({ ...form, role: e.target.value as Staff["role"] })}
-          >
-            <option value="admin">Admin</option>
-            <option value="frontdesk">Front Desk</option>
-            <option value="housekeeping">Housekeeping</option>
-          </select>
-        </Field>
-        <Field label="Phone (optional)">
-          <input
-            className="input"
-            value={form.phone}
-            onChange={(e) => setForm({ ...form, phone: e.target.value })}
-          />
-        </Field>
+        <div className="px-5 py-3 border-b border-borderc">
+          <h2 className="text-lg font-semibold text-brand-dark">Edit Staff · {staff.fullName}</h2>
+        </div>
+        <div className="p-5 space-y-4 overflow-y-auto">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <Field label="Full Name">
+            <input
+              className="input"
+              value={form.fullName}
+              onChange={(e) => setForm({ ...form, fullName: e.target.value })}
+            />
+          </Field>
+          <Field label="Email">
+            <input
+              className="input"
+              type="email"
+              value={form.email}
+              onChange={(e) => setForm({ ...form, email: e.target.value })}
+            />
+          </Field>
+          <Field label="Phone (optional)">
+            <input
+              className="input"
+              value={form.phone}
+              onChange={(e) => setForm({ ...form, phone: e.target.value })}
+            />
+          </Field>
+          <Field label="Role">
+            <select
+              className="input"
+              value={selectedRoleId ?? ""}
+              onChange={(e) => setSelectedRoleId(e.target.value || null)}
+            >
+              <option value="">— Pick a role —</option>
+              {(rbacRoles ?? []).map((r) => (
+                <option key={r.id} value={r.id}>
+                  {r.label}
+                  {r.isSystem ? " · system" : " · custom"}
+                </option>
+              ))}
+            </select>
+          </Field>
+        </div>
+
+        {selectedRole && (
+          <div className="bg-bg/50 border border-borderc rounded-sm px-3 py-2 text-xs text-textSecondary">
+            <span className="font-semibold text-brand-dark">{selectedRole.label}</span> grants{" "}
+            {selectedRole.permissions.includes("*") ? (
+              <span className="font-semibold text-success">all permissions (god mode)</span>
+            ) : (
+              <span>{selectedRole.permissions.length} permissions</span>
+            )}
+            . Effective for this user: <span className="font-mono">{effectivePerms.size}</span>
+            {Object.keys(overrides).length > 0 && (
+              <span> · {Object.keys(overrides).length} override(s)</span>
+            )}
+          </div>
+        )}
+
+        {selectedRole && !selectedRole.permissions.includes("*") && catalog && (
+          <div>
+            <button
+              type="button"
+              onClick={() => setShowAdvanced((s) => !s)}
+              className="text-xs font-semibold text-brand hover:underline"
+            >
+              {showAdvanced ? "Hide" : "Show"} advanced permission overrides
+            </button>
+            {showAdvanced && (
+              <div className="mt-3 border border-borderc rounded-sm p-3 space-y-3">
+                <p className="text-xs text-textSecondary">
+                  Three-state for each permission: <strong>Inherit</strong> (use role default),{" "}
+                  <strong className="text-success">Grant</strong> (force allow), or{" "}
+                  <strong className="text-danger">Deny</strong> (force block). Deny wins.
+                </p>
+                {Object.entries(groupByArea(catalog)).map(([area, defs]) => (
+                  <div key={area}>
+                    <div className="text-xs font-bold text-brand-dark mb-1.5">{area}</div>
+                    <div className="space-y-1">
+                      {defs.map((d) => {
+                        const ovr = overrides[d.key];
+                        const inRole = baseRolePerms.has(d.key);
+                        return (
+                          <div
+                            key={d.key}
+                            className="flex items-center justify-between gap-2 text-sm py-1"
+                          >
+                            <div className="flex-1 min-w-0">
+                              <div className="text-textPrimary truncate">{d.label}</div>
+                              <div className="text-[11px] text-textSecondary font-mono">
+                                {d.key} · role:{" "}
+                                {inRole ? (
+                                  <span className="text-success">allowed</span>
+                                ) : (
+                                  <span className="text-textSecondary">not in role</span>
+                                )}
+                              </div>
+                            </div>
+                            <div className="flex gap-1 shrink-0">
+                              {(["inherit", "grant", "deny"] as const).map((opt) => {
+                                const active = (ovr ?? "inherit") === opt;
+                                const cls =
+                                  opt === "grant"
+                                    ? active
+                                      ? "bg-success text-white border-success"
+                                      : "border-borderc text-success hover:border-success"
+                                    : opt === "deny"
+                                      ? active
+                                        ? "bg-danger text-white border-danger"
+                                        : "border-borderc text-danger hover:border-danger"
+                                      : active
+                                        ? "bg-brand-dark text-cream border-brand-dark"
+                                        : "border-borderc text-textSecondary hover:border-brand-dark";
+                                return (
+                                  <button
+                                    key={opt}
+                                    type="button"
+                                    onClick={() =>
+                                      setOverrides((o) => {
+                                        const next = { ...o };
+                                        if (opt === "inherit") delete next[d.key];
+                                        else next[d.key] = opt;
+                                        return next;
+                                      })
+                                    }
+                                    className={`px-2 h-6 text-[10px] font-semibold rounded-sm border transition-colors capitalize ${cls}`}
+                                  >
+                                    {opt}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         <div className="border-t border-borderc pt-3 mt-2">
           <div className="text-xs uppercase tracking-wide text-textSecondary mb-2">Reset password</div>
@@ -1260,8 +1484,8 @@ function EditStaffModal({ staff, onClose }: { staff: Staff; onClose: () => void 
 
         {err && <div className="text-danger text-sm">{err}</div>}
         {msg && <div className="text-success text-sm">{msg}</div>}
-
-        <div className="flex justify-end gap-2 pt-2">
+        </div>
+        <div className="flex justify-end gap-2 px-5 py-3 border-t border-borderc bg-bg/50">
           <button className="btn-secondary" onClick={onClose}>Cancel</button>
           <button
             className="btn-primary"
@@ -1364,6 +1588,339 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
     <div>
       <label className="label block mb-1">{label}</label>
       {children}
+    </div>
+  );
+}
+
+// ============================================================
+// Roles & Permissions tab
+// ============================================================
+
+interface PermissionDef {
+  key: string;
+  area: string;
+  label: string;
+  description?: string;
+}
+
+interface RbacRole {
+  id: string;
+  key: string;
+  label: string;
+  description: string | null;
+  isSystem: boolean;
+  permissions: string[];
+}
+
+function RolesTab() {
+  const qc = useQueryClient();
+  const dialog = useDialog();
+  const { toast } = useToast();
+  const [editing, setEditing] = useState<RbacRole | null>(null);
+  const [creating, setCreating] = useState(false);
+
+  const { data: rolesData } = useQuery({
+    queryKey: ["rbac-roles"],
+    queryFn: () => api.get<RbacRole[]>("/rbac/roles"),
+  });
+  const { data: catalog } = useQuery({
+    queryKey: ["rbac-catalog"],
+    queryFn: () => api.get<PermissionDef[]>("/rbac/permissions"),
+  });
+
+  const del = useMutation({
+    mutationFn: (id: string) => api.del(`/rbac/roles/${id}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["rbac-roles"] });
+      toast("Role deleted", "success");
+    },
+    onError: (e: Error) => toast(e.message, "error"),
+  });
+
+  if (!rolesData || !catalog) return <Loader />;
+
+  const grouped = groupByArea(catalog);
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <div>
+          <p className="text-sm text-textSecondary">
+            Roles bundle permissions. System roles can be edited (except <em>admin</em>).
+            Custom roles can be deleted when no users hold them.
+          </p>
+        </div>
+        <button
+          className="btn-primary inline-flex items-center gap-2"
+          onClick={() => setCreating(true)}
+        >
+          <Plus className="w-4 h-4" /> New Role
+        </button>
+      </div>
+
+      <div className="card p-0">
+        <table className="table-base">
+          <thead>
+            <tr>
+              <th>Role</th>
+              <th>Type</th>
+              <th>Permissions</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {rolesData.map((r) => {
+              const isAdmin = r.key === "admin";
+              const permCount = r.permissions.includes("*") ? "All (god mode)" : `${r.permissions.length}`;
+              return (
+                <tr key={r.id}>
+                  <td>
+                    <div className="font-semibold text-brand-dark">{r.label}</div>
+                    <div className="text-xs text-textSecondary font-mono">{r.key}</div>
+                    {r.description && (
+                      <div className="text-xs text-textSecondary mt-0.5">{r.description}</div>
+                    )}
+                  </td>
+                  <td className="text-xs">
+                    {r.isSystem ? (
+                      <span className="px-1.5 py-0.5 rounded-sm bg-brand-soft text-brand-dark font-semibold">
+                        System
+                      </span>
+                    ) : (
+                      <span className="px-1.5 py-0.5 rounded-sm bg-bg text-textSecondary border border-borderc">
+                        Custom
+                      </span>
+                    )}
+                  </td>
+                  <td className="text-sm font-mono">{permCount}</td>
+                  <td className="text-right">
+                    <div className="inline-flex gap-2">
+                      {!isAdmin && (
+                        <button
+                          className="text-brand text-xs hover:underline inline-flex items-center gap-1"
+                          onClick={() => setEditing(r)}
+                        >
+                          <Pencil className="w-3 h-3" /> Edit
+                        </button>
+                      )}
+                      {!r.isSystem && (
+                        <button
+                          className="text-danger text-xs hover:underline inline-flex items-center gap-1"
+                          onClick={async () => {
+                            const ok = await dialog.confirm({
+                              title: `Delete role "${r.label}"?`,
+                              message:
+                                "This cannot be undone. Users currently in this role must be reassigned first.",
+                              okLabel: "Delete role",
+                              tone: "danger",
+                            });
+                            if (ok) del.mutate(r.id);
+                          }}
+                        >
+                          <Trash2 className="w-3 h-3" /> Delete
+                        </button>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {creating && <RoleEditor catalog={grouped} onClose={() => setCreating(false)} />}
+      {editing && (
+        <RoleEditor catalog={grouped} role={editing} onClose={() => setEditing(null)} />
+      )}
+    </div>
+  );
+}
+
+function groupByArea(catalog: PermissionDef[]): Record<string, PermissionDef[]> {
+  const out: Record<string, PermissionDef[]> = {};
+  for (const p of catalog) {
+    if (!out[p.area]) out[p.area] = [];
+    out[p.area]!.push(p);
+  }
+  return out;
+}
+
+function RoleEditor({
+  role,
+  catalog,
+  onClose,
+}: {
+  role?: RbacRole;
+  catalog: Record<string, PermissionDef[]>;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  const [key, setKey] = useState(role?.key ?? "");
+  const [label, setLabel] = useState(role?.label ?? "");
+  const [description, setDescription] = useState(role?.description ?? "");
+  const [perms, setPerms] = useState<Set<string>>(new Set(role?.permissions ?? []));
+  const [err, setErr] = useState<string | null>(null);
+
+  function toggle(k: string) {
+    setPerms((s) => {
+      const next = new Set(s);
+      if (next.has(k)) next.delete(k);
+      else next.add(k);
+      return next;
+    });
+  }
+
+  function toggleArea(area: string, on: boolean) {
+    const keys = (catalog[area] ?? []).map((p) => p.key);
+    setPerms((s) => {
+      const next = new Set(s);
+      for (const k of keys) {
+        if (on) next.add(k);
+        else next.delete(k);
+      }
+      return next;
+    });
+  }
+
+  const save = useMutation({
+    mutationFn: () => {
+      const body = {
+        key,
+        label,
+        description: description || null,
+        permissions: Array.from(perms),
+      };
+      if (role) {
+        const { key: _k, ...rest } = body;
+        return api.patch(`/rbac/roles/${role.id}`, rest);
+      }
+      return api.post(`/rbac/roles`, body);
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["rbac-roles"] });
+      toast(role ? "Role updated" : "Role created", "success");
+      onClose();
+    },
+    onError: (e: Error) => setErr(e.message),
+  });
+
+  return (
+    <div
+      className="fixed inset-0 z-[150] grid place-items-center bg-brand-dark/40 p-4"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div className="w-full max-w-3xl bg-surface rounded-md shadow-xl border border-borderc max-h-[90vh] overflow-hidden flex flex-col">
+        <div className="flex items-center justify-between px-5 py-3 border-b border-borderc">
+          <div className="font-semibold text-textPrimary">
+            {role ? `Edit role · ${role.label}` : "Create role"}
+          </div>
+          <button onClick={onClose} className="text-textSecondary hover:text-textPrimary text-lg">
+            ×
+          </button>
+        </div>
+
+        <div className="p-5 space-y-4 overflow-y-auto">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <Field label="Role key (lowercase, _)">
+              <input
+                className="input font-mono disabled:bg-bg/50 disabled:text-textSecondary"
+                value={key}
+                disabled={!!role}
+                placeholder="e.g. front_desk_lead"
+                onChange={(e) => setKey(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, ""))}
+              />
+            </Field>
+            <Field label="Display label">
+              <input
+                className="input"
+                value={label}
+                placeholder="e.g. Front Desk Lead"
+                onChange={(e) => setLabel(e.target.value)}
+              />
+            </Field>
+          </div>
+          <Field label="Description">
+            <input
+              className="input"
+              value={description}
+              placeholder="What this role is for"
+              onChange={(e) => setDescription(e.target.value)}
+            />
+          </Field>
+
+          <div>
+            <div className="label mb-2">Permissions ({perms.size})</div>
+            <div className="space-y-3">
+              {Object.entries(catalog).map(([area, defs]) => {
+                const all = defs.every((d) => perms.has(d.key));
+                const some = defs.some((d) => perms.has(d.key));
+                return (
+                  <div key={area} className="border border-borderc rounded-sm p-3">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="text-sm font-bold text-brand-dark">{area}</div>
+                      <button
+                        type="button"
+                        className="text-xs font-semibold text-brand hover:underline"
+                        onClick={() => toggleArea(area, !all)}
+                      >
+                        {all ? "Clear all" : some ? "Select all" : "Select all"}
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                      {defs.map((d) => {
+                        const on = perms.has(d.key);
+                        return (
+                          <label
+                            key={d.key}
+                            className={`flex items-start gap-2 px-2 py-1.5 rounded-sm cursor-pointer text-sm transition-colors ${
+                              on ? "bg-brand-soft" : "hover:bg-bg"
+                            }`}
+                          >
+                            <input
+                              type="checkbox"
+                              className="mt-0.5"
+                              checked={on}
+                              onChange={() => toggle(d.key)}
+                            />
+                            <div className="flex-1 min-w-0">
+                              <div className="font-medium text-textPrimary">{d.label}</div>
+                              <div className="text-[11px] text-textSecondary font-mono truncate">
+                                {d.key}
+                              </div>
+                            </div>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {err && <div className="text-danger text-sm">{err}</div>}
+        </div>
+
+        <div className="flex items-center justify-end gap-2 px-5 py-3 border-t border-borderc bg-bg/50">
+          <button
+            onClick={onClose}
+            className="px-4 h-9 text-sm font-semibold rounded-sm border-2 border-borderc text-textSecondary hover:border-textSecondary hover:text-textPrimary transition-colors"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => save.mutate()}
+            disabled={save.isPending || !key.trim() || !label.trim()}
+            className="px-4 h-9 text-sm font-semibold rounded-sm bg-brand-dark text-cream border-2 border-brand-dark hover:opacity-90 transition-opacity disabled:opacity-40"
+          >
+            {save.isPending ? "Saving…" : role ? "Save changes" : "Create role"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

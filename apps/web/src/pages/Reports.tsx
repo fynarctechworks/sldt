@@ -1,8 +1,9 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { endOfMonth, format, startOfMonth } from "date-fns";
 import { Download } from "lucide-react";
 import Papa from "papaparse";
 import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   Bar,
   BarChart,
@@ -14,7 +15,9 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import { useDialog } from "@/components/Dialog";
 import { Loader } from "@/components/Loader";
+import { useToast } from "@/components/Toast";
 import { api } from "@/lib/api";
 import { inr } from "@/lib/utils";
 
@@ -293,57 +296,248 @@ function GstTab({ from }: { from: string }) {
   );
 }
 
+interface OutstandingResp {
+  invoices: {
+    invoiceId: string;
+    invoiceNumber: string;
+    reservationId: string;
+    reservationNumber: string;
+    guestId: string;
+    guestName: string;
+    guestPhone: string;
+    grandTotal: string;
+    totalPaid: string;
+    balanceDue: string;
+    status: string;
+    issuedAt: string;
+    checkedOutAt: string | null;
+  }[];
+  pendingPayments: {
+    paymentId: string;
+    invoiceId: string | null;
+    reservationId: string;
+    reservationNumber: string;
+    guestId: string;
+    guestName: string;
+    guestPhone: string;
+    amount: string;
+    notes: string | null;
+    promisedAt: string;
+  }[];
+  byGuest: {
+    guestId: string;
+    guestName: string;
+    guestPhone: string;
+    balance: number;
+    oldest: string;
+  }[];
+  totalOutstanding: number;
+}
+
+function daysSince(iso: string): number {
+  return Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 86400000));
+}
+
 function OutstandingTab() {
-  const { data = [] } = useQuery({
+  const navigate = useNavigate();
+  const qc = useQueryClient();
+  const dialog = useDialog();
+  const { toast } = useToast();
+  const { data } = useQuery({
     queryKey: ["rpt-out"],
-    queryFn: () =>
-      api.get<
-        {
-          id: string;
-          invoiceNumber: string;
-          guestName: string;
-          grandTotal: string;
-          balanceDue: string;
-          status: string;
-          createdAt: string;
-        }[]
-      >("/reports/outstanding"),
+    queryFn: () => api.get<OutstandingResp>("/reports/outstanding"),
+    refetchInterval: 30_000,
   });
 
+  const markReceived = useMutation({
+    mutationFn: ({ id, method }: { id: string; method: string }) =>
+      api.post(`/payments/${id}/mark-received`, { paymentMethod: method }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["rpt-out"] });
+      qc.invalidateQueries({ queryKey: ["outstanding"] });
+    },
+    onError: (e: Error) => toast(e.message, "error"),
+  });
+
+  if (!data) return <Loader />;
+  const { invoices, pendingPayments, byGuest, totalOutstanding } = data;
+
   return (
-    <div className="space-y-4">
-      <div className="flex justify-end">
-        <ExportBtn onClick={() => exportCsv(`outstanding.csv`, data)} />
+    <div className="space-y-5">
+      <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+        <div className="card">
+          <div className="label">Total Outstanding</div>
+          <div className="text-2xl font-bold text-danger font-mono">{inr(totalOutstanding)}</div>
+        </div>
+        <div className="card">
+          <div className="label">Guests with balance</div>
+          <div className="text-2xl font-bold text-brand-dark">{byGuest.length}</div>
+        </div>
+        <div className="card">
+          <div className="label">Pending payments</div>
+          <div className="text-2xl font-bold text-warning">{pendingPayments.length}</div>
+        </div>
       </div>
-      <div className="card p-0">
-        <table className="table-base">
-          <thead>
-            <tr>
-              <th>Invoice</th>
-              <th>Guest</th>
-              <th>Date</th>
-              <th>Status</th>
-              <th className="text-right">Total</th>
-              <th className="text-right">Balance</th>
-            </tr>
-          </thead>
-          <tbody>
-            {data.map((r) => (
-              <tr key={r.id}>
-                <td className="font-mono">{r.invoiceNumber}</td>
-                <td>{r.guestName}</td>
-                <td>{format(new Date(r.createdAt), "dd MMM yyyy")}</td>
-                <td className="capitalize">{r.status}</td>
-                <td className="text-right font-mono">{inr(r.grandTotal)}</td>
-                <td className="text-right font-mono text-danger font-semibold">
-                  {inr(r.balanceDue)}
-                </td>
+
+      {byGuest.length > 0 && (
+        <section>
+          <div className="text-xs uppercase tracking-wider text-textSecondary font-semibold mb-2">
+            By Guest
+          </div>
+          <div className="card p-0">
+            <table className="table-base">
+              <thead>
+                <tr>
+                  <th>Guest</th>
+                  <th>Phone</th>
+                  <th>Oldest invoice</th>
+                  <th className="text-right">Balance</th>
+                </tr>
+              </thead>
+              <tbody>
+                {byGuest.map((g) => (
+                  <tr
+                    key={g.guestId}
+                    className="cursor-pointer hover:bg-bg"
+                    onClick={() => navigate(`/guests/${g.guestId}`)}
+                  >
+                    <td className="font-medium">{g.guestName}</td>
+                    <td className="font-mono text-textSecondary">{g.guestPhone}</td>
+                    <td>
+                      {format(new Date(g.oldest), "dd MMM yyyy")}{" "}
+                      <span className="text-xs text-textSecondary">
+                        · {daysSince(g.oldest)}d ago
+                      </span>
+                    </td>
+                    <td className="text-right font-mono text-danger font-semibold">
+                      {inr(g.balance)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
+
+      {pendingPayments.length > 0 && (
+        <section>
+          <div className="text-xs uppercase tracking-wider text-textSecondary font-semibold mb-2">
+            Pending Payments (collect later)
+          </div>
+          <div className="card p-0">
+            <table className="table-base">
+              <thead>
+                <tr>
+                  <th>Reservation</th>
+                  <th>Guest</th>
+                  <th>Notes</th>
+                  <th>Promised</th>
+                  <th className="text-right">Amount</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {pendingPayments.map((p) => (
+                  <tr key={p.paymentId}>
+                    <td className="font-mono">{p.reservationNumber}</td>
+                    <td>
+                      <div>{p.guestName}</div>
+                      <div className="text-xs text-textSecondary font-mono">{p.guestPhone}</div>
+                    </td>
+                    <td className="text-xs text-textSecondary">{p.notes ?? ""}</td>
+                    <td>
+                      {format(new Date(p.promisedAt), "dd MMM yyyy")}{" "}
+                      <span className="text-xs text-textSecondary">
+                        · {daysSince(p.promisedAt)}d ago
+                      </span>
+                    </td>
+                    <td className="text-right font-mono text-danger font-semibold">
+                      {inr(p.amount)}
+                    </td>
+                    <td className="text-right">
+                      <button
+                        className="!h-7 !px-2 text-xs font-semibold rounded-sm bg-success text-white border-2 border-success hover:opacity-90"
+                        onClick={async () => {
+                          const chosen = await dialog.prompt({
+                            title: "Mark payment received",
+                            message: `Confirm collection of ${inr(p.amount)} from ${p.guestName}.`,
+                            okLabel: "Mark received",
+                            tone: "success",
+                            required: true,
+                            defaultValue: "cash",
+                            options: [
+                              { value: "cash", label: "Cash" },
+                              { value: "upi", label: "UPI" },
+                              { value: "card", label: "Card" },
+                              { value: "bank_transfer", label: "Bank transfer" },
+                            ],
+                          });
+                          if (chosen) markReceived.mutate({ id: p.paymentId, method: chosen });
+                        }}
+                        disabled={markReceived.isPending}
+                      >
+                        Mark Received
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
+
+      <section>
+        <div className="flex items-center justify-between mb-2">
+          <div className="text-xs uppercase tracking-wider text-textSecondary font-semibold">
+            All Unpaid Invoices
+          </div>
+          <ExportBtn onClick={() => exportCsv(`outstanding.csv`, invoices)} />
+        </div>
+        <div className="card p-0">
+          <table className="table-base">
+            <thead>
+              <tr>
+                <th>Invoice</th>
+                <th>Reservation</th>
+                <th>Guest</th>
+                <th>Issued</th>
+                <th>Status</th>
+                <th className="text-right">Total</th>
+                <th className="text-right">Balance</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
-        {data.length === 0 && <div className="p-6 text-textSecondary text-sm">Nothing outstanding.</div>}
-      </div>
+            </thead>
+            <tbody>
+              {invoices.map((r) => (
+                <tr
+                  key={r.invoiceId}
+                  className="cursor-pointer hover:bg-bg"
+                  onClick={() => navigate(`/reservations/${r.reservationId}`)}
+                >
+                  <td className="font-mono">{r.invoiceNumber}</td>
+                  <td className="font-mono text-textSecondary">{r.reservationNumber}</td>
+                  <td>{r.guestName}</td>
+                  <td>
+                    {format(new Date(r.issuedAt), "dd MMM yyyy")}{" "}
+                    <span className="text-xs text-textSecondary">
+                      · {daysSince(r.issuedAt)}d
+                    </span>
+                  </td>
+                  <td className="capitalize">{r.status}</td>
+                  <td className="text-right font-mono">{inr(r.grandTotal)}</td>
+                  <td className="text-right font-mono text-danger font-semibold">
+                    {inr(r.balanceDue)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {invoices.length === 0 && (
+            <div className="p-6 text-textSecondary text-sm">Nothing outstanding.</div>
+          )}
+        </div>
+      </section>
     </div>
   );
 }

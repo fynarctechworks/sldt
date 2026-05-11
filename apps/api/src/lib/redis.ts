@@ -31,10 +31,10 @@ export const pubClient = new IORedis(env.UPSTASH_REDIS_URL, ioOpts);
 export const subClient = new IORedis(env.UPSTASH_REDIS_URL, ioOpts);
 
 // Attach error handlers so unhandled-error spam stops; we already log via wrappers.
-pubClient.on("error", (err) => {
+pubClient.on("error", (err: Error) => {
   logger.debug({ err: err.message }, "redis pub error (ignored)");
 });
-subClient.on("error", (err) => {
+subClient.on("error", (err: Error) => {
   logger.debug({ err: err.message }, "redis sub error (ignored)");
 });
 

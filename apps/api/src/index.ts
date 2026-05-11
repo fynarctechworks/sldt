@@ -17,6 +17,7 @@ import messageRoutes from "./routes/messages.js";
 import notificationRoutes from "./routes/notifications.js";
 import otpRoutes from "./routes/otp.js";
 import paymentRoutes from "./routes/payments.js";
+import rbacRoutes from "./routes/rbac.js";
 import reportRoutes from "./routes/reports.js";
 import reservationRoutes from "./routes/reservations.js";
 import roomRoutes from "./routes/rooms.js";
@@ -61,6 +62,7 @@ v1.use("/staff", staffRouter);
 v1.use("/otp", otpRoutes);
 v1.use("/notifications", notificationRoutes);
 v1.use("/messages", messageRoutes);
+v1.use("/rbac", rbacRoutes);
 
 app.use("/api/v1", v1);
 

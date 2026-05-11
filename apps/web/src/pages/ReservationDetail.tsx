@@ -20,14 +20,15 @@ import { useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useAuth } from "@/auth/AuthContext";
 import { CheckInReceiptModal, type CheckInReceiptData } from "@/components/CheckInReceiptModal";
+import { useDialog } from "@/components/Dialog";
 import { KycModal } from "@/components/KycModal";
+import { PdfPreviewModal } from "@/components/PdfPreviewModal";
 import { Loader } from "@/components/Loader";
 import { OtpModal } from "@/components/OtpModal";
 import { RoomActionPopover } from "@/components/RoomActionPopover";
 import { StatusBadge } from "@/components/StatusBadge";
 import { useToast } from "@/components/Toast";
 import { api } from "@/lib/api";
-import { supabase } from "@/lib/supabase";
 import { inr } from "@/lib/utils";
 
 interface Detail {
@@ -47,6 +48,7 @@ interface Detail {
   advancePaid: string;
   balanceDue: string;
   gstRate: string;
+  gstAmount: string;
   hotelCheckInTime: string;
   hotelCheckOutTime: string;
   guest: {
@@ -82,6 +84,7 @@ interface Detail {
     id: string;
     amount: string;
     paymentMethod: string;
+    status?: string;
     paymentDate: string;
     notes: string | null;
     receiptNumber: string | null;
@@ -95,6 +98,7 @@ export default function ReservationDetail() {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const { profile } = useAuth();
+  const dialog = useDialog();
   const [err, setErr] = useState<string | null>(null);
 
   const [showCharge, setShowCharge] = useState(false);
@@ -107,6 +111,7 @@ export default function ReservationDetail() {
   const [showEditDates, setShowEditDates] = useState(false);
   const [showOtp, setShowOtp] = useState(false);
   const [showCheckInReceipt, setShowCheckInReceipt] = useState(false);
+  const [pdfPreview, setPdfPreview] = useState<{ url: string; title: string; filename: string } | null>(null);
   const { toast } = useToast();
 
   const { data, isLoading } = useQuery({
@@ -165,44 +170,20 @@ export default function ReservationDetail() {
     onError: (e: Error) => setErr(e.message),
   });
 
-  async function downloadPdf(invoiceId: string, invoiceNumber: string) {
-    const { data: session } = await supabase.auth.getSession();
-    const token = session.session?.access_token;
-    const res = await fetch(
-      `${import.meta.env.VITE_API_URL}/invoices/${invoiceId}/pdf`,
-      { headers: token ? { Authorization: `Bearer ${token}` } : {} },
-    );
-    if (!res.ok) {
-      setErr(`PDF download failed (${res.status})`);
-      return;
-    }
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${invoiceNumber}.pdf`;
-    a.click();
-    URL.revokeObjectURL(url);
+  function previewInvoice(invoiceId: string, invoiceNumber: string) {
+    setPdfPreview({
+      url: `${import.meta.env.VITE_API_URL}/invoices/${invoiceId}/pdf`,
+      title: `Invoice · ${invoiceNumber}`,
+      filename: `${invoiceNumber}.pdf`,
+    });
   }
 
-  async function downloadReceipt(paymentId: string, receiptNumber: string | null) {
-    const { data: session } = await supabase.auth.getSession();
-    const token = session.session?.access_token;
-    const res = await fetch(
-      `${import.meta.env.VITE_API_URL}/payments/${paymentId}/receipt`,
-      { headers: token ? { Authorization: `Bearer ${token}` } : {} },
-    );
-    if (!res.ok) {
-      setErr(`Receipt download failed (${res.status})`);
-      return;
-    }
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${receiptNumber ?? "receipt-" + paymentId.slice(0, 8)}.pdf`;
-    a.click();
-    URL.revokeObjectURL(url);
+  function previewReceipt(paymentId: string, receiptNumber: string | null) {
+    setPdfPreview({
+      url: `${import.meta.env.VITE_API_URL}/payments/${paymentId}/receipt`,
+      title: `Receipt · ${receiptNumber ?? paymentId.slice(0, 8)}`,
+      filename: `${receiptNumber ?? "receipt-" + paymentId.slice(0, 8)}.pdf`,
+    });
   }
 
   if (isLoading) return <Loader size="lg" />;
@@ -327,6 +308,20 @@ export default function ReservationDetail() {
             Check Out & Generate Invoice
           </button>
         )}
+        {canCheckOut && (
+          <button
+            className="btn-secondary inline-flex items-center gap-2"
+            onClick={() =>
+              setPdfPreview({
+                url: `${import.meta.env.VITE_API_URL}/reservations/${r.id}/invoice-preview`,
+                title: `Invoice Preview · ${r.reservationNumber}`,
+                filename: `${r.reservationNumber}-preview.pdf`,
+              })
+            }
+          >
+            <FileDown className="w-4 h-4" /> Preview Invoice
+          </button>
+        )}
         {(r.status === "checked_in" || r.status === "confirmed") && (
           <button className="btn-secondary inline-flex items-center gap-2" onClick={() => setShowCharge(true)}>
             <Plus className="w-4 h-4" /> Add Charge
@@ -360,8 +355,17 @@ export default function ReservationDetail() {
         {canCancel && (
           <button
             className="btn-danger inline-flex items-center gap-2"
-            onClick={() => {
-              const reason = prompt("Cancellation reason?");
+            onClick={async () => {
+              const reason = await dialog.prompt({
+                title: "Cancel reservation",
+                message: "This cannot be undone. Please provide a reason for the records.",
+                placeholder: "e.g. Guest requested, no-show, duplicate booking",
+                okLabel: "Cancel reservation",
+                cancelLabel: "Keep it",
+                tone: "danger",
+                required: true,
+                multiline: true,
+              });
               if (reason) cancel.mutate(reason);
             }}
           >
@@ -441,16 +445,23 @@ export default function ReservationDetail() {
             <div className="flex gap-2">
               <button
                 className="btn-secondary inline-flex items-center gap-2"
-                onClick={() => downloadPdf(invoice.id, invoice.invoiceNumber)}
+                onClick={() => previewInvoice(invoice.id, invoice.invoiceNumber)}
               >
-                <FileDown className="w-4 h-4" /> PDF
+                <FileDown className="w-4 h-4" /> Preview
               </button>
               {profile?.role === "admin" && invoice.status !== "voided" && (
                 <>
                   <button
                     className="btn-secondary"
                     onClick={async () => {
-                      const reason = prompt("Reissue reason (correction)?");
+                      const reason = await dialog.prompt({
+                        title: "Reissue invoice",
+                        message: "Issue a corrected invoice. The original will be marked superseded.",
+                        placeholder: "Correction reason",
+                        okLabel: "Reissue",
+                        required: true,
+                        multiline: true,
+                      });
                       if (!reason) return;
                       try {
                         await api.post(`/invoices/${invoice.id}/reissue`, { reason });
@@ -465,7 +476,15 @@ export default function ReservationDetail() {
                   <button
                     className="btn-danger"
                     onClick={async () => {
-                      const reason = prompt("Void reason?");
+                      const reason = await dialog.prompt({
+                        title: "Void invoice",
+                        message: "Voiding marks this invoice as cancelled and zeros it out.",
+                        placeholder: "Void reason",
+                        okLabel: "Void invoice",
+                        tone: "danger",
+                        required: true,
+                        multiline: true,
+                      });
                       if (!reason) return;
                       try {
                         await api.post(`/invoices/${invoice.id}/void`, { reason });
@@ -504,7 +523,7 @@ export default function ReservationDetail() {
                   payment={p}
                   isAdmin={profile?.role === "admin"}
                   onSaved={invalidate}
-                  onPrintReceipt={() => downloadReceipt(p.id, p.receiptNumber)}
+                  onPrintReceipt={() => previewReceipt(p.id, p.receiptNumber)}
                 />
               ))}
             </tbody>
@@ -586,6 +605,8 @@ export default function ReservationDetail() {
                 ratePerNight: rm.ratePerNight,
               })),
               subtotal: r.subtotal,
+              gstRate: r.gstRate,
+              gstAmount: r.gstAmount ?? "",
               grandTotal: r.grandTotal,
               advancePaid: r.advancePaid,
               balanceDue: r.balanceDue,
@@ -660,6 +681,13 @@ export default function ReservationDetail() {
           }}
         />
       )}
+      <PdfPreviewModal
+        open={!!pdfPreview}
+        url={pdfPreview?.url ?? null}
+        title={pdfPreview?.title ?? ""}
+        filename={pdfPreview?.filename ?? "document.pdf"}
+        onClose={() => setPdfPreview(null)}
+      />
     </div>
   );
 }
@@ -790,6 +818,7 @@ function ChargeRow(props: {
   canEdit: boolean;
   onSaved: () => void;
 }) {
+  const dialog = useDialog();
   const [editing, setEditing] = useState(false);
   const [description, setDescription] = useState(props.charge.description);
   const [amount, setAmount] = useState(Number(props.charge.amount));
@@ -853,8 +882,14 @@ function ChargeRow(props: {
             </button>
             <button
               className="btn-secondary !h-7 !px-2 text-danger"
-              onClick={() => {
-                if (confirm(`Delete charge "${props.charge.description}"?`)) del.mutate();
+              onClick={async () => {
+                const ok = await dialog.confirm({
+                  title: "Delete charge",
+                  message: `Remove "${props.charge.description}" from this reservation?`,
+                  okLabel: "Delete",
+                  tone: "danger",
+                });
+                if (ok) del.mutate();
               }}
               title="Delete"
             >
@@ -893,6 +928,7 @@ function PaymentRow(props: {
     id: string;
     amount: string;
     paymentMethod: string;
+    status?: string;
     paymentDate: string;
     notes: string | null;
     receiptNumber: string | null;
@@ -903,6 +939,9 @@ function PaymentRow(props: {
   onSaved: () => void;
   onPrintReceipt: () => void;
 }) {
+  const dialog = useDialog();
+  const { toast } = useToast();
+  const isPending = props.payment.status === "pending";
   const [editing, setEditing] = useState(false);
   const [paymentDate, setPaymentDate] = useState(
     new Date(props.payment.paymentDate).toISOString().slice(0, 16),
@@ -926,6 +965,13 @@ function PaymentRow(props: {
   const voidPay = useMutation({
     mutationFn: (reason: string) => api.post(`/payments/${props.payment.id}/void`, { reason }),
     onSuccess: props.onSaved,
+  });
+
+  const markReceived = useMutation({
+    mutationFn: (chosenMethod: string) =>
+      api.post(`/payments/${props.payment.id}/mark-received`, { paymentMethod: chosenMethod }),
+    onSuccess: props.onSaved,
+    onError: (e: Error) => toast(e.message, "error"),
   });
 
   const within24h =
@@ -968,10 +1014,16 @@ function PaymentRow(props: {
             <option value="upi">UPI</option>
             <option value="card">Card</option>
             <option value="bank_transfer">Bank Transfer</option>
-            <option value="cheque">Cheque</option>
           </select>
         ) : (
-          props.payment.paymentMethod.replace("_", " ")
+          <div className="flex items-center gap-2">
+            <span>{props.payment.paymentMethod.replace("_", " ")}</span>
+            {isPending && (
+              <span className="text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded font-bold bg-warning/20 text-warning">
+                Pending
+              </span>
+            )}
+          </div>
         )}
       </td>
       <td className="font-mono text-xs">
@@ -995,10 +1047,36 @@ function PaymentRow(props: {
       <td className="text-right">
         {!editing && (
           <div className="inline-flex gap-1">
+            {isPending && (
+              <button
+                className="!h-7 !px-2 text-xs font-semibold rounded-sm bg-success text-white border-2 border-success hover:opacity-90 inline-flex items-center gap-1"
+                onClick={async () => {
+                  const chosen = await dialog.prompt({
+                    title: "Mark payment received",
+                    message: `Confirm collection of ${inr(props.payment.amount)}.`,
+                    okLabel: "Mark received",
+                    tone: "success",
+                    required: true,
+                    defaultValue: "cash",
+                    options: [
+                      { value: "cash", label: "Cash" },
+                      { value: "upi", label: "UPI" },
+                      { value: "card", label: "Card" },
+                      { value: "bank_transfer", label: "Bank transfer" },
+                    ],
+                  });
+                  if (chosen) markReceived.mutate(chosen);
+                }}
+                disabled={markReceived.isPending}
+                title="Mark as received"
+              >
+                Mark Received
+              </button>
+            )}
             <button
               className="btn-secondary !h-7 !px-2"
               onClick={props.onPrintReceipt}
-              title={`Download receipt ${props.payment.receiptNumber ?? ""}`}
+              title={`Preview receipt ${props.payment.receiptNumber ?? ""}`}
             >
               <Printer className="w-3.5 h-3.5" />
             </button>
@@ -1014,8 +1092,15 @@ function PaymentRow(props: {
             {props.isAdmin && (
               <button
                 className="btn-secondary !h-7 !px-2 text-danger"
-                onClick={() => {
-                  const reason = prompt("Void reason?");
+                onClick={async () => {
+                  const reason = await dialog.prompt({
+                    title: "Void payment",
+                    message: `Void this ${inr(props.payment.amount)} payment? It will be reversed in the ledger.`,
+                    placeholder: "Void reason",
+                    okLabel: "Void payment",
+                    tone: "danger",
+                    required: true,
+                  });
                   if (reason) voidPay.mutate(reason);
                 }}
                 title="Void"
@@ -1157,7 +1242,7 @@ function AddRoomModal(props: {
 
   return (
     <ModalShell title="Add Room to Reservation" onClose={props.onClose}>
-      <div className="space-y-3">
+      <div className="space-y-4">
         <div className="grid grid-cols-2 gap-3">
           <div>
             <label className="label block mb-1">Start Date</label>
@@ -1174,38 +1259,54 @@ function AddRoomModal(props: {
             />
           </div>
           <div>
-            <label className="label block mb-1">End Date (reservation check-out)</label>
-            <input className="input" type="date" value={props.checkOutDate} disabled />
+            <label className="label block mb-1">End Date (check-out)</label>
+            <input
+              className="input bg-bg/50 cursor-not-allowed"
+              type="date"
+              value={props.checkOutDate}
+              disabled
+            />
           </div>
         </div>
 
         <div>
-          <label className="label block mb-1">Available Rooms</label>
+          <label className="label block mb-1.5">Available Rooms</label>
           {avail.isLoading ? (
-            <div className="text-sm text-textSecondary">Checking availability…</div>
+            <div className="text-sm text-textSecondary py-3">Checking availability…</div>
           ) : available.length === 0 ? (
-            <div className="text-sm text-textSecondary">No rooms available for this range.</div>
+            <div className="text-sm text-textSecondary py-3">
+              No rooms available for this range.
+            </div>
           ) : (
-            <div className="grid grid-cols-3 gap-2 max-h-52 overflow-y-auto">
-              {available.map((rm) => (
-                <button
-                  key={rm.id}
-                  type="button"
-                  onClick={() => {
-                    setSelectedRoomId(rm.id);
-                    setRatePerNight(Number(rm.baseRate));
-                  }}
-                  className={`p-2 rounded border text-left ${
-                    selectedRoomId === rm.id
-                      ? "border-navy bg-navy/5"
-                      : "border-gray-300 hover:bg-gray-50"
-                  }`}
-                >
-                  <div className="font-mono font-bold text-navy">{rm.roomNumber}</div>
-                  <div className="text-xs capitalize text-textSecondary">{rm.roomType}</div>
-                  <div className="text-xs font-mono">₹{Number(rm.baseRate).toFixed(0)}/n</div>
-                </button>
-              ))}
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 max-h-56 overflow-y-auto pr-1">
+              {available.map((rm) => {
+                const active = selectedRoomId === rm.id;
+                return (
+                  <button
+                    key={rm.id}
+                    type="button"
+                    onClick={() => {
+                      setSelectedRoomId(rm.id);
+                      setRatePerNight(Number(rm.baseRate));
+                    }}
+                    className={`p-2.5 rounded-sm border-2 text-left transition-colors ${
+                      active
+                        ? "border-brand-dark bg-brand-soft"
+                        : "border-borderc hover:border-brand-dark hover:bg-bg"
+                    }`}
+                  >
+                    <div className="font-mono font-bold text-brand-dark text-sm leading-tight">
+                      {rm.roomNumber}
+                    </div>
+                    <div className="text-[11px] capitalize text-textSecondary mt-0.5 truncate">
+                      {rm.roomType}
+                    </div>
+                    <div className="text-xs font-mono text-textPrimary mt-1">
+                      ₹{Number(rm.baseRate).toFixed(0)}/n
+                    </div>
+                  </button>
+                );
+              })}
             </div>
           )}
         </div>
@@ -1218,20 +1319,26 @@ function AddRoomModal(props: {
               type="number"
               min={0}
               step="0.01"
-              value={ratePerNight}
+              value={ratePerNight || ""}
+              placeholder="0"
               onChange={(e) => setRatePerNight(Number(e.target.value))}
             />
             <div className="text-xs text-textSecondary mt-1">
-              Base rate: ₹{Number(selectedRoom.baseRate).toFixed(0)}
+              Base rate: ₹{Number(selectedRoom.baseRate).toFixed(0)}/night
             </div>
           </div>
         )}
 
         {err && <div className="text-danger text-sm">{err}</div>}
-        <div className="flex justify-end gap-2">
-          <button className="btn-secondary" onClick={props.onClose}>Cancel</button>
+        <div className="flex justify-end gap-2 pt-1">
           <button
-            className="btn-primary"
+            className="px-4 h-9 text-sm font-semibold rounded-sm border-2 border-borderc text-textSecondary hover:border-textSecondary hover:text-textPrimary transition-colors"
+            onClick={props.onClose}
+          >
+            Cancel
+          </button>
+          <button
+            className="px-4 h-9 text-sm font-semibold rounded-sm bg-brand-dark text-cream border-2 border-brand-dark hover:opacity-90 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed"
             disabled={!selectedRoomId || ratePerNight <= 0 || save.isPending}
             onClick={() => save.mutate()}
           >
@@ -1369,7 +1476,8 @@ function LateCheckoutModal(props: {
               type="number"
               min={0}
               step="0.01"
-              value={fee}
+              value={fee || ""}
+              placeholder="0"
               onChange={(e) => setFee(Number(e.target.value))}
             />
           </div>
@@ -1413,7 +1521,8 @@ function ChargeModal(props: {
     mutationFn: () =>
       api.post(`/reservations/${props.reservationId}/charges`, {
         description,
-        amount,
+        quantity: 1,
+        rate: amount,
         gstRate,
       }),
     onSuccess: props.onSaved,
@@ -1440,7 +1549,8 @@ function ChargeModal(props: {
               type="number"
               min={0}
               step="0.01"
-              value={amount}
+              value={amount || ""}
+              placeholder="0"
               onChange={(e) => setAmount(Number(e.target.value))}
             />
           </div>
@@ -1480,17 +1590,16 @@ function PaymentModal(props: {
   onSaved: () => void;
 }) {
   const [amount, setAmount] = useState(props.balance);
-  const [method, setMethod] = useState<"cash" | "card" | "upi" | "bank_transfer" | "cheque">("cash");
+  const [method, setMethod] = useState<"cash" | "card" | "upi" | "bank_transfer">("cash");
   const [reference, setReference] = useState("");
   const [err, setErr] = useState<string | null>(null);
 
   const save = useMutation({
     mutationFn: () =>
-      api.post(`/payments`, {
-        reservationId: props.reservationId,
+      api.post(`/reservations/${props.reservationId}/payments`, {
         amount,
         paymentMethod: method,
-        reference: reference || undefined,
+        notes: reference || undefined,
       }),
     onSuccess: props.onSaved,
     onError: (e: Error) => setErr(e.message),
@@ -1506,7 +1615,8 @@ function PaymentModal(props: {
             type="number"
             min={0}
             step="0.01"
-            value={amount}
+            value={amount || ""}
+            placeholder="0"
             onChange={(e) => setAmount(Number(e.target.value))}
           />
           <div className="text-xs text-textSecondary mt-1">Balance due: {inr(props.balance)}</div>
@@ -1522,7 +1632,6 @@ function PaymentModal(props: {
             <option value="upi">UPI</option>
             <option value="card">Card</option>
             <option value="bank_transfer">Bank Transfer</option>
-            <option value="cheque">Cheque</option>
           </select>
         </div>
         <div>
@@ -1556,16 +1665,23 @@ function CheckoutModal(props: {
   onClose: () => void;
   onDone: () => void;
 }) {
-  const [finalAmount, setFinalAmount] = useState(0);
-  const [method, setMethod] = useState<"cash" | "card" | "upi" | "bank_transfer">("cash");
+  const [finalAmount, setFinalAmount] = useState(props.balance);
+  const [method, setMethod] = useState<"cash" | "card" | "upi" | "bank_transfer" | "unpaid">("cash");
+  const [paymentNotes, setPaymentNotes] = useState("");
   const [err, setErr] = useState<string | null>(null);
+
+  const isUnpaid = method === "unpaid";
+  const balanceRemaining = props.balance > 0.009;
+  const submitDisabled =
+    balanceRemaining && (finalAmount <= 0.009 || (isUnpaid && paymentNotes.trim() === ""));
 
   const act = useMutation({
     mutationFn: () => {
       const body: Record<string, unknown> = {};
-      if (finalAmount > 0) {
+      if (balanceRemaining && finalAmount > 0) {
         body.finalPayment = finalAmount;
         body.paymentMethod = method;
+        if (isUnpaid) body.paymentNotes = paymentNotes;
       }
       return api.post(`/reservations/${props.reservationId}/check-out`, body);
     },
@@ -1582,14 +1698,18 @@ function CheckoutModal(props: {
         </div>
         <div className="grid grid-cols-2 gap-3">
           <div>
-            <label className="label block mb-1">Final Payment (optional)</label>
+            <label className="label block mb-1">
+              Final Payment {balanceRemaining && <span className="text-danger">*</span>}
+            </label>
             <input
               className="input"
               type="number"
               min={0}
               step="0.01"
-              value={finalAmount}
+              value={finalAmount || ""}
+              placeholder={balanceRemaining ? String(props.balance) : "0"}
               onChange={(e) => setFinalAmount(Number(e.target.value))}
+              disabled={!balanceRemaining}
             />
           </div>
           <div>
@@ -1598,18 +1718,46 @@ function CheckoutModal(props: {
               className="input"
               value={method}
               onChange={(e) => setMethod(e.target.value as typeof method)}
+              disabled={!balanceRemaining}
             >
               <option value="cash">Cash</option>
               <option value="upi">UPI</option>
               <option value="card">Card</option>
               <option value="bank_transfer">Bank Transfer</option>
+              <option value="unpaid">Unpaid · Collect later</option>
             </select>
           </div>
         </div>
+        {isUnpaid && (
+          <div className="rounded-sm border border-warning/40 bg-warning/5 p-3 space-y-2">
+            <div className="text-xs text-warning font-semibold uppercase tracking-wider">
+              Unpaid checkout
+            </div>
+            <div className="text-xs text-textSecondary">
+              Invoice will be issued as unpaid. Mark it received from the guest profile or the
+              reservation page when the guest pays.
+            </div>
+            <div>
+              <label className="label block mb-1">
+                Reason / notes <span className="text-danger">*</span>
+              </label>
+              <input
+                className="input"
+                value={paymentNotes}
+                onChange={(e) => setPaymentNotes(e.target.value)}
+                placeholder="e.g. trusted regular, will pay next visit"
+              />
+            </div>
+          </div>
+        )}
         {err && <div className="text-danger text-sm">{err}</div>}
         <div className="flex justify-end gap-2">
           <button className="btn-secondary" onClick={props.onClose}>Cancel</button>
-          <button className="btn-primary" onClick={() => act.mutate()} disabled={act.isPending}>
+          <button
+            className="btn-primary"
+            onClick={() => act.mutate()}
+            disabled={act.isPending || submitDisabled}
+          >
             {act.isPending ? "Processing…" : "Complete Check-out"}
           </button>
         </div>

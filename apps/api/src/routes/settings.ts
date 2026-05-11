@@ -9,6 +9,7 @@ import { and, asc, count as sqlCount, eq, sql } from "drizzle-orm";
 import { Router } from "express";
 import { db } from "../db/client.js";
 import { profiles } from "../db/schema/profiles.js";
+import { roles, userRoles } from "../db/schema/rbac.js";
 import { reservationRooms } from "../db/schema/reservations.js";
 import { rooms } from "../db/schema/rooms.js";
 import { roomTypes, settings } from "../db/schema/settings.js";
@@ -21,12 +22,12 @@ import {
   upsertTemplate,
 } from "../lib/templates.js";
 import { supabaseAdmin } from "../lib/supabase.js";
-import { requireAdmin, requireAuth, requireRole } from "../middleware/auth.js";
+import { requireAuth, requirePermission } from "../middleware/auth.js";
 import { validate } from "../middleware/validate.js";
 
 const router = Router();
 
-router.get("/", requireAuth, requireAdmin, async (_req, res) => {
+router.get("/", requireAuth, requirePermission("manage_settings"), async (_req, res) => {
   const rows = await db.select().from(settings).limit(1);
   const types = await db.select().from(roomTypes).orderBy(asc(roomTypes.label));
   return ok(res, { settings: rows[0] ?? null, roomTypes: types });
@@ -48,7 +49,7 @@ router.get("/public", requireAuth, async (_req, res) => {
   return ok(res, rows[0] ?? null);
 });
 
-router.put("/", requireAuth, requireAdmin, validate(settingsUpdateSchema), async (req, res) => {
+router.put("/", requireAuth, requirePermission("manage_settings"), validate(settingsUpdateSchema), async (req, res) => {
   const input = req.body as Record<string, unknown>;
   const rows = await db.select().from(settings).limit(1);
   if (!rows.length) return fail(res, 404, "NOT_FOUND", "Settings not initialized");
@@ -71,7 +72,7 @@ router.put("/", requireAuth, requireAdmin, validate(settingsUpdateSchema), async
   return ok(res, updated);
 });
 
-router.get("/room-types", requireAuth, requireRole("admin", "frontdesk"), async (req, res) => {
+router.get("/room-types", requireAuth, requirePermission("view_rooms", "manage_settings"), async (req, res) => {
   const includeArchived = req.query.all === "true";
   const rows = await db
     .select()
@@ -84,7 +85,7 @@ router.get("/room-types", requireAuth, requireRole("admin", "frontdesk"), async 
 router.post(
   "/room-types",
   requireAuth,
-  requireAdmin,
+  requirePermission("manage_settings"),
   validate(roomTypeCreateSchema),
   async (req, res) => {
     const input = req.body as {
@@ -126,7 +127,7 @@ router.post(
 router.put(
   "/room-types/:id",
   requireAuth,
-  requireAdmin,
+  requirePermission("manage_settings"),
   validate(roomTypeUpdateSchema),
   async (req, res) => {
     const id = req.params.id!;
@@ -182,7 +183,7 @@ router.put(
   },
 );
 
-router.delete("/room-types/:id", requireAuth, requireAdmin, async (req, res) => {
+router.delete("/room-types/:id", requireAuth, requirePermission("manage_settings"), async (req, res) => {
   const id = req.params.id!;
   const existing = await db.select().from(roomTypes).where(eq(roomTypes.id, id)).limit(1);
   if (!existing.length) return fail(res, 404, "NOT_FOUND", "Room type not found");
@@ -224,12 +225,12 @@ router.delete("/room-types/:id", requireAuth, requireAdmin, async (req, res) => 
 
 // ============ MESSAGE TEMPLATES ============
 
-router.get("/templates", requireAuth, requireAdmin, async (_req, res) => {
+router.get("/templates", requireAuth, requirePermission("manage_templates"), async (_req, res) => {
   const items = await getAllTemplatesForUI();
   return ok(res, { items });
 });
 
-router.put("/templates/:key", requireAuth, requireAdmin, async (req, res) => {
+router.put("/templates/:key", requireAuth, requirePermission("manage_templates"), async (req, res) => {
   const key = req.params.key;
   if (!key || !(key in TEMPLATE_DEFAULTS)) {
     return fail(res, 400, "INVALID_KEY", "Unknown template key");
@@ -250,7 +251,7 @@ router.put("/templates/:key", requireAuth, requireAdmin, async (req, res) => {
   return ok(res, { ok: true });
 });
 
-router.post("/templates/:key/reset", requireAuth, requireAdmin, async (req, res) => {
+router.post("/templates/:key/reset", requireAuth, requirePermission("manage_templates"), async (req, res) => {
   const key = req.params.key;
   if (!key || !(key in TEMPLATE_DEFAULTS)) {
     return fail(res, 400, "INVALID_KEY", "Unknown template key");
@@ -268,12 +269,12 @@ router.post("/templates/:key/reset", requireAuth, requireAdmin, async (req, res)
 
 const staffRouter = Router();
 
-staffRouter.get("/", requireAuth, requireAdmin, async (_req, res) => {
+staffRouter.get("/", requireAuth, requirePermission("manage_staff"), async (_req, res) => {
   const rows = await db.select().from(profiles).orderBy(profiles.fullName);
   return ok(res, rows);
 });
 
-staffRouter.post("/", requireAuth, requireAdmin, validate(staffCreateSchema), async (req, res) => {
+staffRouter.post("/", requireAuth, requirePermission("manage_staff"), validate(staffCreateSchema), async (req, res) => {
   const input = req.body as {
     email: string;
     password: string;
@@ -301,6 +302,16 @@ staffRouter.post("/", requireAuth, requireAdmin, validate(staffCreateSchema), as
     })
     .returning();
 
+  // Map to RBAC user_roles. Falls back silently if the role row doesn't exist
+  // (shouldn't happen — system roles are seeded — but don't block staff creation).
+  const [r] = await db.select({ id: roles.id }).from(roles).where(eq(roles.key, input.role)).limit(1);
+  if (r) {
+    await db
+      .insert(userRoles)
+      .values({ userId: data.user.id, roleId: r.id, assignedBy: req.user!.id })
+      .onConflictDoNothing();
+  }
+
   await logActivity({
     action: "staff_created",
     entityType: "profile",
@@ -315,7 +326,7 @@ staffRouter.post("/", requireAuth, requireAdmin, validate(staffCreateSchema), as
 staffRouter.put(
   "/:id",
   requireAuth,
-  requireAdmin,
+  requirePermission("manage_staff"),
   validate(staffUpdateSchema),
   async (req, res) => {
     const id = req.params.id!;
@@ -377,7 +388,7 @@ staffRouter.put(
   },
 );
 
-staffRouter.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
+staffRouter.delete("/:id", requireAuth, requirePermission("manage_staff"), async (req, res) => {
   const id = req.params.id!;
   if (id === req.user!.id) return fail(res, 400, "SELF_DEACTIVATE", "You cannot deactivate yourself");
   const [updated] = await db
@@ -398,7 +409,7 @@ staffRouter.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
   return ok(res, updated);
 });
 
-staffRouter.delete("/:id/hard", requireAuth, requireAdmin, async (req, res) => {
+staffRouter.delete("/:id/hard", requireAuth, requirePermission("manage_staff"), async (req, res) => {
   const id = req.params.id!;
   if (id === req.user!.id) return fail(res, 400, "SELF_DELETE", "You cannot delete yourself");
 

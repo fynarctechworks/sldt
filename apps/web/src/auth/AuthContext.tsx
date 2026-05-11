@@ -1,5 +1,5 @@
 import type { Session } from "@supabase/supabase-js";
-import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import { api } from "@/lib/api";
 import { UI_PREVIEW } from "@/lib/mock-data";
 import { supabase } from "@/lib/supabase";
@@ -10,12 +10,18 @@ interface Profile {
   email: string;
   fullName: string;
   role: Role;
+  rbacRoleKey: string | null;
+  isGodMode: boolean;
+  permissions: string[];
 }
 
 interface AuthCtx {
   session: Session | null;
   profile: Profile | null;
   loading: boolean;
+  permissions: Set<string>;
+  isGodMode: boolean;
+  can: (key: string) => boolean;
   signIn: (email: string, password: string) => Promise<void>;
   signOut: () => Promise<void>;
 }
@@ -28,6 +34,9 @@ const FAKE_PROFILE: Profile = {
   email: "admin@hoteldesk.local",
   fullName: "Preview Admin",
   role: "admin",
+  rbacRoleKey: "admin",
+  isGodMode: true,
+  permissions: [],
 };
 
 export function AuthProvider({ children }: { children: ReactNode }) {
@@ -80,11 +89,32 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     await supabase.auth.signOut();
   }
 
-  return <Ctx.Provider value={{ session, profile, loading, signIn, signOut }}>{children}</Ctx.Provider>;
+  const permissions = useMemo(
+    () => new Set(profile?.permissions ?? []),
+    [profile?.permissions],
+  );
+  const isGodMode = profile?.isGodMode ?? false;
+
+  function can(key: string): boolean {
+    if (isGodMode) return true;
+    return permissions.has(key);
+  }
+
+  return (
+    <Ctx.Provider
+      value={{ session, profile, loading, permissions, isGodMode, can, signIn, signOut }}
+    >
+      {children}
+    </Ctx.Provider>
+  );
 }
 
 export function useAuth() {
   const v = useContext(Ctx);
   if (!v) throw new Error("useAuth must be used inside AuthProvider");
   return v;
+}
+
+export function usePermission(key: string): boolean {
+  return useAuth().can(key);
 }

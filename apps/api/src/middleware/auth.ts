@@ -3,6 +3,7 @@ import type { NextFunction, Request, Response } from "express";
 import { db } from "../db/client.js";
 import type { Role } from "../db/schema/enums.js";
 import { profiles } from "../db/schema/profiles.js";
+import { getUserPermissions, hasPermission } from "../lib/permission-resolver.js";
 import { supabaseAdmin } from "../lib/supabase.js";
 import { fail } from "../lib/response.js";
 
@@ -13,6 +14,9 @@ declare module "express-serve-static-core" {
       email: string;
       role: Role;
       fullName: string;
+      permissions: Set<string>;
+      isGodMode: boolean;
+      rbacRoleKey: string | null;
     };
   }
 }
@@ -42,11 +46,18 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     return fail(res, 403, "INACTIVE_USER", "Account is deactivated");
   }
 
+  // Resolve effective RBAC permissions. Falls back gracefully if user_roles row is missing
+  // (legacy users) — they'll get the empty set and only legacy requireRole checks pass.
+  const perms = await getUserPermissions(profile[0]!.id);
+
   req.user = {
     id: profile[0]!.id,
     email: profile[0]!.email,
     role: profile[0]!.role,
     fullName: profile[0]!.fullName,
+    permissions: perms.permissions,
+    isGodMode: perms.isGodMode,
+    rbacRoleKey: perms.roleKey,
   };
   next();
 }
@@ -56,6 +67,24 @@ export function requireRole(...roles: Role[]) {
     if (!req.user) return fail(res, 401, "UNAUTHENTICATED", "Not authenticated");
     if (!roles.includes(req.user.role)) {
       return fail(res, 403, "FORBIDDEN", `Requires role: ${roles.join(" or ")}`);
+    }
+    next();
+  };
+}
+
+// Permission-based gate. Pass one or more permission keys; user must have at least one.
+// Admin (god mode) always passes.
+export function requirePermission(...keys: string[]) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    if (!req.user) return fail(res, 401, "UNAUTHENTICATED", "Not authenticated");
+    const ok = keys.some((k) => hasPermission(req.user!, k));
+    if (!ok) {
+      return fail(
+        res,
+        403,
+        "FORBIDDEN",
+        `Requires permission: ${keys.join(" or ")}`,
+      );
     }
     next();
   };

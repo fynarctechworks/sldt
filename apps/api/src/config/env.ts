@@ -29,7 +29,7 @@ const envSchema = z.object({
 
   TWILIO_ACCOUNT_SID: z.string().optional().transform((v) => (v === "" ? undefined : v)),
   TWILIO_AUTH_TOKEN: z.string().optional().transform((v) => (v === "" ? undefined : v)),
-  TWILIO_FROM_NUMBER: z.string().optional().transform((v) => (v === "" ? undefined : v)),
+  TWILIO_WHATSAPP_FROM: z.string().optional().transform((v) => (v === "" ? undefined : v)),
   TWILIO_MESSAGING_SERVICE_SID: z.string().optional().transform((v) => (v === "" ? undefined : v)),
 
   OTP_LENGTH: z.coerce.number().int().min(4).max(8).default(6),

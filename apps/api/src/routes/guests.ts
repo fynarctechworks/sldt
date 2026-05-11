@@ -13,11 +13,13 @@ import { Router } from "express";
 import multer from "multer";
 import { db } from "../db/client.js";
 import { guestFollowUps, guestNotes, guests } from "../db/schema/guests.js";
+import { reservations } from "../db/schema/reservations.js";
+import { invoices } from "../db/schema/invoices.js";
 import { logActivity } from "../lib/activity.js";
 import { encrypt, last4 } from "../lib/crypto.js";
 import { fail, list, ok } from "../lib/response.js";
 import { signedKycUrl, uploadKycPhoto, validateKycFile } from "../lib/storage.js";
-import { requireAdmin, requireAuth, requireRole } from "../middleware/auth.js";
+import { requireAuth, requirePermission } from "../middleware/auth.js";
 import { validate } from "../middleware/validate.js";
 
 const upload = multer({
@@ -41,7 +43,7 @@ function maskGuest<T extends { idProofNumberEncrypted: string; idProofLast4: str
 router.get(
   "/",
   requireAuth,
-  requireRole("admin", "frontdesk"),
+  requirePermission("view_guests"),
   validate(guestListQuerySchema, "query"),
   async (req, res) => {
     const { search, tag, has_followup, page, per_page } = req.query as unknown as {
@@ -94,7 +96,7 @@ router.get(
 router.get(
   "/check-duplicate",
   requireAuth,
-  requireRole("admin", "frontdesk"),
+  requirePermission("view_guests"),
   validate(guestDuplicateQuerySchema, "query"),
   async (req, res) => {
     const { phone, id_number } = req.query as { phone?: string; id_number?: string };
@@ -117,19 +119,53 @@ router.get(
 router.get(
   "/:id",
   requireAuth,
-  requireRole("admin", "frontdesk"),
+  requirePermission("view_guests"),
   async (req, res) => {
     const id = req.params.id!;
     const found = await db.select().from(guests).where(eq(guests.id, id)).limit(1);
     if (!found.length) return fail(res, 404, "NOT_FOUND", "Guest not found");
-    return ok(res, maskGuest(found[0]!, req.user!.role));
+
+    const [resStats, paidStats] = await Promise.all([
+      db
+        .select({
+          total: sql<number>`count(*)::int`,
+          completed: sql<number>`count(*) filter (where ${reservations.status} = 'checked_out')::int`,
+          upcoming: sql<number>`count(*) filter (where ${reservations.status} in ('confirmed','checked_in'))::int`,
+          cancelled: sql<number>`count(*) filter (where ${reservations.status} = 'cancelled')::int`,
+          firstStay: sql<string | null>`min(${reservations.checkInDate})`,
+          lastStay: sql<string | null>`max(${reservations.checkOutDate}) filter (where ${reservations.status} = 'checked_out')`,
+        })
+        .from(reservations)
+        .where(eq(reservations.guestId, id)),
+      db
+        .select({
+          totalSpent: sql<number>`coalesce(sum(${invoices.totalPaid}::numeric), 0)::float`,
+          balanceDue: sql<number>`coalesce(sum(${invoices.balanceDue}::numeric) filter (where ${invoices.status} != 'voided'), 0)::float`,
+        })
+        .from(invoices)
+        .where(eq(invoices.guestId, id)),
+    ]);
+
+    return ok(res, {
+      ...maskGuest(found[0]!, req.user!.role),
+      stats: {
+        totalStays: resStats[0]?.total ?? 0,
+        completedStays: resStats[0]?.completed ?? 0,
+        upcomingStays: resStats[0]?.upcoming ?? 0,
+        cancelledStays: resStats[0]?.cancelled ?? 0,
+        firstStay: resStats[0]?.firstStay ?? null,
+        lastStay: resStats[0]?.lastStay ?? null,
+        totalSpent: paidStats[0]?.totalSpent ?? 0,
+        balanceDue: paidStats[0]?.balanceDue ?? 0,
+      },
+    });
   },
 );
 
 router.post(
   "/",
   requireAuth,
-  requireRole("admin", "frontdesk"),
+  requirePermission("view_guests"),
   validate(guestCreateSchema),
   async (req, res) => {
     const input = req.body;
@@ -175,7 +211,7 @@ router.post(
 router.put(
   "/:id",
   requireAuth,
-  requireRole("admin", "frontdesk"),
+  requirePermission("view_guests"),
   validate(guestUpdateSchema),
   async (req, res) => {
     const id = req.params.id!;
@@ -208,7 +244,7 @@ router.put(
 router.post(
   "/:id/kyc",
   requireAuth,
-  requireRole("admin", "frontdesk"),
+  requirePermission("view_guests"),
   upload.fields([
     { name: "front", maxCount: 1 },
     { name: "back", maxCount: 1 },
@@ -265,7 +301,7 @@ router.post(
 router.get(
   "/:id/kyc",
   requireAuth,
-  requireRole("admin", "frontdesk"),
+  requirePermission("view_guests"),
   async (req, res) => {
     const id = req.params.id!;
     const found = await db.select().from(guests).where(eq(guests.id, id)).limit(1);
@@ -287,7 +323,7 @@ router.get(
 router.patch(
   "/:id/tags",
   requireAuth,
-  requireRole("admin", "frontdesk"),
+  requirePermission("view_guests"),
   validate(guestTagsSchema),
   async (req, res) => {
     const id = req.params.id!;
@@ -315,7 +351,7 @@ router.patch(
 router.get(
   "/:id/notes",
   requireAuth,
-  requireRole("admin", "frontdesk"),
+  requirePermission("view_guests"),
   async (req, res) => {
     const id = req.params.id!;
     const rows = await db
@@ -330,7 +366,7 @@ router.get(
 router.post(
   "/:id/notes",
   requireAuth,
-  requireRole("admin", "frontdesk"),
+  requirePermission("view_guests"),
   validate(guestNoteCreateSchema),
   async (req, res) => {
     const id = req.params.id!;
@@ -349,7 +385,7 @@ router.post(
 router.get(
   "/:id/follow-ups",
   requireAuth,
-  requireRole("admin", "frontdesk"),
+  requirePermission("view_guests"),
   async (req, res) => {
     const id = req.params.id!;
     const rows = await db
@@ -364,7 +400,7 @@ router.get(
 router.post(
   "/:id/follow-ups",
   requireAuth,
-  requireRole("admin", "frontdesk"),
+  requirePermission("view_guests"),
   validate(followUpCreateSchema),
   async (req, res) => {
     const id = req.params.id!;
@@ -398,7 +434,7 @@ router.post(
 router.patch(
   "/:id/follow-ups/:followUpId",
   requireAuth,
-  requireRole("admin", "frontdesk"),
+  requirePermission("view_guests"),
   validate(followUpUpdateSchema),
   async (req, res) => {
     const { followUpId } = req.params as { followUpId: string };
@@ -430,7 +466,7 @@ router.patch(
 router.get(
   "/follow-ups/due",
   requireAuth,
-  requireRole("admin", "frontdesk"),
+  requirePermission("view_guests"),
   async (req, res) => {
     const days = Math.min(30, Math.max(0, Number((req.query as { days?: string }).days ?? 7)));
     const rows = await db
@@ -457,7 +493,7 @@ router.get(
   },
 );
 
-router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
+router.delete("/:id", requireAuth, requirePermission("delete_guests"), async (req, res) => {
   const id = req.params.id!;
   const [deleted] = await db.delete(guests).where(eq(guests.id, id)).returning();
   if (!deleted) return fail(res, 404, "NOT_FOUND", "Guest not found");
