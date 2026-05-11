@@ -1,7 +1,8 @@
 import { UI_PREVIEW, mockGet, mockMutation } from "./mock-data";
 import { supabase } from "./supabase";
 
-const BASE = import.meta.env.VITE_API_URL as string;
+const RAW_BASE = (import.meta.env.VITE_API_URL as string) ?? "";
+const BASE = RAW_BASE.replace(/\/+$/, "");
 
 async function authHeader(): Promise<HeadersInit> {
   const { data } = await supabase.auth.getSession();
