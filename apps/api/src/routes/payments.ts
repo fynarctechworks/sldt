@@ -182,11 +182,10 @@ router.post(
     if (!existing.length) return fail(res, 404, "NOT_FOUND", "Payment not found");
     if (existing[0]!.voided) return fail(res, 400, "ALREADY_VOIDED", "Already voided");
 
-    const inv = await db
-      .select()
-      .from(invoices)
-      .where(eq(invoices.id, existing[0]!.invoiceId))
-      .limit(1);
+    const invoiceId = existing[0]!.invoiceId;
+    const inv = invoiceId
+      ? await db.select().from(invoices).where(eq(invoices.id, invoiceId)).limit(1)
+      : [];
 
     await db.transaction(async (tx) => {
       await tx

@@ -1,5 +1,9 @@
 import { Redis } from "@upstash/redis";
-import IORedis from "ioredis";
+// ioredis v5 ships an odd default export shape under NodeNext + esModuleInterop.
+// Both forms exist at runtime; cast the import to the constructor type explicitly.
+import IORedisImport from "ioredis";
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const IORedis = IORedisImport as unknown as new (url: string, opts?: Record<string, unknown>) => any;
 import { env } from "../config/env.js";
 import { logger } from "./logger.js";
 
@@ -43,7 +47,7 @@ export async function startDashboardSubscriber() {
     await subClient.connect();
     await pubClient.connect();
     await subClient.subscribe(DASHBOARD_CHANNEL);
-    subClient.on("message", async (channel) => {
+    subClient.on("message", async (channel: string) => {
       if (channel === DASHBOARD_CHANNEL) {
         await redis.del(DASHBOARD_KEY);
       }

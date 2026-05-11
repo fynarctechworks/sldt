@@ -1,7 +1,10 @@
 import cors from "cors";
 import express from "express";
 import helmet from "helmet";
-import pinoHttp from "pino-http";
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+import pinoHttpImport from "pino-http";
+// pino-http v10 ships odd typings; the runtime export is callable.
+const pinoHttp = pinoHttpImport as unknown as (opts: { logger: typeof logger }) => import("express").RequestHandler;
 import { env } from "./config/env.js";
 import { closeBrowser } from "./lib/pdf.js";
 import { logger } from "./lib/logger.js";
