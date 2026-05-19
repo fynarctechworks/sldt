@@ -5,9 +5,10 @@ import {
   roomStatusUpdateSchema,
   roomUpdateSchema,
 } from "@hoteldesk/shared";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { Router } from "express";
 import { db } from "../db/client.js";
+import { reservationRooms, reservations } from "../db/schema/reservations.js";
 import { rooms } from "../db/schema/rooms.js";
 import { logActivity } from "../lib/activity.js";
 import { findAvailableRooms } from "../lib/availability.js";
@@ -129,5 +130,107 @@ router.patch(
     return ok(res, updated);
   },
 );
+
+// Preview the impact of deleting a room — counts past reservations that
+// reference it and reports whether the room is currently occupied or in any
+// active reservation. The web UI uses this to render a confirm dialog before
+// firing the destructive call.
+router.get("/:id/delete-impact", requireAuth, requirePermission("edit_rooms"), async (req, res) => {
+  const id = req.params.id!;
+  const [room] = await db.select().from(rooms).where(eq(rooms.id, id)).limit(1);
+  if (!room) return fail(res, 404, "NOT_FOUND", "Room not found");
+
+  // Total historical reservations that have ever held this room.
+  const [{ total = 0 } = { total: 0 }] = await db
+    .select({ total: sql<number>`count(*)::int` })
+    .from(reservationRooms)
+    .where(eq(reservationRooms.roomId, id));
+
+  // Active reservations (confirmed or checked-in) — these would block deletion.
+  const activeRows = await db
+    .select({
+      reservationId: reservations.id,
+      reservationNumber: reservations.reservationNumber,
+      status: reservations.status,
+      checkInDate: reservations.checkInDate,
+      checkOutDate: reservations.checkOutDate,
+    })
+    .from(reservationRooms)
+    .innerJoin(reservations, eq(reservations.id, reservationRooms.reservationId))
+    .where(
+      and(
+        eq(reservationRooms.roomId, id),
+        inArray(reservations.status, ["confirmed", "checked_in"]),
+      ),
+    );
+
+  return ok(res, {
+    room: { id: room.id, roomNumber: room.roomNumber, status: room.status },
+    totalHistoricalReservations: total,
+    activeReservations: activeRows,
+    canDelete: activeRows.length === 0 && room.status !== "occupied",
+  });
+});
+
+// Hard delete a room. Cascades to reservation_rooms (historical links are
+// detached). Blocked if the room is currently occupied or attached to an
+// active reservation — admin must close those out first.
+router.delete("/:id", requireAuth, requirePermission("edit_rooms"), async (req, res) => {
+  const id = req.params.id!;
+  const [room] = await db.select().from(rooms).where(eq(rooms.id, id)).limit(1);
+  if (!room) return fail(res, 404, "NOT_FOUND", "Room not found");
+
+  if (room.status === "occupied") {
+    return fail(
+      res,
+      409,
+      "ROOM_OCCUPIED",
+      `Room ${room.roomNumber} is currently occupied. Check the guest out first.`,
+    );
+  }
+
+  const activeCount = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(reservationRooms)
+    .innerJoin(reservations, eq(reservations.id, reservationRooms.reservationId))
+    .where(
+      and(
+        eq(reservationRooms.roomId, id),
+        inArray(reservations.status, ["confirmed", "checked_in"]),
+      ),
+    );
+  if ((activeCount[0]?.n ?? 0) > 0) {
+    return fail(
+      res,
+      409,
+      "ROOM_IN_USE",
+      `Room ${room.roomNumber} is attached to ${activeCount[0]!.n} active reservation(s). Cancel or check them out first.`,
+    );
+  }
+
+  const detached = await db.transaction(async (tx) => {
+    // Detach all historical reservation_rooms rows for this room, then drop
+    // the room itself. The FK is RESTRICT by default, so we have to clear
+    // children explicitly inside the same tx.
+    const removed = await tx
+      .delete(reservationRooms)
+      .where(eq(reservationRooms.roomId, id))
+      .returning({ id: reservationRooms.id });
+    await tx.delete(rooms).where(eq(rooms.id, id));
+    return removed.length;
+  });
+
+  await logActivity({
+    action: "room_deleted",
+    entityType: "room",
+    entityId: id,
+    description: `Room ${room.roomNumber} deleted (${detached} historical reservation link${detached === 1 ? "" : "s"} detached)`,
+    performedBy: req.user!.id,
+    ipAddress: req.ip,
+    metadata: { roomNumber: room.roomNumber, detachedHistoricalLinks: detached },
+  });
+  await invalidateDashboard();
+  return ok(res, { id, deleted: true, detachedHistoricalLinks: detached });
+});
 
 export default router;

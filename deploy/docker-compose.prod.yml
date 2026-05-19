@@ -1,0 +1,57 @@
+# Production stack for the Hostinger VPS — API only.
+#
+# Postgres and Redis are NOT here: production uses managed Supabase
+# (Postgres + Auth) and Upstash (Redis). The web front-end is on Vercel.
+# So the only thing this VPS runs is the API container, fronted by
+# nginx (see deploy/nginx/) which terminates HTTPS for api.sldtstayinn.com.
+#
+# Usage on the VPS (run from the repo root):
+#   docker compose -f deploy/docker-compose.prod.yml up -d --build
+#
+# Update after a git pull:
+#   docker compose -f deploy/docker-compose.prod.yml up -d --build
+#
+# Logs:
+#   docker compose -f deploy/docker-compose.prod.yml logs -f api
+#
+# The API reads its secrets from apps/api/.env.production (git-ignored).
+# Fill that file on the VPS before the first `up`.
+
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: apps/api/Dockerfile
+    image: hoteldesk-api:latest
+    restart: unless-stopped
+    # Bind to localhost only — nginx on the host is the public entry point
+    # and proxies to this. Nothing should hit the container port directly
+    # from the internet.
+    ports:
+      - "127.0.0.1:3000:3000"
+    env_file:
+      # Real production secrets. This file is git-ignored — create it on
+      # the VPS from apps/api/.env.production.example.
+      - ../apps/api/.env.production
+    environment:
+      # Belt-and-suspenders: ensure prod mode even if the env file is
+      # somehow missing the key. env_file values still override nothing
+      # here since this is the same key — compose merges, file wins only
+      # if listed after; we keep NODE_ENV here as the floor.
+      NODE_ENV: production
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging:
+      # Cap log disk usage so a long-running container can't fill the VPS.
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

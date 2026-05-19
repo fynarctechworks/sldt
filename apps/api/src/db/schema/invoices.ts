@@ -26,6 +26,11 @@ export const invoices = pgTable("invoices", {
   sgstRate: numeric("sgst_rate", { precision: 5, scale: 2 }).notNull(),
   sgstAmount: numeric("sgst_amount", { precision: 10, scale: 2 }).notNull(),
   grandTotal: numeric("grand_total", { precision: 10, scale: 2 }).notNull(),
+  // Wallet credit redeemed against this invoice. Reduces balance_due
+  // but not subtotal/GST (GST was already collected on the bill).
+  walletCreditApplied: numeric("wallet_credit_applied", { precision: 10, scale: 2 })
+    .notNull()
+    .default("0"),
   totalPaid: numeric("total_paid", { precision: 10, scale: 2 }).notNull().default("0"),
   balanceDue: numeric("balance_due", { precision: 10, scale: 2 }).notNull(),
   status: text("status", { enum: INVOICE_STATUSES }).notNull().default("issued"),

@@ -11,6 +11,7 @@
     "db:generate": "drizzle-kit generate",
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
+    "db:migrate": "node scripts/migrate.mjs",
     "db:seed": "tsx src/db/seed.ts",
     "test": "vitest run",
     "lint": "eslint src --ext .ts"
@@ -32,6 +33,7 @@
     "pino-http": "^10.3.0",
     "postgres": "^3.4.4",
     "puppeteer": "^23.6.0",
+    "sharp": "^0.34.5",
     "zod": "^3.23.8"
   },
   "devDependencies": {

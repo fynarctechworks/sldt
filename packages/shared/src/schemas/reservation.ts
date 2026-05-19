@@ -1,6 +1,9 @@
 import { z } from "zod";
 import { BOOKING_SOURCES, PAYMENT_METHODS, RESERVATION_STATUSES } from "../enums.js";
 
+export const STAY_TYPES = ["overnight", "short_stay"] as const;
+export type StayType = (typeof STAY_TYPES)[number];
+
 export const reservationCreateSchema = z
   .object({
     guestId: z.string().uuid(),
@@ -15,6 +18,17 @@ export const reservationCreateSchema = z
       .min(1),
     checkInDate: z.string().date(),
     checkOutDate: z.string().date(),
+    // Day-use vs night-based booking. For short_stay:
+    //   - checkInDate == checkOutDate
+    //   - durationHours is required (3..23.5, in 0.5 steps)
+    //   - ratePerNight on each room is interpreted as the FLAT price for the
+    //     chosen duration (the client computes it from the room type's
+    //     short_stay_bands, or pro-rates the custom hours).
+    stayType: z.enum(STAY_TYPES).optional().default("overnight"),
+    durationHours: z.coerce.number().min(1).max(23.5).optional(),
+    // Optional human label persisted on the reservation's specialRequests
+    // companion field — for documents like "Day use · 6 hours".
+    shortStayLabel: z.string().max(64).optional(),
     numAdults: z.coerce.number().int().min(1).default(1),
     numChildren: z.coerce.number().int().min(0).default(0),
     advancePaid: z.coerce.number().min(0).default(0),
@@ -22,15 +36,55 @@ export const reservationCreateSchema = z
     specialRequests: z.string().max(1000).optional().nullable(),
     bookingSource: z.enum(BOOKING_SOURCES).optional().default("walkin"),
     creditNotes: z.string().max(500).optional().nullable(),
+    // Wallet credit to apply as a discount on this booking. Capped server-side
+    // at min(guest wallet balance, reservation grand total).
+    useWalletCredit: z.coerce.number().min(0).optional().default(0),
+    // OTP code, when the create flow uses the "verify first, then create"
+    // pattern (the only way new bookings are made now). The server looks
+    // up the most recent un-consumed checkin-purpose OTP for this guest,
+    // checks the code, marks it consumed inside the same transaction as
+    // the reservation insert, then proceeds. Omitting this rejects the
+    // create unless an admin override flag is added later.
+    otpCode: z.string().min(4).max(8).optional(),
   })
-  .refine((d) => new Date(d.checkOutDate) > new Date(d.checkInDate), {
-    message: "check_out_date must be after check_in_date",
-    path: ["checkOutDate"],
+  .superRefine((d, ctx) => {
+    if (d.stayType === "short_stay") {
+      if (d.checkInDate !== d.checkOutDate) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["checkOutDate"],
+          message: "short_stay must have check_out_date == check_in_date",
+        });
+      }
+      if (d.durationHours === undefined || d.durationHours <= 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["durationHours"],
+          message: "durationHours is required for short_stay",
+        });
+      }
+    } else if (new Date(d.checkOutDate) <= new Date(d.checkInDate)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["checkOutDate"],
+        message: "check_out_date must be after check_in_date",
+      });
+    }
   });
 
 export const reservationListQuerySchema = z.object({
   status: z.enum(RESERVATION_STATUSES).optional(),
   date: z.string().optional(),
+  q: z.string().trim().min(1).max(100).optional(),
+  date_from: z.string().date().optional(),
+  date_to: z.string().date().optional(),
+  // Complimentary bookings are hidden from the default list — they only
+  // show up under Reports → Complimentary. Pass include_complimentary=true
+  // to override (admin tooling, audits, etc).
+  include_complimentary: z
+    .union([z.literal("true"), z.literal("false")])
+    .optional()
+    .transform((v) => v === "true"),
   page: z.coerce.number().int().min(1).default(1),
   per_page: z.coerce.number().int().min(1).max(100).default(25),
 });
@@ -44,10 +98,21 @@ export const checkOutSchema = z.object({
   finalPayment: z.coerce.number().min(0).optional(),
   paymentMethod: z.enum(PAYMENT_METHODS).optional(),
   paymentNotes: z.string().max(500).optional(),
+  refundMode: z.enum(["cash", "credit"]).optional(),
+  refundNote: z.string().max(500).optional(),
 });
 
 export const cancelSchema = z.object({
   cancellationReason: z.string().min(1).max(500),
+});
+
+// Reclassify an existing reservation as complimentary after the fact.
+// Reason is required so the audit log + complimentary report stay useful;
+// approver is the optional human name of who authorized the comp (owner,
+// manager-on-duty, etc).
+export const makeComplimentarySchema = z.object({
+  reason: z.string().min(1).max(500),
+  approver: z.string().max(120).optional().nullable(),
 });
 
 export const swapRoomSchema = z.object({
@@ -116,9 +181,43 @@ export const editDatesSchema = z
     path: ["checkOutDate"],
   });
 
+// Editable surface for an already-issued invoice. Mirrors the receipt-edit
+// pattern: a single PATCH lets staff fix anything they need on the bill.
+//
+// IMPORTANT: this is in-place mutation of a tax invoice. The server keeps a
+// full audit-log entry of every edit (action: "invoice_edited") so the
+// before/after is recoverable from the activity_log table for compliance
+// review. The invoice_number is intentionally NOT editable.
 export const editInvoiceSchema = z.object({
   issueDate: z.string().date().optional(),
   notes: z.string().max(1000).optional().nullable(),
+  // Printed guest details. These are snapshots on the invoice itself; the
+  // guests table is left alone.
+  guestName: z.string().min(1).max(200).optional(),
+  guestAddress: z.string().max(500).optional().nullable(),
+  guestGstin: z.string().max(20).optional().nullable(),
+  // Stay window. These edit the underlying RESERVATION's check-in /
+  // check-out dates (the invoice doesn't store them itself). Provided so
+  // the invoice editor can correct a wrong stay date without forcing the
+  // user to leave the modal.
+  checkInDate: z.string().date().optional(),
+  checkOutDate: z.string().date().optional(),
+  // If provided, the entire line-item list is REPLACED with the given
+  // array. Server recomputes subtotal / cgst / sgst / grandTotal /
+  // balance_due / status from these rows. Omitting this key leaves line
+  // items untouched.
+  lineItems: z
+    .array(
+      z.object({
+        description: z.string().min(1).max(500),
+        sacCode: z.string().max(20),
+        quantity: z.number().int().min(1),
+        rate: z.coerce.number().min(0),
+        gstRate: z.coerce.number().min(0).max(100),
+        itemType: z.enum(["room_charge", "additional_charge"]),
+      }),
+    )
+    .optional(),
 });
 
 export const editPaymentSchema = z.object({

@@ -25,6 +25,7 @@ export const guests = pgTable(
     tags: text("tags").array().notNull().default(sql`ARRAY[]::text[]`),
     idProofPhotoFront: text("id_proof_photo_front"),
     idProofPhotoBack: text("id_proof_photo_back"),
+    guestPhoto: text("guest_photo"),
     kycVerifiedAt: timestamp("kyc_verified_at", { withTimezone: true }),
     kycVerifiedBy: uuid("kyc_verified_by"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),

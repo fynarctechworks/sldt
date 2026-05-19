@@ -1,5 +1,5 @@
 import { endOfMonth, format, parseISO, startOfMonth } from "date-fns";
-import { and, desc, eq, gte, lte, ne, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, lte, ne, sql } from "drizzle-orm";
 import { Router } from "express";
 import { db } from "../db/client.js";
 import { guests } from "../db/schema/guests.js";
@@ -32,7 +32,7 @@ router.get("/occupancy", requireAuth, requirePermission("view_reports"), async (
        INNER JOIN ${reservations} r ON r.id = rr.reservation_id
        WHERE r.check_in_date <= gs AND r.check_out_date > gs
        AND r.status IN ('checked_in','checked_out','confirmed')
-       AND r.booking_source NOT IN ('credit','complimentary')) as occupied
+       AND r.booking_source <> 'complimentary') as occupied
     FROM generate_series(${format(from, "yyyy-MM-dd")}::date, ${format(to, "yyyy-MM-dd")}::date, '1 day') gs
   `);
 
@@ -53,13 +53,23 @@ router.get("/occupancy", requireAuth, requirePermission("view_reports"), async (
 router.get("/revenue", requireAuth, requirePermission("view_reports"), async (req, res) => {
   const { from, to } = rangeDefaults(req as never);
 
+  // Real revenue = received (not pending), not voided, not complimentary.
+  //   - Pending = staff recorded a promise of payment ("unpaid"); not cash yet.
+  //   - Voided = reversed for accounting.
+  //   - Complimentary = owner-comp bookings; tracked in their own report.
+  // The daily aggregate joins to reservations so it can apply the same
+  // booking-source filter the per-type breakdowns use.
   const daily = await db.execute<{ day: string; total: string; count: number }>(sql`
-    SELECT DATE(payment_date)::text as day,
-      COALESCE(SUM(amount),0)::text as total,
+    SELECT DATE(p.payment_date)::text as day,
+      COALESCE(SUM(p.amount),0)::text as total,
       COUNT(*)::int as count
-    FROM ${payments}
-    WHERE payment_date >= ${from.toISOString()} AND payment_date <= ${to.toISOString()}
-    GROUP BY DATE(payment_date)
+    FROM ${payments} p
+    INNER JOIN ${reservations} r ON r.id = p.reservation_id
+    WHERE p.payment_date >= ${from.toISOString()} AND p.payment_date <= ${to.toISOString()}
+      AND p.voided = false
+      AND p.status = 'received'
+      AND r.booking_source <> 'complimentary'
+    GROUP BY DATE(p.payment_date)
     ORDER BY day
   `);
 
@@ -74,14 +84,46 @@ router.get("/revenue", requireAuth, requirePermission("view_reports"), async (re
     .innerJoin(reservations, eq(reservations.id, payments.reservationId))
     .innerJoin(reservationRooms, eq(reservationRooms.reservationId, reservations.id))
     .innerJoin(rooms, eq(rooms.id, reservationRooms.roomId))
-    .where(and(gte(payments.paymentDate, from), lte(payments.paymentDate, to)))
+    .where(
+      and(
+        gte(payments.paymentDate, from),
+        lte(payments.paymentDate, to),
+        eq(payments.voided, false),
+        eq(payments.status, "received"),
+        sql`${reservations.bookingSource} <> 'complimentary'`,
+      ),
+    )
     .groupBy(rooms.roomType);
 
-  return ok(res, { from, to, totalRevenue, daily, byRoomType: byType });
+  // Day-use vs overnight split. Drives the "Booking types" summary block
+  // on the Reports page so the owner can see how much short-stay revenue
+  // the property is generating without slicing per-room manually.
+  const byStayType = await db
+    .select({
+      stayType: reservations.stayType,
+      bookings: sql<number>`count(distinct ${reservations.id})::int`,
+      total: sql<string>`COALESCE(SUM(${payments.amount}),0)::text`,
+    })
+    .from(payments)
+    .innerJoin(reservations, eq(reservations.id, payments.reservationId))
+    .where(
+      and(
+        gte(payments.paymentDate, from),
+        lte(payments.paymentDate, to),
+        eq(payments.voided, false),
+        eq(payments.status, "received"),
+        sql`${reservations.bookingSource} <> 'complimentary'`,
+      ),
+    )
+    .groupBy(reservations.stayType);
+
+  return ok(res, { from, to, totalRevenue, daily, byRoomType: byType, byStayType });
 });
 
 router.get("/collections", requireAuth, requirePermission("view_reports"), async (req, res) => {
   const { from, to } = rangeDefaults(req as never);
+  // Exclude complimentary-reservation payments from the by-method
+  // breakdown. They're shown in the Complimentary report instead.
   const byMethod = await db
     .select({
       method: payments.paymentMethod,
@@ -89,25 +131,73 @@ router.get("/collections", requireAuth, requirePermission("view_reports"), async
       total: sql<string>`COALESCE(SUM(${payments.amount}),0)::text`,
     })
     .from(payments)
-    .where(and(gte(payments.paymentDate, from), lte(payments.paymentDate, to)))
+    .innerJoin(reservations, eq(reservations.id, payments.reservationId))
+    .where(
+      and(
+        gte(payments.paymentDate, from),
+        lte(payments.paymentDate, to),
+        eq(payments.voided, false),
+        eq(payments.status, "received"),
+        sql`${reservations.bookingSource} <> 'complimentary'`,
+      ),
+    )
     .groupBy(payments.paymentMethod);
 
+  // Full payments list — keep voided + pending visible so staff can see
+  // what was voided/promised, but exclude complimentary-reservation rows
+  // entirely (they live in their own report).
   const rows = await db
     .select()
     .from(payments)
-    .where(and(gte(payments.paymentDate, from), lte(payments.paymentDate, to)))
+    .innerJoin(reservations, eq(reservations.id, payments.reservationId))
+    .where(
+      and(
+        gte(payments.paymentDate, from),
+        lte(payments.paymentDate, to),
+        sql`${reservations.bookingSource} <> 'complimentary'`,
+      ),
+    )
     .orderBy(desc(payments.paymentDate))
     .limit(500);
 
-  return ok(res, { from, to, byMethod, payments: rows });
+  return ok(res, { from, to, byMethod, payments: rows.map((r) => r.payments) });
 });
 
 router.get("/gst-summary", requireAuth, requirePermission("view_reports"), async (req, res) => {
-  const { month } = req.query as { month?: string };
-  const anchor = month ? parseISO(`${month}-01`) : new Date();
-  const from = startOfMonth(anchor);
-  const to = endOfMonth(anchor);
+  // Accept any of:
+  //   ?month=YYYY-MM             — single calendar month (legacy callers)
+  //   ?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD — explicit window (the
+  //                                            Reports page uses this when
+  //                                            the user picks Week / Year /
+  //                                            Custom)
+  //   neither                    — defaults to the current month
+  // The response keeps the legacy `month` field as a human label so the
+  // GST tab's section header doesn't break for month-based callers.
+  const { month, date_from, date_to } = req.query as {
+    month?: string;
+    date_from?: string;
+    date_to?: string;
+  };
 
+  let from: Date;
+  let to: Date;
+  let label: string;
+  if (date_from && date_to) {
+    from = parseISO(date_from);
+    // Inclusive end-of-day so a single-day window includes invoices issued
+    // anytime on date_to.
+    to = new Date(parseISO(date_to).getTime() + 86_399_999);
+    label = `${format(from, "dd MMM yyyy")} → ${format(parseISO(date_to), "dd MMM yyyy")}`;
+  } else {
+    const anchor = month ? parseISO(`${month}-01`) : new Date();
+    from = startOfMonth(anchor);
+    to = endOfMonth(anchor);
+    label = format(anchor, "yyyy-MM");
+  }
+
+  // GST summary excludes invoices tied to complimentary reservations.
+  // A comped booking is not a taxable sale from a management standpoint,
+  // so its CGST/SGST shouldn't appear in the GST filing rollup.
   const rows = await db
     .select({
       status: invoices.status,
@@ -118,19 +208,24 @@ router.get("/gst-summary", requireAuth, requirePermission("view_reports"), async
       count: sql<number>`count(*)::int`,
     })
     .from(invoices)
+    .innerJoin(reservations, eq(reservations.id, invoices.reservationId))
     .where(
       and(
         gte(invoices.createdAt, from),
         lte(invoices.createdAt, to),
         ne(invoices.status, "voided"),
+        sql`${reservations.bookingSource} <> 'complimentary'`,
       ),
     )
     .groupBy(invoices.status);
 
-  return ok(res, { month: format(anchor, "yyyy-MM"), from, to, byStatus: rows });
+  return ok(res, { month: label, from, to, byStatus: rows });
 });
 
-router.get("/outstanding", requireAuth, requirePermission("view_collections", "view_reports"), async (_req, res) => {
+router.get("/outstanding", requireAuth, requirePermission("view_revenue"), async (_req, res) => {
+  // Complimentary reservations are not chased — they were comped, there
+  // is no debt. All three sub-queries below filter them out.
+  // 1. Invoices that still have a balance.
   const rows = await db
     .select({
       invoiceId: invoices.id,
@@ -150,8 +245,46 @@ router.get("/outstanding", requireAuth, requirePermission("view_collections", "v
     .from(invoices)
     .innerJoin(guests, eq(guests.id, invoices.guestId))
     .innerJoin(reservations, eq(reservations.id, invoices.reservationId))
-    .where(and(ne(invoices.status, "voided"), ne(invoices.status, "paid")))
+    .where(
+      and(
+        ne(invoices.status, "voided"),
+        ne(invoices.status, "paid"),
+        sql`${reservations.bookingSource} <> 'complimentary'`,
+      ),
+    )
     .orderBy(desc(invoices.createdAt));
+
+  // 2. Active reservations (confirmed / checked-in) that DON'T have an
+  //    invoice yet but have a non-zero balance — these would be missed by
+  //    the invoice-only query above. Examples: a guest who paid an advance
+  //    but is still checked in; a confirmed booking with no advance.
+  const preInvoiceRows = await db
+    .select({
+      reservationId: reservations.id,
+      reservationNumber: reservations.reservationNumber,
+      guestId: reservations.guestId,
+      guestName: guests.fullName,
+      guestPhone: guests.phone,
+      grandTotal: reservations.grandTotal,
+      advancePaid: reservations.advancePaid,
+      balanceDue: reservations.balanceDue,
+      status: reservations.status,
+      checkInDate: reservations.checkInDate,
+      checkOutDate: reservations.checkOutDate,
+      createdAt: reservations.createdAt,
+    })
+    .from(reservations)
+    .innerJoin(guests, eq(guests.id, reservations.guestId))
+    .leftJoin(invoices, eq(invoices.reservationId, reservations.id))
+    .where(
+      and(
+        inArray(reservations.status, ["confirmed", "checked_in"]),
+        sql`${invoices.id} IS NULL`,
+        sql`${reservations.balanceDue}::numeric > 0.009`,
+        sql`${reservations.bookingSource} <> 'complimentary'`,
+      ),
+    )
+    .orderBy(desc(reservations.createdAt));
 
   // Pending (unpaid-method) payments — separate stream for visibility
   const pendingPayments = await db
@@ -170,35 +303,50 @@ router.get("/outstanding", requireAuth, requirePermission("view_collections", "v
     .from(payments)
     .innerJoin(reservations, eq(reservations.id, payments.reservationId))
     .innerJoin(guests, eq(guests.id, reservations.guestId))
-    .where(and(eq(payments.status, "pending"), eq(payments.voided, false)))
+    .where(
+      and(
+        eq(payments.status, "pending"),
+        eq(payments.voided, false),
+        sql`${reservations.bookingSource} <> 'complimentary'`,
+      ),
+    )
     .orderBy(desc(payments.createdAt));
 
-  // Guest-level totals
+  // Guest-level totals — combine invoice-based and pre-invoice balances.
   const byGuest = new Map<
     string,
     { guestId: string; guestName: string; guestPhone: string; balance: number; oldest: Date }
   >();
-  for (const r of rows) {
-    const balance = Number(r.balanceDue);
-    if (balance <= 0.009) continue;
+  function addToGuest(
+    r: {
+      guestId: string;
+      guestName: string;
+      guestPhone: string;
+    },
+    balance: number,
+    when: Date,
+  ) {
+    if (balance <= 0.009) return;
     const cur = byGuest.get(r.guestId);
-    const issued = new Date(r.issuedAt);
     if (cur) {
       cur.balance += balance;
-      if (issued < cur.oldest) cur.oldest = issued;
+      if (when < cur.oldest) cur.oldest = when;
     } else {
       byGuest.set(r.guestId, {
         guestId: r.guestId,
         guestName: r.guestName,
         guestPhone: r.guestPhone,
         balance,
-        oldest: issued,
+        oldest: when,
       });
     }
   }
+  for (const r of rows) addToGuest(r, Number(r.balanceDue), new Date(r.issuedAt));
+  for (const r of preInvoiceRows) addToGuest(r, Number(r.balanceDue), new Date(r.createdAt));
 
   return ok(res, {
     invoices: rows,
+    preInvoice: preInvoiceRows,
     pendingPayments,
     byGuest: Array.from(byGuest.values()).sort((a, b) => b.balance - a.balance),
     totalOutstanding: Array.from(byGuest.values()).reduce((s, g) => s + g.balance, 0),
@@ -207,14 +355,21 @@ router.get("/outstanding", requireAuth, requirePermission("view_collections", "v
 
 router.get("/room-performance", requireAuth, requirePermission("view_reports"), async (req, res) => {
   const { from, to } = rangeDefaults(req as never);
+  // Complimentary reservations are filtered out of every aggregate — they
+  // shouldn't inflate per-room booking counts or revenue.
+  const notComp = sql`${reservations.bookingSource} <> 'complimentary'`;
   const rows = await db
     .select({
       roomId: rooms.id,
       roomNumber: rooms.roomNumber,
       roomType: rooms.roomType,
       baseRate: rooms.baseRate,
-      bookings: sql<number>`count(distinct ${reservations.id})::int`,
-      revenue: sql<string>`COALESCE(SUM(${payments.amount}),0)::text`,
+      bookings: sql<number>`count(distinct ${reservations.id}) filter (where ${notComp})::int`,
+      // Split booking counts so a manager can see which rooms are being
+      // used for day-use vs traditional overnight.
+      overnightBookings: sql<number>`count(distinct ${reservations.id}) filter (where ${reservations.stayType} = 'overnight' AND ${notComp})::int`,
+      shortStayBookings: sql<number>`count(distinct ${reservations.id}) filter (where ${reservations.stayType} = 'short_stay' AND ${notComp})::int`,
+      revenue: sql<string>`COALESCE(SUM(${payments.amount}) filter (where ${payments.voided} = false AND ${payments.status} = 'received' AND ${notComp}),0)::text`,
     })
     .from(rooms)
     .leftJoin(reservationRooms, eq(reservationRooms.roomId, rooms.id))
@@ -301,6 +456,18 @@ router.get("/credit-bookings", requireAuth, requirePermission("view_reports"), a
       status: reservations.status,
       creditNotes: reservations.creditNotes,
       createdAt: reservations.createdAt,
+      // Sum of received, non-voided payments on this reservation. For
+      // comped bookings this often > 0 — staff collected money before the
+      // booking was reclassified to complimentary. The report surfaces it
+      // so the owner sees both the "comped value" and "money already in
+      // the till" for the same row.
+      totalPaid: sql<string>`COALESCE((
+        SELECT SUM(${payments.amount})
+        FROM ${payments}
+        WHERE ${payments.reservationId} = ${reservations.id}
+          AND ${payments.voided} = false
+          AND ${payments.status} = 'received'
+      ), 0)::text`,
     })
     .from(reservations)
     .innerJoin(guests, eq(guests.id, reservations.guestId))
@@ -318,10 +485,11 @@ router.get("/credit-bookings", requireAuth, requirePermission("view_reports"), a
       acc.count += 1;
       acc.grandTotal += Number(r.grandTotal);
       acc.balanceDue += Number(r.balanceDue);
+      acc.totalPaid += Number(r.totalPaid);
       if (r.bookingSource === "complimentary") acc.complimentary += Number(r.grandTotal);
       return acc;
     },
-    { count: 0, grandTotal: 0, balanceDue: 0, complimentary: 0 },
+    { count: 0, grandTotal: 0, balanceDue: 0, totalPaid: 0, complimentary: 0 },
   );
 
   return ok(res, { from, to, totals, rows });
@@ -329,13 +497,16 @@ router.get("/credit-bookings", requireAuth, requirePermission("view_reports"), a
 
 router.get("/guests", requireAuth, requirePermission("view_reports"), async (req, res) => {
   const { from, to } = rangeDefaults(req as never);
+  // Stays count includes comps (a stay happened, even if comped). Revenue
+  // excludes comp-booking payments — those live in the Complimentary
+  // report so the guest's "real revenue" isn't inflated.
   const rows = await db
     .select({
       guestId: guests.id,
       fullName: guests.fullName,
       phone: guests.phone,
       stays: sql<number>`count(distinct ${reservations.id})::int`,
-      revenue: sql<string>`COALESCE(SUM(${payments.amount}),0)::text`,
+      revenue: sql<string>`COALESCE(SUM(${payments.amount}) filter (where ${payments.voided} = false AND ${payments.status} = 'received' AND ${reservations.bookingSource} <> 'complimentary'),0)::text`,
     })
     .from(guests)
     .leftJoin(reservations, eq(reservations.guestId, guests.id))

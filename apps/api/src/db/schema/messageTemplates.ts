@@ -7,6 +7,8 @@ export const TEMPLATE_KEYS = [
   "checkout_owner_sms",
   "otp_guest_sms",
   "payment_reminder_guest_sms",
+  "booking_advance_guest_sms",
+  "booking_advance_owner_sms",
 ] as const;
 export type TemplateKey = (typeof TEMPLATE_KEYS)[number];
 

@@ -14,6 +14,7 @@ import { reservationRooms } from "../db/schema/reservations.js";
 import { rooms } from "../db/schema/rooms.js";
 import { roomTypes, settings } from "../db/schema/settings.js";
 import { logActivity } from "../lib/activity.js";
+import { publishSettingsInvalidation } from "../lib/redis.js";
 import { fail, ok } from "../lib/response.js";
 import { invalidateSettings } from "../lib/settings.js";
 import {
@@ -39,10 +40,18 @@ router.get("/public", requireAuth, async (_req, res) => {
       hotelName: settings.hotelName,
       hotelAddress: settings.hotelAddress,
       hotelPhone: settings.hotelPhone,
+      hotelEmail: settings.hotelEmail,
+      ownerPhone: settings.ownerPhone,
       hotelGstin: settings.hotelGstin,
       hotelLogoUrl: settings.hotelLogoUrl,
       checkInTime: settings.checkInTime,
       checkOutTime: settings.checkOutTime,
+      gstSlabExemptBelow: settings.gstSlabExemptBelow,
+      gstSlabLowRate: settings.gstSlabLowRate,
+      gstSlabLowMax: settings.gstSlabLowMax,
+      gstSlabHighRate: settings.gstSlabHighRate,
+      // Drives the rate-vs-grand-total interpretation on NewReservation.
+      gstMode: settings.gstMode,
     })
     .from(settings)
     .limit(1);
@@ -61,6 +70,7 @@ router.put("/", requireAuth, requirePermission("manage_settings"), validate(sett
     .where(eq(settings.id, rows[0]!.id))
     .returning();
   invalidateSettings();
+  await publishSettingsInvalidation();
   await logActivity({
     action: "settings_updated",
     entityType: "settings",
@@ -95,6 +105,7 @@ router.post(
       maxOccupancy: number;
       description?: string | null;
       isActive: boolean;
+      shortStayBands?: Array<{ label: string; hours: number; rate: number }>;
     };
 
     const dup = await db.select({ id: roomTypes.id }).from(roomTypes).where(eq(roomTypes.slug, input.slug)).limit(1);
@@ -109,6 +120,7 @@ router.post(
         maxOccupancy: String(input.maxOccupancy),
         description: input.description ?? null,
         isActive: input.isActive,
+        shortStayBands: input.shortStayBands ?? [],
       })
       .returning();
 

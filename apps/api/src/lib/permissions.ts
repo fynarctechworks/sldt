@@ -62,6 +62,12 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   { key: "view_reports", area: "Reports", label: "View reports" },
   { key: "export_reports", area: "Reports", label: "Export reports (CSV)" },
 
+  // Revenue / financial visibility. Gates rupee totals across the app
+  // (Dashboard "Revenue Today", Collections totals, etc.) — distinct
+  // from `view_reports` because some properties want staff to see *their*
+  // collections without seeing aggregate revenue.
+  { key: "view_revenue", area: "Reports", label: "View revenue & financial totals" },
+
   // Activity & Notifications
   { key: "view_activity", area: "Activity", label: "View activity log" },
   { key: "view_notifications", area: "Notifications", label: "View notifications" },

@@ -29,8 +29,38 @@ export interface SendResult {
   error?: string;
 }
 
+// Mask sequences that look like OTP codes (4-8 contiguous digits) so the
+// stub log doesn't leak codes. Other meaningful content stays readable
+// for development.
+function redactOtpFromText(text: string): string {
+  return text.replace(/\b\d{4,8}\b/g, "******");
+}
+
+// Mask the middle of a phone or email so log diagnostics still tie back to
+// the right guest but the full identifier doesn't sit in plaintext.
+function maskRecipient(to: string): string {
+  if (to.includes("@")) {
+    const [user, domain] = to.split("@");
+    if (!user || !domain) return "***@***";
+    return `${user.slice(0, 2)}***@${domain}`;
+  }
+  const digits = to.replace(/\D/g, "");
+  if (digits.length < 4) return "***";
+  return `***${digits.slice(-4)}`;
+}
+
 async function sendWhatsAppStub(msg: SmsMessage): Promise<SendResult> {
-  logger.info({ provider: "stub", to: msg.to, text: msg.text }, "[WHATSAPP STUB]");
+  // Stub mode is for local development. We log a masked recipient + a
+  // redacted preview of the body so a developer can confirm a message
+  // was triggered without seeing the OTP or the full guest contact.
+  logger.info(
+    {
+      provider: "stub",
+      to: maskRecipient(msg.to),
+      preview: redactOtpFromText(msg.text).slice(0, 200),
+    },
+    "[WHATSAPP STUB]",
+  );
   return { ok: true, provider: "stub", id: `stub-${Date.now()}` };
 }
 
@@ -95,7 +125,7 @@ async function sendWhatsAppLive(msg: SmsMessage): Promise<SendResult> {
     };
     logger.info(
       {
-        to,
+        to: maskRecipient(to.replace("whatsapp:", "")),
         httpStatus: res.status,
         twilioStatus: json.status,
         sid: json.sid,

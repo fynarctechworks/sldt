@@ -2,25 +2,28 @@ import { editPaymentSchema, paymentSchema, voidPaymentSchema } from "@hoteldesk/
 import { and, desc, eq, gte, lte, sql } from "drizzle-orm";
 import { Router } from "express";
 import { db } from "../db/client.js";
-import { invoices, payments } from "../db/schema/invoices.js";
+import { invoiceLineItems, invoices, payments } from "../db/schema/invoices.js";
 import { reservations } from "../db/schema/reservations.js";
 import { guests } from "../db/schema/guests.js";
 import { logActivity } from "../lib/activity.js";
-import { renderReceiptPdf } from "../lib/pdf.js";
+import { logger } from "../lib/logger.js";
+import { renderInvoicePdf, renderReceiptPdf } from "../lib/pdf.js";
 import { generateReceiptNumber } from "../lib/receipt.js";
 import { invalidateDashboard } from "../lib/redis.js";
 import { getSettings } from "../lib/settings.js";
+import { uploadPublicPdf } from "../lib/storage.js";
 import { fail, ok } from "../lib/response.js";
 import { requireAuth, requirePermission } from "../middleware/auth.js";
+import { idempotent } from "../middleware/idempotency.js";
 import { validate } from "../middleware/validate.js";
 
 const router = Router();
-const STAFF = ["admin", "frontdesk"] as const;
 
 router.post(
   "/",
   requireAuth,
   requirePermission("record_payments"),
+  idempotent("payments.record"),
   validate(paymentSchema),
   async (req, res) => {
     const input = req.body as import("@hoteldesk/shared").PaymentInput;
@@ -28,8 +31,8 @@ router.post(
     if (!inv.length) return fail(res, 404, "NOT_FOUND", "Invoice not found");
     if (inv[0]!.status === "voided") return fail(res, 409, "VOIDED", "Invoice is voided");
 
-    const rcpNum = await generateReceiptNumber();
-    const created = await db.transaction(async (tx) => {
+    const result = await db.transaction(async (tx) => {
+      const rcpNum = await generateReceiptNumber(tx);
       const [pay] = await tx
         .insert(payments)
         .values({
@@ -62,8 +65,72 @@ router.post(
         .set({ balanceDue: String(newBalance), updatedAt: new Date() })
         .where(eq(reservations.id, inv[0]!.reservationId));
 
-      return pay!;
+      // If this real payment fully settles the invoice, auto-void any
+      // still-pending "collect later" promises that were sitting on the
+      // same invoice — they're now satisfied by this actual collection.
+      // Pending payments have status='pending' and didn't count toward
+      // totalPaid, so no balance recompute is needed.
+      let autoVoided: { id: string; amount: string }[] = [];
+      if (newStatus === "paid") {
+        autoVoided = await tx
+          .update(payments)
+          .set({
+            voided: true,
+            voidedReason: `Auto-voided: settled by ${rcpNum}`,
+            voidedBy: req.user!.id,
+            voidedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(payments.invoiceId, input.invoiceId),
+              eq(payments.status, "pending"),
+              eq(payments.voided, false),
+            ),
+          )
+          .returning({ id: payments.id, amount: payments.amount });
+      }
+
+      return { pay: pay!, autoVoided };
     });
+
+    for (const v of result.autoVoided) {
+      await logActivity({
+        action: "payment_voided",
+        entityType: "payment",
+        entityId: v.id,
+        description: `Pending promise ₹${v.amount} auto-voided: settled by ${result.pay.receiptNumber ?? "real payment"}`,
+        performedBy: req.user!.id,
+        ipAddress: req.ip,
+      });
+    }
+    const created = result.pay;
+
+    // If this payment was recorded by the "collect previous balance" flow,
+    // its notes look like "Collected at check-out of <SLDT-RES-XXXX>"
+    // (or, on legacy rows, "<uuid>"). Resolve to a reservation id and
+    // regenerate that source reservation's public invoice PDF so the
+    // companion-footer block stays current. Async-safe: failures warn.
+    const marker = extractCheckoutSourceReservation(input.notes ?? "");
+    if (marker) {
+      void (async () => {
+        try {
+          let resvId: string | null = null;
+          if (marker.kind === "id") {
+            resvId = marker.value;
+          } else {
+            const [row] = await db
+              .select({ id: reservations.id })
+              .from(reservations)
+              .where(eq(reservations.reservationNumber, marker.value))
+              .limit(1);
+            resvId = row?.id ?? null;
+          }
+          if (resvId) await regenerateInvoicePdfForReservation(resvId);
+        } catch (err) {
+          logger.warn({ err, marker }, "companion-collection invoice PDF regen failed");
+        }
+      })();
+    }
 
     await logActivity({
       action: "payment_recorded",
@@ -78,7 +145,7 @@ router.post(
   },
 );
 
-router.get("/", requireAuth, requirePermission("view_collections"), async (req, res) => {
+router.get("/", requireAuth, requirePermission("view_revenue"), async (req, res) => {
   const { date_from, date_to, method } = req.query as Record<string, string | undefined>;
   const conditions = [];
   if (date_from) conditions.push(gte(payments.paymentDate, new Date(date_from)));
@@ -173,6 +240,7 @@ router.post(
   "/:id/void",
   requireAuth,
   requirePermission("void_payments"),
+  idempotent("payments.void"),
   validate(voidPaymentSchema),
   async (req, res) => {
     const id = req.params.id!;
@@ -199,6 +267,7 @@ router.post(
         .where(eq(payments.id, id));
 
       if (inv.length) {
+        // Post-invoice void: reverse against the invoice + reservation balance.
         const newTotalPaid = +(Number(inv[0]!.totalPaid) - Number(existing[0]!.amount)).toFixed(2);
         const newBalance = +(Number(inv[0]!.grandTotal) - newTotalPaid).toFixed(2);
         const newStatus = newBalance <= 0.009 ? "paid" : newTotalPaid > 0 ? "partial" : "issued";
@@ -216,6 +285,33 @@ router.post(
           .update(reservations)
           .set({ balanceDue: String(newBalance), updatedAt: new Date() })
           .where(eq(reservations.id, existing[0]!.reservationId));
+      } else {
+        // Pre-invoice void (advance payment): reduce reservation.advancePaid
+        // and recompute balanceDue from grandTotal. Only "received" payments
+        // affect those columns — voiding a "pending" payment has no money
+        // impact since pending wasn't counted as paid in the first place.
+        if (existing[0]!.status === "received") {
+          const [r] = await tx
+            .select()
+            .from(reservations)
+            .where(eq(reservations.id, existing[0]!.reservationId))
+            .limit(1);
+          if (r) {
+            const newAdvance = Math.max(
+              0,
+              +(Number(r.advancePaid) - Number(existing[0]!.amount)).toFixed(2),
+            );
+            const newBalance = +(Number(r.grandTotal) - newAdvance).toFixed(2);
+            await tx
+              .update(reservations)
+              .set({
+                advancePaid: String(newAdvance),
+                balanceDue: String(newBalance),
+                updatedAt: new Date(),
+              })
+              .where(eq(reservations.id, r.id));
+          }
+        }
       }
     });
 
@@ -237,6 +333,7 @@ router.post(
   "/:id/mark-received",
   requireAuth,
   requirePermission("record_payments"),
+  idempotent("payments.markReceived"),
   async (req, res) => {
     const id = req.params.id!;
     const body = req.body as { paymentMethod?: string; notes?: string };
@@ -302,5 +399,131 @@ router.post(
     return ok(res, { success: true });
   },
 );
+
+// Parses the FIFO marker on a payment's `notes` field.
+//   - new format: "Collected at check-out of SLDT-RES-XXXX" → returns
+//     { kind:"number", value: "SLDT-RES-XXXX" }
+//   - legacy:     "Collected at check-out of <uuid>"        → returns
+//     { kind:"id", value: uuid }
+// Returns null if neither matches. Callers resolve the value to a
+// reservation id before triggering the PDF regenerator.
+function extractCheckoutSourceReservation(
+  notes: string,
+): { kind: "id" | "number"; value: string } | null {
+  const uuidMatch = notes.match(
+    /Collected at check-out of ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i,
+  );
+  if (uuidMatch) return { kind: "id", value: uuidMatch[1]! };
+  const numberMatch = notes.match(/Collected at check-out of (SLDT-RES-\d+)/i);
+  if (numberMatch) return { kind: "number", value: numberMatch[1]! };
+  return null;
+}
+
+// Re-renders + re-uploads the public invoice PDF for a given reservation so
+// the static link reflects the latest data (e.g. a freshly recorded
+// companion collection that should appear in the footer). Best-effort —
+// callers `.catch()` on this.
+async function regenerateInvoicePdfForReservation(reservationId: string): Promise<void> {
+  const [inv] = await db
+    .select()
+    .from(invoices)
+    .where(eq(invoices.reservationId, reservationId))
+    .limit(1);
+  if (!inv) return;
+  const [items, pays, settings, companion, [resRow]] = await Promise.all([
+    db.select().from(invoiceLineItems).where(eq(invoiceLineItems.invoiceId, inv.id)),
+    db.select().from(payments).where(eq(payments.invoiceId, inv.id)),
+    getSettings(),
+    collectCompanionCollections(reservationId, inv.id),
+    db.select().from(reservations).where(eq(reservations.id, reservationId)).limit(1),
+  ]);
+  const pdf = await renderInvoicePdf({
+    invoice: inv,
+    lineItems: items,
+    payments: pays,
+    settings,
+    stay: resRow
+      ? {
+          checkInDate: resRow.checkInDate,
+          checkOutDate: resRow.checkOutDate,
+          numNights: Number(resRow.numNights),
+          checkedInAt: resRow.checkedInAt
+            ? resRow.checkedInAt.toISOString()
+            : null,
+        }
+      : undefined,
+    companionCollections: companion,
+  });
+  await uploadPublicPdf(`invoices/${inv.invoiceNumber}.pdf`, pdf);
+}
+
+// Companion-collection lookup — duplicate of routes/invoices.ts helper so
+// the payments route stays self-contained without a circular import.
+// Mirrors the same logic: LEFT JOIN invoices so pre-invoice payments
+// (those whose target reservation hasn't been checked out yet) are also
+// counted in the footer.
+async function collectCompanionCollections(
+  reservationId: string,
+  thisInvoiceId: string,
+): Promise<
+  { invoiceNumber: string | null; reservationNumber: string; amount: string }[]
+> {
+  // Same dual-marker logic as routes/invoices.ts. See there for the
+  // rationale. Mirror kept in-file to avoid a circular import.
+  const [thisRes] = await db
+    .select({ reservationNumber: reservations.reservationNumber })
+    .from(reservations)
+    .where(eq(reservations.id, reservationId))
+    .limit(1);
+  const newMarker = thisRes
+    ? `Collected at check-out of ${thisRes.reservationNumber}`
+    : null;
+  const legacyMarker = `Collected at check-out of ${reservationId}`;
+  const rows = await db
+    .select({
+      paymentReservationId: payments.reservationId,
+      amount: payments.amount,
+      invoiceId: invoices.id,
+      invoiceNumber: invoices.invoiceNumber,
+      otherReservationNumber: reservations.reservationNumber,
+    })
+    .from(payments)
+    .innerJoin(reservations, eq(reservations.id, payments.reservationId))
+    .leftJoin(invoices, eq(invoices.reservationId, payments.reservationId))
+    .where(
+      and(
+        eq(payments.voided, false),
+        newMarker
+          ? sql`${payments.notes} IN (${legacyMarker}, ${newMarker})`
+          : eq(payments.notes, legacyMarker),
+        sql`(${invoices.id} IS NULL OR ${invoices.id} <> ${thisInvoiceId})`,
+      ),
+    );
+  const byReservation = new Map<
+    string,
+    {
+      invoiceNumber: string | null;
+      reservationNumber: string;
+      total: number;
+    }
+  >();
+  for (const r of rows) {
+    if (!r.paymentReservationId) continue;
+    const cur = byReservation.get(r.paymentReservationId);
+    const amt = Number(r.amount);
+    if (cur) cur.total += amt;
+    else
+      byReservation.set(r.paymentReservationId, {
+        invoiceNumber: r.invoiceNumber ?? null,
+        reservationNumber: r.otherReservationNumber,
+        total: amt,
+      });
+  }
+  return Array.from(byReservation.values()).map((v) => ({
+    invoiceNumber: v.invoiceNumber,
+    reservationNumber: v.reservationNumber,
+    amount: v.total.toFixed(2),
+  }));
+}
 
 export default router;

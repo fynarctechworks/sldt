@@ -27,6 +27,9 @@ export const settingsUpdateSchema = z.object({
   gstSlabLowMax: z.coerce.number().min(0).optional(),
   gstSlabHighRate: z.coerce.number().min(0).max(100).optional(),
   additionalChargeDefaultGst: z.coerce.number().min(0).max(100).optional(),
+  // 'exclusive': rate is net, GST added on top.
+  // 'inclusive': rate already includes GST; net is extracted backwards.
+  gstMode: z.enum(["exclusive", "inclusive"]).optional(),
 
   docPrimaryColor: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),
   docAccentColor: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),
@@ -43,9 +46,27 @@ export const settingsUpdateSchema = z.object({
   docShowSignature: z.boolean().optional(),
 });
 
+// Strong-password rule: 10+ chars, at least one letter, at least one digit,
+// at least one symbol. Catches the common weak choices ("password123",
+// "12345678") while staying typeable. We don't enforce mixed case so users
+// who type in non-Latin scripts aren't locked out — symbol-and-digit is
+// sufficient entropy.
+const STRONG_PASSWORD = z
+  .string()
+  .min(10, "Password must be at least 10 characters")
+  .max(72, "Password is too long")
+  .regex(/[A-Za-z]/, "Password must contain a letter")
+  .regex(/[0-9]/, "Password must contain a digit")
+  .regex(/[^A-Za-z0-9]/, "Password must contain a symbol")
+  .refine((v) => !/^(.)\1+$/.test(v), "Password can't be all the same character")
+  .refine(
+    (v) => !["password", "12345678", "qwerty", "admin", "letmein"].some((bad) => v.toLowerCase().includes(bad)),
+    "Password is too common — try something less predictable",
+  );
+
 export const staffCreateSchema = z.object({
   email: z.string().email(),
-  password: z.string().min(8),
+  password: STRONG_PASSWORD,
   fullName: z.string().min(2),
   role: z.enum(ROLES),
   phone: z.string().optional(),
@@ -57,10 +78,20 @@ export const staffUpdateSchema = z.object({
   isActive: z.boolean().optional(),
   phone: z.string().optional().nullable(),
   email: z.string().email().optional(),
-  password: z.string().min(8).max(72).optional(),
+  password: STRONG_PASSWORD.optional(),
 });
 
 const slugRegex = /^[a-z0-9_]+$/;
+
+// One row of the per-room-type short-stay price table. The reservation UI
+// renders these as quick-pick pills and pro-rates a custom-hours entry from
+// the closest band.
+export const shortStayBandSchema = z.object({
+  label: z.string().min(1).max(40),
+  hours: z.coerce.number().positive().max(23.5),
+  rate: z.coerce.number().min(0),
+});
+export type ShortStayBand = z.infer<typeof shortStayBandSchema>;
 
 export const roomTypeCreateSchema = z.object({
   slug: z.string().min(1).max(40).regex(slugRegex, "Slug must be lowercase letters, numbers, underscore"),
@@ -69,6 +100,7 @@ export const roomTypeCreateSchema = z.object({
   maxOccupancy: z.coerce.number().int().min(1).max(20).default(2),
   description: z.string().max(300).optional().nullable(),
   isActive: z.boolean().default(true),
+  shortStayBands: z.array(shortStayBandSchema).max(10).optional(),
 });
 
 export const roomTypeUpdateSchema = roomTypeCreateSchema.partial().extend({

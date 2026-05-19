@@ -14,18 +14,49 @@ import { validate } from "../middleware/validate.js";
 
 const router = Router();
 
-const sendSchema = z.object({
-  reservationId: z.string().uuid(),
-  channel: z.enum(["sms", "email"]),
-});
+// Either reservationId (legacy: OTP after a reservation row exists) OR
+// guestId (new: OTP before the reservation is created — used by the
+// "create only after OTP verified" flow). Exactly one must be present.
+const sendSchema = z
+  .object({
+    reservationId: z.string().uuid().optional(),
+    guestId: z.string().uuid().optional(),
+    channel: z.enum(["sms", "email"]),
+  })
+  .refine((d) => !!d.reservationId !== !!d.guestId, {
+    message: "Provide exactly one of reservationId or guestId",
+  });
 
 router.post("/send", requireAuth, validate(sendSchema), async (req, res) => {
-  const { reservationId, channel } = req.body as z.infer<typeof sendSchema>;
+  const { reservationId, guestId, channel } = req.body as z.infer<typeof sendSchema>;
 
-  const [r] = await db.select().from(reservations).where(eq(reservations.id, reservationId)).limit(1);
-  if (!r) return fail(res, 404, "NOT_FOUND", "Reservation not found");
-
-  const [g] = await db.select().from(guests).where(eq(guests.id, r.guestId)).limit(1);
+  // Resolve the guest. Two paths:
+  //   1. reservationId → look up reservation → guest
+  //   2. guestId       → look up guest directly (no reservation in DB yet)
+  let g: typeof guests.$inferSelect | undefined;
+  let resvId: string | null = null;
+  if (reservationId) {
+    const [r] = await db
+      .select()
+      .from(reservations)
+      .where(eq(reservations.id, reservationId))
+      .limit(1);
+    if (!r) return fail(res, 404, "NOT_FOUND", "Reservation not found");
+    resvId = r.id;
+    const [foundGuest] = await db
+      .select()
+      .from(guests)
+      .where(eq(guests.id, r.guestId))
+      .limit(1);
+    g = foundGuest;
+  } else if (guestId) {
+    const [foundGuest] = await db
+      .select()
+      .from(guests)
+      .where(eq(guests.id, guestId))
+      .limit(1);
+    g = foundGuest;
+  }
   if (!g) return fail(res, 404, "NOT_FOUND", "Guest not found");
 
   const target = channel === "sms" ? g.phone : g.email;
@@ -33,6 +64,13 @@ router.post("/send", requireAuth, validate(sendSchema), async (req, res) => {
     return fail(res, 400, "NO_TARGET", channel === "sms" ? "Guest has no phone on file" : "Guest has no email on file");
   }
 
+  // Tiered throttling.
+  // 1) Per-target cool-down: one OTP per minute per phone/email.
+  // 2) Per-target daily cap: 10 OTPs in 24h to the same recipient (catches
+  //    someone abusing a real guest's number).
+  // 3) Per-IP hourly cap: 30 OTP sends from one client IP per hour
+  //    (catches scripted abuse even if the attacker rotates targets).
+  // The activity_log captures every block reason for incident review.
   const recent = await db
     .select({ id: otps.id })
     .from(otps)
@@ -45,7 +83,54 @@ router.post("/send", requireAuth, validate(sendSchema), async (req, res) => {
     )
     .limit(1);
   if (recent.length > 0) {
+    logger.warn({ target: maskTarget(target, channel), reason: "cooldown" }, "OTP throttle");
     return fail(res, 429, "RATE_LIMITED", "Please wait before requesting a new code");
+  }
+
+  const dailyCount = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(otps)
+    .where(
+      and(
+        eq(otps.target, target),
+        eq(otps.purpose, "checkin"),
+        gt(otps.createdAt, sql`now() - interval '24 hours'`),
+      ),
+    );
+  if ((dailyCount[0]?.n ?? 0) >= 10) {
+    logger.warn(
+      { target: maskTarget(target, channel), reason: "daily_cap" },
+      "OTP throttle",
+    );
+    return fail(
+      res,
+      429,
+      "RATE_LIMITED",
+      "This recipient has reached the daily OTP limit. Try again tomorrow.",
+    );
+  }
+
+  // Per-IP hourly cap. ipAddress is recorded on otps rows for this reason.
+  // Falls back to 'unknown' when behind a proxy without trust proxy set, but
+  // trust proxy is set in index.ts so req.ip resolves to the real client.
+  const clientIp = req.ip ?? "unknown";
+  const ipCount = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(otps)
+    .where(
+      and(
+        eq(otps.ipAddress, clientIp),
+        gt(otps.createdAt, sql`now() - interval '1 hour'`),
+      ),
+    );
+  if ((ipCount[0]?.n ?? 0) >= 30) {
+    logger.warn({ ip: clientIp, reason: "ip_cap" }, "OTP throttle");
+    return fail(
+      res,
+      429,
+      "RATE_LIMITED",
+      "Too many OTP requests from this device. Slow down.",
+    );
   }
 
   const code = generateOtp();
@@ -56,9 +141,10 @@ router.post("/send", requireAuth, validate(sendSchema), async (req, res) => {
       channel,
       target,
       codeHash: hashOtp(code),
-      reservationId: r.id,
+      reservationId: resvId,
       guestId: g.id,
       expiresAt: expiresAt(),
+      ipAddress: clientIp,
     })
     .returning({ id: otps.id });
 
@@ -81,7 +167,16 @@ router.post("/send", requireAuth, validate(sendSchema), async (req, res) => {
   }
 
   if (env.NOTIFICATIONS_PROVIDER === "stub") {
-    logger.info({ otp: code, target }, "[OTP] generated (stub mode — code returned in response)");
+    // Stub mode (dev) returns the code in the response body for the test
+    // harness. We deliberately do NOT log the raw code here — log files
+    // get archived/shipped to monitoring systems and leaking OTP codes in
+    // a hotel-staff log review would be a real privacy/security issue.
+    // The target is also masked so a developer skimming logs can identify
+    // the test guest without seeing their full phone/email.
+    logger.info(
+      { target: maskTarget(target, channel) },
+      "[OTP] generated in stub mode (code returned to caller, not logged)",
+    );
   }
 
   return ok(res, {
@@ -93,41 +188,86 @@ router.post("/send", requireAuth, validate(sendSchema), async (req, res) => {
   });
 });
 
-const verifySchema = z.object({
-  reservationId: z.string().uuid(),
-  code: z.string().min(4).max(8),
-});
+// Same shape as send: exactly one of reservationId or guestId.
+const verifySchema = z
+  .object({
+    reservationId: z.string().uuid().optional(),
+    guestId: z.string().uuid().optional(),
+    code: z.string().min(4).max(8),
+  })
+  .refine((d) => !!d.reservationId !== !!d.guestId, {
+    message: "Provide exactly one of reservationId or guestId",
+  });
 
 router.post("/verify", requireAuth, validate(verifySchema), async (req, res) => {
-  const { reservationId, code } = req.body as z.infer<typeof verifySchema>;
+  const { reservationId, guestId, code } = req.body as z.infer<typeof verifySchema>;
+  const clientIp = req.ip ?? "unknown";
+
+  // Look up the most recent non-consumed OTP by either anchor.
+  const whereClause = reservationId
+    ? and(
+        eq(otps.reservationId, reservationId),
+        eq(otps.purpose, "checkin"),
+        isNull(otps.consumedAt),
+      )
+    : and(
+        eq(otps.guestId, guestId!),
+        // In guest-only mode there's no reservation yet, so the row must
+        // not be linked to one. This stops a code intended for a different
+        // active reservation from being reused for a fresh booking.
+        isNull(otps.reservationId),
+        eq(otps.purpose, "checkin"),
+        isNull(otps.consumedAt),
+      );
 
   const [row] = await db
     .select()
     .from(otps)
-    .where(
-      and(
-        eq(otps.reservationId, reservationId),
-        eq(otps.purpose, "checkin"),
-        isNull(otps.consumedAt),
-      ),
-    )
+    .where(whereClause)
     .orderBy(sql`${otps.createdAt} desc`)
     .limit(1);
 
-  if (!row) return fail(res, 404, "NO_OTP", "No active OTP for this reservation");
-  if (row.expiresAt < new Date()) return fail(res, 400, "EXPIRED", "OTP has expired, request a new one");
+  const anchorLog = reservationId ? { reservationId } : { guestId };
+
+  if (!row) {
+    logger.warn({ ...anchorLog, ip: clientIp, reason: "no_otp" }, "OTP verify failed");
+    return fail(res, 404, "NO_OTP", "No active OTP found");
+  }
+  if (row.expiresAt < new Date()) {
+    logger.warn({ ...anchorLog, ip: clientIp, reason: "expired" }, "OTP verify failed");
+    return fail(res, 400, "EXPIRED", "OTP has expired, request a new one");
+  }
   if (row.attempts >= env.OTP_MAX_ATTEMPTS) {
+    logger.warn(
+      { ...anchorLog, ip: clientIp, attempts: row.attempts, reason: "max_attempts" },
+      "OTP verify failed",
+    );
     return fail(res, 429, "TOO_MANY_ATTEMPTS", "Too many wrong attempts, request a new OTP");
   }
 
   if (row.codeHash !== hashOtp(code)) {
     await db.update(otps).set({ attempts: row.attempts + 1 }).where(eq(otps.id, row.id));
+    logger.warn(
+      { ...anchorLog, ip: clientIp, attempts: row.attempts + 1, reason: "wrong_code" },
+      "OTP verify failed",
+    );
     return fail(res, 400, "INVALID_CODE", "Incorrect code");
   }
 
-  await db.update(otps).set({ consumedAt: new Date() }).where(eq(otps.id, row.id));
+  // We DON'T mark the OTP consumed here when verifying for a not-yet-
+  // created reservation. The reservation-create endpoint will check the
+  // OTP itself and mark it consumed in the same transaction so a verified
+  // OTP can't be replayed against a different payload.
+  if (reservationId) {
+    await db.update(otps).set({ consumedAt: new Date() }).where(eq(otps.id, row.id));
+  }
 
-  return ok(res, { verified: true, reservationId, verifiedAt: new Date().toISOString() });
+  return ok(res, {
+    verified: true,
+    reservationId: reservationId ?? null,
+    guestId: guestId ?? null,
+    verifiedAt: new Date().toISOString(),
+  });
 });
 
 export default router;

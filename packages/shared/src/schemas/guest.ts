@@ -36,6 +36,7 @@ export const guestListQuerySchema = z.object({
 });
 
 export const GUEST_TAGS = [
+  "first_time",
   "vip",
   "corporate",
   "repeat",

@@ -19,11 +19,16 @@ export const otps = pgTable(
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
     attempts: integer("attempts").notNull().default(0),
     consumedAt: timestamp("consumed_at", { withTimezone: true }),
+    // Client IP that originated the OTP send. Used for per-IP rate limiting
+    // (catches scripted abuse that rotates targets). Optional because old
+    // rows pre-date this column.
+    ipAddress: text("ip_address"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
     targetIdx: index("idx_otps_target_purpose").on(t.target, t.purpose),
     reservationIdx: index("idx_otps_reservation").on(t.reservationId),
+    ipIdx: index("idx_otps_ip_created").on(t.ipAddress, t.createdAt),
   }),
 );
 

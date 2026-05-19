@@ -1,4 +1,20 @@
-import { boolean, numeric, pgTable, text, time, timestamp, uuid } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import {
+  boolean,
+  jsonb,
+  numeric,
+  pgTable,
+  text,
+  time,
+  timestamp,
+  uuid,
+} from "drizzle-orm/pg-core";
+
+export type ShortStayBand = {
+  label: string;
+  hours: number;
+  rate: number;
+};
 
 export const settings = pgTable("settings", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -30,6 +46,16 @@ export const settings = pgTable("settings", {
     .notNull()
     .default("18"),
 
+  // 'exclusive' (legacy): rate is net, GST is added on top → grand total
+  //   = rate × (1 + gstRate/100). ₹1000 + 5% → ₹1050.
+  // 'inclusive' (default): rate already contains GST → net is extracted
+  //   backwards. ₹1000 at 5% → ₹952.38 net + ₹47.62 GST = ₹1000 grand.
+  // Only honoured by NEW reservation creates and the recalc helper.
+  // Existing reservation rows keep whatever totals they were created with.
+  gstMode: text("gst_mode", { enum: ["exclusive", "inclusive"] as const })
+    .notNull()
+    .default("inclusive"),
+
   docPrimaryColor: text("doc_primary_color").notNull().default("#0F3D2E"),
   docAccentColor: text("doc_accent_color").notNull().default("#B08A4A"),
   docInvoiceTitle: text("doc_invoice_title").notNull().default("Tax Invoice"),
@@ -38,6 +64,9 @@ export const settings = pgTable("settings", {
   docTermsText: text("doc_terms_text"),
   docSignatoryLabel: text("doc_signatory_label").notNull().default("Authorised Signatory"),
   docInvoicePageSize: text("doc_invoice_page_size").notNull().default("A4"),
+  // Receipts default to A5 — they're a single-stay slip, not a full
+  // tax-invoice document. A4 leaves a lot of empty space at the bottom
+  // when printed.
   docReceiptPageSize: text("doc_receipt_page_size").notNull().default("A5"),
   docShowLogo: boolean("doc_show_logo").notNull().default(true),
   docShowGstin: boolean("doc_show_gstin").notNull().default(true),
@@ -56,6 +85,13 @@ export const roomTypes = pgTable("room_types", {
   maxOccupancy: numeric("max_occupancy").notNull().default("2"),
   description: text("description"),
   isActive: boolean("is_active").notNull().default(true),
+  // Day-use bands shown on the reservation form when stay_type='short_stay'.
+  // Each row is {label, hours, rate}; the user can also enter a custom
+  // duration that is priced pro-rata from the closest band.
+  shortStayBands: jsonb("short_stay_bands")
+    .$type<ShortStayBand[]>()
+    .notNull()
+    .default(sql`'[]'::jsonb`),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });

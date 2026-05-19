@@ -50,6 +50,43 @@
 }
 
 @layer utilities {
+  /* Checkout-alert breathing pulse (legacy). Subtle box-shadow ring used
+     by the time-late pill — kept for that pill so the per-row count keeps
+     its breathing effect. */
+  @keyframes checkout-pulse {
+    0%,
+    100% {
+      box-shadow: 0 0 0 0 rgba(163, 58, 48, 0.45);
+    }
+    50% {
+      box-shadow: 0 0 0 6px rgba(163, 58, 48, 0);
+    }
+  }
+  .animate-checkout-pulse {
+    animation: checkout-pulse 2s ease-in-out infinite;
+  }
+
+  /* Hard background blink for imminent + overdue rows. Bright red ⇄
+     deeper red every second. Fast enough to feel urgent, slow enough
+     to avoid photosensitivity issues (WCAG suggests <3 flashes/second).
+     Border + text colour are forced too so contrast stays readable at
+     both peaks. */
+  @keyframes checkout-blink {
+    0%,
+    100% {
+      background-color: #A33A30; /* danger */
+      border-color: #A33A30;
+    }
+    50% {
+      background-color: #6E2620; /* deeper red */
+      border-color: #6E2620;
+    }
+  }
+  .animate-checkout-blink {
+    animation: checkout-blink 1s steps(2, end) infinite;
+    color: #FAF7F0;
+  }
+
   @keyframes loader-spin-cw {
     to {
       transform: rotate(360deg);

@@ -24,6 +24,13 @@ export const reservations = pgTable(
       .references(() => guests.id),
     checkInDate: date("check_in_date").notNull(),
     checkOutDate: date("check_out_date").notNull(),
+    // 'overnight' (default) — traditional night-based booking.
+    // 'short_stay' — same-calendar-day day-use booking measured in hours;
+    // duration_hours is required and check_out_date == check_in_date.
+    stayType: text("stay_type", { enum: ["overnight", "short_stay"] as const })
+      .notNull()
+      .default("overnight"),
+    durationHours: numeric("duration_hours", { precision: 5, scale: 2 }),
     numAdults: integer("num_adults").notNull().default(1),
     numChildren: integer("num_children").notNull().default(0),
     ratePerNight: numeric("rate_per_night", { precision: 10, scale: 2 }).notNull(),
@@ -34,8 +41,28 @@ export const reservations = pgTable(
     gstRate: numeric("gst_rate", { precision: 5, scale: 2 }).notNull(),
     gstAmount: numeric("gst_amount", { precision: 10, scale: 2 }).notNull(),
     grandTotal: numeric("grand_total", { precision: 10, scale: 2 }).notNull(),
+    // GST mode snapshot at create time. 'exclusive' means subtotal is the
+    // net (GST added on top), 'inclusive' means grand_total already
+    // contained GST (subtotal was extracted backwards). Recalcs and
+    // edits on this row honour the same mode it was created with, so the
+    // property's current setting can change without rewriting history.
+    gstMode: text("gst_mode", { enum: ["exclusive", "inclusive"] as const })
+      .notNull()
+      .default("exclusive"),
     advancePaid: numeric("advance_paid", { precision: 10, scale: 2 }).notNull().default("0"),
+    // Wallet credit applied as a discount on this booking. Deducted from
+    // balanceDue (and shown as a separate line on the invoice). The source
+    // entries live in guest_ledger with entryType='credit_used'.
+    walletCreditApplied: numeric("wallet_credit_applied", { precision: 10, scale: 2 })
+      .notNull()
+      .default("0"),
     balanceDue: numeric("balance_due", { precision: 10, scale: 2 }).notNull(),
+    // Extra hours granted via POST /:id/late-checkout. Added to the hotel's
+    // default checkOutTime to compute the effective per-reservation
+    // check-out moment. 0 = no extension (the default).
+    lateCheckoutHours: numeric("late_checkout_hours", { precision: 4, scale: 2 })
+      .notNull()
+      .default("0"),
     status: text("status", { enum: RESERVATION_STATUSES }).notNull().default("confirmed"),
     bookingSource: text("booking_source", { enum: BOOKING_SOURCES }).notNull().default("walkin"),
     creditNotes: text("credit_notes"),
@@ -52,7 +79,11 @@ export const reservations = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
-    checkOutAfterIn: check("res_checkout_after_checkin", sql`${t.checkOutDate} > ${t.checkInDate}`),
+    checkOutAfterIn: check(
+      "res_checkout_after_checkin",
+      sql`(${t.stayType} = 'short_stay' AND ${t.checkOutDate} >= ${t.checkInDate})
+        OR (${t.stayType} = 'overnight' AND ${t.checkOutDate} > ${t.checkInDate})`,
+    ),
   }),
 );
 

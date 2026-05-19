@@ -46,6 +46,33 @@ describe("calcGstBreakdown", () => {
     expect(b.grandTotal).toBe(11800);
   });
 
+  // Inclusive mode uses simple-percent-of-gross per the owner's decision
+  // (not the strict inverse-extraction formula). ₹1000 @ 5% → GST is 5%
+  // of 1000 = 50, net = 950. Cleaner round numbers, matches how the
+  // owner verbally quotes the bill.
+  it("inclusive mode: GST is rate × gross (5% on 1000 → 50)", () => {
+    const b = calcGstBreakdown(1000, 5, "inclusive");
+    expect(b.grandTotal).toBe(1000);
+    expect(b.subtotal).toBe(950);
+    expect(b.gstAmount).toBe(50);
+    expect(b.cgstAmount).toBe(25);
+    expect(b.sgstAmount).toBe(25);
+  });
+
+  it("inclusive mode: 18% on 10000 → 1800 GST, 8200 net", () => {
+    const b = calcGstBreakdown(10000, 18, "inclusive");
+    expect(b.grandTotal).toBe(10000);
+    expect(b.subtotal).toBe(8200);
+    expect(b.gstAmount).toBe(1800);
+  });
+
+  it("inclusive mode at 0% leaves the amount untouched", () => {
+    const b = calcGstBreakdown(800, 0, "inclusive");
+    expect(b.grandTotal).toBe(800);
+    expect(b.subtotal).toBe(800);
+    expect(b.gstAmount).toBe(0);
+  });
+
   it("handles zero-rate tariffs", () => {
     const b = calcGstBreakdown(800, 0);
     expect(b.gstAmount).toBe(0);

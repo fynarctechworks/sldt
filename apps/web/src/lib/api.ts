@@ -16,9 +16,49 @@ export class ApiError extends Error {
   }
 }
 
+// Helper for callers that want one idempotency key per UI intent. Use the
+// returned function inside a React component (typically tied to a form or
+// modal instance) and pass the resulting key to api.post on each submit.
+// All clicks during the same intent share the same key; calling next()
+// rotates it for the next intent.
+export function newIdempotencyKey(): string {
+  // crypto.randomUUID is available in all modern browsers and Node 14+.
+  // Fall back to a Math.random-based key only if the runtime is ancient.
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `idk-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+// Tracks whether we've already started the sign-out cascade so concurrent
+// in-flight requests that all return 401 don't each trigger a separate
+// signOut() / page reload.
+let signingOutFor401 = false;
+
+async function handle401(): Promise<void> {
+  if (signingOutFor401) return;
+  signingOutFor401 = true;
+  try {
+    await supabase.auth.signOut();
+  } catch {
+    /* ignore — we're about to reload anyway */
+  }
+  // Avoid hard-redirect loop if user is already on /login.
+  if (typeof window !== "undefined" && !window.location.pathname.startsWith("/login")) {
+    const from = window.location.pathname + window.location.search;
+    window.location.replace(`/login?expired=1&from=${encodeURIComponent(from)}`);
+  }
+}
+
 async function handle<T>(res: Response): Promise<T> {
   if (res.status === 304) {
     throw new ApiError(304, "NOT_MODIFIED", "Unexpected 304. Disable ETag on server");
+  }
+  if (res.status === 401) {
+    // Fire-and-forget the sign-out — we don't want every caller to await
+    // it, but we still throw so the in-flight request short-circuits.
+    void handle401();
+    throw new ApiError(401, "UNAUTHENTICATED", "Session expired. Please sign in again.");
   }
   const text = await res.text();
   const json = text ? (JSON.parse(text) as { success?: boolean; data?: T; error?: { code?: string; message?: string; details?: unknown } }) : {};
@@ -46,11 +86,24 @@ export const api = {
     return handle<T>(res);
   },
 
-  async post<T>(path: string, body?: unknown): Promise<T> {
+  async post<T>(
+    path: string,
+    body?: unknown,
+    // When provided, sent as Idempotency-Key. Server-side middleware on
+    // payment/credit endpoints replays the original response if the same
+    // key arrives twice, preventing duplicate charges from double-click
+    // or network retry.
+    opts?: { idempotencyKey?: string },
+  ): Promise<T> {
     if (UI_PREVIEW) return mockMutation<T>(path);
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...((await authHeader()) as Record<string, string>),
+    };
+    if (opts?.idempotencyKey) headers["Idempotency-Key"] = opts.idempotencyKey;
     const res = await fetch(`${BASE}${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", ...(await authHeader()) },
+      headers,
       body: body ? JSON.stringify(body) : undefined,
     });
     return handle<T>(res);
@@ -107,6 +160,10 @@ export async function getList<T>(
     }
   }
   const res = await fetch(url, { headers: await authHeader() });
+  if (res.status === 401) {
+    void handle401();
+    throw new ApiError(401, "UNAUTHENTICATED", "Session expired. Please sign in again.");
+  }
   const json = await res.json().catch(() => ({}));
   if (!res.ok || json?.success === false) {
     throw new ApiError(res.status, json?.error?.code ?? "UNKNOWN", json?.error?.message ?? `HTTP ${res.status}`);

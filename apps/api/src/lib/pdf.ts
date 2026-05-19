@@ -1,10 +1,26 @@
 import { format } from "date-fns";
+import { eq } from "drizzle-orm";
 import puppeteer, { type Browser, type PaperFormat } from "puppeteer";
+import { db } from "../db/client.js";
 import type { InvoiceLineItem, Invoice, Payment } from "../db/schema/invoices.js";
+import { payments } from "../db/schema/invoices.js";
 import type { Guest } from "../db/schema/guests.js";
-import type { Reservation } from "../db/schema/reservations.js";
+import { reservationRooms, type Reservation } from "../db/schema/reservations.js";
+import { rooms } from "../db/schema/rooms.js";
+import { roomTypes } from "../db/schema/settings.js";
 import type { Settings } from "../db/schema/settings.js";
 import { logger } from "./logger.js";
+import { combinedRoomTypeLabel } from "./roomTypeLabel.js";
+
+function formatTime(hhmm: string | null | undefined): string {
+  if (!hhmm) return "";
+  const [hStr, mStr] = hhmm.split(":");
+  const h = Number(hStr);
+  const m = mStr ?? "00";
+  const period = h >= 12 ? "PM" : "AM";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}:${m.padStart(2, "0")} ${period}`;
+}
 
 let browserPromise: Promise<Browser> | null = null;
 
@@ -25,6 +41,41 @@ export async function closeBrowser() {
     await b.close();
     browserPromise = null;
   }
+}
+
+// Hardens a freshly-created page for rendering invoice/receipt HTML.
+//
+// 1. JavaScript execution is disabled. Our templates are pure HTML+CSS, so
+//    JS in the rendered document can only come from injection. Turning it
+//    off is the cheapest way to neutralise that risk class entirely.
+// 2. Request interception blocks every non-image network call, and even
+//    images are restricted to https/data URIs. This kills SSRF (the page
+//    can't be coerced into fetching internal IPs) and any "load remote
+//    stylesheet/font/script" injection.
+// 3. We never navigate to a URL — only setContent — so no opportunity for
+//    the doc to bounce out via window.location.
+async function hardenPage(page: import("puppeteer").Page) {
+  await page.setJavaScriptEnabled(false);
+  await page.setRequestInterception(true);
+  page.on("request", (request) => {
+    const url = request.url();
+    const resourceType = request.resourceType();
+    // Allow images only, and only from data: or https: schemes (the hotel
+    // logo on Supabase storage is the only legitimate remote resource).
+    if (
+      resourceType === "image" &&
+      (url.startsWith("data:") || url.startsWith("https://"))
+    ) {
+      request.continue();
+      return;
+    }
+    // The synthetic about:blank document Puppeteer creates before setContent.
+    if (url === "about:blank") {
+      request.continue();
+      return;
+    }
+    request.abort();
+  });
 }
 
 function esc(s: string | null | undefined) {
@@ -385,7 +436,15 @@ function commonStyles(L: DocLayout) {
   `;
 }
 
-function brandHeader(L: DocLayout, hotelName: string, hotelAddress: string, hotelGstin: string) {
+function brandHeader(
+  L: DocLayout,
+  hotelName: string,
+  hotelAddress: string,
+  hotelGstin: string,
+  hotelPhone?: string | null,
+  ownerPhone?: string | null,
+) {
+  const phones = [hotelPhone, ownerPhone].filter((p): p is string => !!p && p.trim() !== "");
   return `
     <div class="brand">
       ${L.showLogo && L.logoUrl ? `<div class="logo-tile"><img src="${esc(L.logoUrl)}" alt="logo" /></div>` : ""}
@@ -393,6 +452,7 @@ function brandHeader(L: DocLayout, hotelName: string, hotelAddress: string, hote
         <h1>${esc(hotelName)}</h1>
         <div class="tagline">Hospitality &amp; Stays</div>
         <div class="addr">${esc(hotelAddress)}</div>
+        ${phones.length ? `<div class="addr">${phones.map((p) => esc(p)).join(" &nbsp;·&nbsp; ")}</div>` : ""}
         ${L.showGstin && hotelGstin ? `<div class="gstin">GSTIN&nbsp;·&nbsp;${esc(hotelGstin)}</div>` : ""}
       </div>
     </div>
@@ -404,8 +464,36 @@ function renderInvoiceHtml(data: {
   lineItems: InvoiceLineItem[];
   payments: Payment[];
   settings: Settings;
+  // Stay window comes from the reservation, not the invoice. Optional so
+  // callers that don't have it (legacy paths) still render correctly.
+  stay?: {
+    checkInDate: string;
+    checkOutDate: string;
+    numNights: number;
+    // Day-use vs overnight. When 'short_stay', the stay block in the
+    // header reads "Day use · N hours" instead of "N night(s)".
+    stayType?: "overnight" | "short_stay";
+    durationHours?: number | null;
+    // ISO timestamp of when the guest actually checked in. Used to split
+    // payments into "Advance (at booking/check-in)" vs "Later" so the
+    // totals show the breakdown rather than a single Total Paid number.
+    // Null/missing when the reservation isn't checked in yet (advance-
+    // receipt rendering path).
+    checkedInAt?: string | null;
+  };
+  // Other bookings for the same guest that were paid at the same desk
+  // visit (the "collect previous balance" flow on check-out). Surfaced as
+  // an informational footer block. Does NOT affect the invoice's totals
+  // or GST — those other bookings are separate documents. invoiceNumber
+  // may be null when the companion is still a pre-invoice reservation
+  // (active stay, not yet checked out).
+  companionCollections?: {
+    invoiceNumber: string | null;
+    reservationNumber: string;
+    amount: string;
+  }[];
 }) {
-  const { invoice, lineItems, payments, settings } = data;
+  const { invoice, lineItems, payments, settings, stay, companionCollections } = data;
   const L = layoutFromSettings(settings);
 
   const itemRows = lineItems
@@ -421,16 +509,32 @@ function renderInvoiceHtml(data: {
     )
     .join("");
 
+  // Determine the advance/later boundary so each payment row can be
+  // tagged. When checkedInAt isn't known yet (still pre-check-in), all
+  // payments are advance. Voided rows are skipped entirely.
+  const checkedInAtMs = data.stay?.checkedInAt
+    ? new Date(data.stay.checkedInAt).getTime()
+    : null;
   const payRows = payments.length
     ? payments
-        .map(
-          (p) => `
+        .filter((p) => !p.voided)
+        .map((p) => {
+          const isLater =
+            checkedInAtMs !== null &&
+            new Date(p.paymentDate).getTime() > checkedInAtMs;
+          const tag = isLater ? "Later payment" : "Advance at check-in";
+          return `
     <tr>
       <td>${format(new Date(p.paymentDate), "dd MMM yyyy")}</td>
-      <td class="capitalize">${p.paymentMethod.replace("_", " ")}</td>
+      <td class="capitalize">
+        ${p.paymentMethod.replace("_", " ")}
+        <span style="color:#6B6358;font-size:9.5px;text-transform:none;letter-spacing:0;margin-left:4px;">
+          · ${tag}
+        </span>
+      </td>
       <td class="num mono">${inr(p.amount, L.currency)}</td>
-    </tr>`,
-        )
+    </tr>`;
+        })
         .join("")
     : `<tr><td colspan="3" style="color:#999;text-align:center;padding:14px;">No payments yet</td></tr>`;
 
@@ -446,7 +550,7 @@ ${L.showLogo && L.logoUrl ? `<div class="watermark"><img src="${esc(L.logoUrl)}"
   <div class="top-rule"></div>
 
   <div class="header">
-    ${brandHeader(L, invoice.hotelName, invoice.hotelAddress, invoice.hotelGstin)}
+    ${brandHeader(L, invoice.hotelName, invoice.hotelAddress, invoice.hotelGstin, data.settings.hotelPhone, data.settings.ownerPhone)}
     <div class="meta">
       <div class="doc-label">${esc(L.invoiceTitle)}</div>
       <div class="doc-no">${esc(invoice.invoiceNumber)}</div>
@@ -464,8 +568,34 @@ ${L.showLogo && L.logoUrl ? `<div class="watermark"><img src="${esc(L.logoUrl)}"
     </div>
     <div class="info-card">
       <div class="label">Stay</div>
-      <div class="sub mono">Invoice ${esc(invoice.invoiceNumber)}</div>
-      <div class="sub">Issued ${format(new Date(invoice.createdAt), "dd MMM yyyy")}</div>
+      ${(() => {
+        if (!stay) return "";
+        const isShort = stay.stayType === "short_stay";
+        // For day-use bookings, derive the actual exit time from
+        // checkedInAt + durationHours so the invoice reflects when the
+        // guest is supposed to leave (not the overnight check-out date).
+        const shortOut = isShort && stay.checkedInAt
+          ? new Date(
+              new Date(stay.checkedInAt).getTime()
+                + Math.round(Number(stay.durationHours ?? 0) * 3600 * 1000),
+            )
+          : null;
+        const checkInLine = `<div class="sub">Check-in: <strong>${format(
+          stay.checkedInAt ? new Date(stay.checkedInAt) : new Date(stay.checkInDate + "T00:00:00"),
+          isShort && stay.checkedInAt ? "dd MMM yyyy · h:mm a" : "dd MMM yyyy",
+        )}</strong></div>`;
+        const checkOutLine = `<div class="sub">Check-out: <strong>${format(
+          shortOut ?? new Date(stay.checkOutDate + "T00:00:00"),
+          shortOut ? "dd MMM yyyy · h:mm a" : "dd MMM yyyy",
+        )}</strong></div>`;
+        const durationLine = `<div class="sub" style="color:#6B6358;">${
+          isShort
+            ? `Day use · ${Number(stay.durationHours ?? 0)} hour${Number(stay.durationHours ?? 0) === 1 ? "" : "s"}`
+            : `${stay.numNights} night${stay.numNights === 1 ? "" : "s"}`
+        }</div>`;
+        return checkInLine + checkOutLine + durationLine;
+      })()}
+      <div class="sub" style="margin-top:4px;">Issued ${format(new Date(invoice.issueDate ?? invoice.createdAt), "dd MMM yyyy")}</div>
     </div>
   </div>
 
@@ -489,7 +619,38 @@ ${L.showLogo && L.logoUrl ? `<div class="watermark"><img src="${esc(L.logoUrl)}"
       <tr class="tax"><td>CGST @ ${invoice.cgstRate}%</td><td class="num mono">${inr(invoice.cgstAmount, L.currency)}</td></tr>
       <tr class="tax"><td>SGST @ ${invoice.sgstRate}%</td><td class="num mono">${inr(invoice.sgstAmount, L.currency)}</td></tr>
       <tr class="grand"><td>Grand Total</td><td class="num mono">${inr(invoice.grandTotal, L.currency)}</td></tr>
-      <tr class="paid"><td>Total Paid</td><td class="num mono">${inr(invoice.totalPaid, L.currency)}</td></tr>
+      ${
+        Number(invoice.walletCreditApplied ?? 0) > 0.009
+          ? `<tr class="paid"><td>Wallet credit applied</td><td class="num mono">−${inr(invoice.walletCreditApplied, L.currency)}</td></tr>`
+          : ""
+      }
+      ${(() => {
+        // Split total paid into Advance (at/before check-in) and Later
+        // when both exist. Reads from the actual payment rows so the
+        // numbers always match Payment History below. Falls back to a
+        // single "Total Paid" line when there's nothing to split.
+        const checkedInAt = data.stay?.checkedInAt
+          ? new Date(data.stay.checkedInAt).getTime()
+          : null;
+        let advance = 0;
+        let later = 0;
+        for (const p of payments) {
+          if (p.voided) continue;
+          if (p.status && p.status !== "received") continue;
+          const ts = new Date(p.paymentDate).getTime();
+          if (checkedInAt !== null && ts > checkedInAt) later += Number(p.amount);
+          else advance += Number(p.amount);
+        }
+        advance = +advance.toFixed(2);
+        later = +later.toFixed(2);
+        if (advance > 0.009 && later > 0.009) {
+          return `
+      <tr class="paid"><td>Advance Paid (at check-in)</td><td class="num mono">${inr(advance, L.currency)}</td></tr>
+      <tr class="paid"><td>Later Payments</td><td class="num mono">${inr(later, L.currency)}</td></tr>
+      <tr class="paid"><td>Total Paid</td><td class="num mono">${inr(invoice.totalPaid, L.currency)}</td></tr>`;
+        }
+        return `<tr class="paid"><td>Total Paid</td><td class="num mono">${inr(invoice.totalPaid, L.currency)}</td></tr>`;
+      })()}
       <tr class="balance"><td>Balance Due</td><td class="num mono ${balanceClass}">${inr(invoice.balanceDue, L.currency)}</td></tr>
     </table>
   </div>
@@ -505,6 +666,55 @@ ${L.showLogo && L.logoUrl ? `<div class="watermark"><img src="${esc(L.logoUrl)}"
     </thead>
     <tbody>${payRows}</tbody>
   </table>
+
+  ${
+    companionCollections && companionCollections.length > 0
+      ? (() => {
+          const total = companionCollections
+            .reduce((s, c) => s + Number(c.amount), 0)
+            .toFixed(2);
+          const rows = companionCollections
+            .map((c) => {
+              // Pre-invoice rows have no invoice number yet. Show the
+              // reservation number and a small "(advance)" tag so staff
+              // and the guest understand it's a payment toward an
+              // ongoing booking that hasn't been invoiced yet.
+              const left = c.invoiceNumber
+                ? `${esc(c.invoiceNumber)} <span style="color:#6B6358;">(${esc(c.reservationNumber)})</span>`
+                : `${esc(c.reservationNumber)} <span style="color:#6B6358;font-style:italic;">(advance, not invoiced yet)</span>`;
+              return `
+              <tr>
+                <td style="padding:3px 6px;border-bottom:1px solid #EEE8DA;">${left}</td>
+                <td style="padding:3px 6px;border-bottom:1px solid #EEE8DA;text-align:right;font-family:'JetBrains Mono',monospace;">${inr(c.amount, L.currency)}</td>
+              </tr>`;
+            })
+            .join("");
+          // Subtitle adapts based on whether any companions are pre-invoice.
+          const hasPreInvoice = companionCollections.some((c) => !c.invoiceNumber);
+          const subtitleNoun = hasPreInvoice
+            ? `booking${companionCollections.length === 1 ? "" : "s"}`
+            : `invoice${companionCollections.length === 1 ? "" : "s"}`;
+          return `
+  <div style="margin-top:10px;padding:8px 10px;border-left:2px solid #B08A4A;background:#FAF7F0;font-size:10.5px;page-break-inside:avoid;">
+    <div style="font-weight:600;color:#0F3D2E;text-transform:uppercase;letter-spacing:0.06em;font-size:10px;margin-bottom:2px;">
+      Also collected today
+    </div>
+    <div style="color:#6B6358;font-size:10px;margin-bottom:4px;">
+      Settled at the same visit, against other ${subtitleNoun} for this guest.
+    </div>
+    <table style="width:100%;border-collapse:collapse;font-size:10.5px;">
+      <tbody>
+        ${rows}
+        <tr style="font-weight:600;">
+          <td style="padding:3px 6px;">Total settled separately</td>
+          <td style="padding:3px 6px;text-align:right;font-family:'JetBrains Mono',monospace;">${inr(total, L.currency)}</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>`;
+        })()
+      : ""
+  }
 
   ${
     L.showTerms && L.termsText
@@ -531,10 +741,29 @@ export async function renderInvoicePdf(data: {
   lineItems: InvoiceLineItem[];
   payments: Payment[];
   settings: Settings;
+  stay?: {
+    checkInDate: string;
+    checkOutDate: string;
+    numNights: number;
+    stayType?: "overnight" | "short_stay";
+    durationHours?: number | null;
+    // ISO timestamp of when the guest actually checked in. Used to split
+    // payments into "Advance (at booking/check-in)" vs "Later" so the
+    // totals show the breakdown rather than a single Total Paid number.
+    // Null/missing when the reservation isn't checked in yet (advance-
+    // receipt rendering path).
+    checkedInAt?: string | null;
+  };
+  companionCollections?: {
+    invoiceNumber: string | null;
+    reservationNumber: string;
+    amount: string;
+  }[];
 }): Promise<Buffer> {
   const browser = await getBrowser();
   const page = await browser.newPage();
   try {
+    await hardenPage(page);
     const html = renderInvoiceHtml(data);
     await page.setContent(html, { waitUntil: "networkidle0", timeout: 15_000 });
     const pdf = await page.pdf({
@@ -558,81 +787,364 @@ function renderReceiptHtml(data: {
   guest: Guest;
   invoice: Invoice | null;
   settings: Settings;
+  rooms: {
+    roomNumber: string;
+    // Pre-rendered: "Ac Single Bed Rooms" when there's no sold-as
+    // override, "Ac Single Bed Rooms booked as Non Ac Bed Rooms" when
+    // there is. Built by the caller via combinedRoomTypeLabel().
+    displayType: string;
+    ratePerNight: string;
+  }[];
+  // All non-voided payments for this reservation, used to split totals
+  // into Advance (at/before check-in) vs Later. Optional — if omitted,
+  // the totals render with a single "Paid" line as before.
+  allPayments?: Payment[];
 }) {
-  const { payment, reservation, guest, invoice, settings } = data;
+  const { payment, reservation, guest, invoice, settings, rooms, allPayments } = data;
   const L = layoutFromSettings(settings);
 
   const isAdvance = !invoice;
-  const sublabel = isAdvance
-    ? "Receipt Voucher (Rule 50, CGST Rules). Full GST invoice will be issued at check-out."
-    : "Payment received against tax invoice.";
+  const pillLabel = isAdvance ? "Advance" : "Check-in";
+  const titleLabel = isAdvance ? "Booking Advance Receipt" : L.receiptTitle;
+  const amountLabel = isAdvance ? "Advance Received" : "Amount Received";
+
+  const subtotal = Number(reservation.subtotal);
+  const gstRate = Number(reservation.gstRate);
+  const gstAmount = Number(reservation.gstAmount);
+  const halfGstRate = +(gstRate / 2).toFixed(2);
+  const halfGstAmount = +(gstAmount / 2).toFixed(2);
+  const otherHalfGstAmount = +(gstAmount - halfGstAmount).toFixed(2);
+
   const grandTotal = invoice ? Number(invoice.grandTotal) : Number(reservation.grandTotal);
   const paidSoFar = invoice ? Number(invoice.totalPaid) : Number(reservation.advancePaid);
-  const balanceDue = Math.max(0, +(grandTotal - paidSoFar).toFixed(2));
+  const walletCreditApplied = invoice
+    ? Number(invoice.walletCreditApplied ?? 0)
+    : Number(reservation.walletCreditApplied ?? 0);
+  const balanceDue = Math.max(
+    0,
+    +(grandTotal - paidSoFar - walletCreditApplied).toFixed(2),
+  );
 
-  const balanceClass = balanceDue <= 0.009 ? "paid" : "";
+  const isShortStay = reservation.stayType === "short_stay";
+  const durationHours = Number(reservation.durationHours ?? 0);
+  const nights = Number(reservation.numNights);
+  // Label shown both in the Stay card ("3 nights" / "Day use · 6 hours")
+  // and the Subtotal row ("Subtotal (3n)" / "Subtotal (6 hrs)").
+  const stayUnitLabel = isShortStay
+    ? `Day use · ${durationHours} hour${durationHours === 1 ? "" : "s"}`
+    : `${nights} night${nights === 1 ? "" : "s"}`;
+  const subtotalUnitLabel = isShortStay ? `${durationHours} hrs` : `${nights}n`;
+  // For short_stay, check-out is checkedInAt + durationHours (or, if not
+  // yet checked in, checkInDate + hotel checkInTime + durationHours). We
+  // compute it once and show it instead of the overnight "by 11:00 AM"
+  // default, which is wrong for day-use exits.
+  const shortStayCheckoutDate = (() => {
+    if (!isShortStay) return null;
+    const startMs = reservation.checkedInAt
+      ? new Date(reservation.checkedInAt).getTime()
+      : (() => {
+          const [ch, cm] = (settings.checkInTime ?? "12:00").split(":");
+          return new Date(
+            `${reservation.checkInDate}T${(ch ?? "12").padStart(2, "0")}:${(cm ?? "00").padStart(2, "0")}:00+05:30`,
+          ).getTime();
+        })();
+    return new Date(startMs + Math.round(durationHours * 3600 * 1000));
+  })();
 
   return `<!doctype html>
-<html><head><meta charset="utf-8"><style>${commonStyles(L)}</style></head>
+<html><head><meta charset="utf-8"><style>${commonStyles(L)}
+  /* Slip layout (matches on-screen CheckInReceiptModal) */
+  .slip { color: #1C2620; }
+  .slip-header {
+    display: flex; justify-content: space-between; align-items: flex-start;
+    gap: 12px; padding-bottom: 12px;
+    border-bottom: 2px solid ${L.primary};
+  }
+  .slip-header .hotel { display: flex; gap: 10px; align-items: flex-start; }
+  .slip-header .hotel-logo {
+    width: 48px; height: 48px; border-radius: 6px; padding: 2px;
+    background: #FAF7F0; box-shadow: inset 0 0 0 1px ${L.primary}33;
+    object-fit: contain;
+  }
+  .slip-header .hotel-name { font-size: 15px; font-weight: 700; color: ${L.primary}; line-height: 1.1; }
+  .slip-header .hotel-sub { font-size: 10px; color: #6B7C72; margin-top: 2px; line-height: 1.35; }
+  .slip-header .hotel-gstin { font-size: 10px; color: #6B7C72; font-family: 'SF Mono', Menlo, monospace; margin-top: 2px; }
+  .slip-header .meta { text-align: right; }
+  .pill {
+    display: inline-block; font-size: 10px; letter-spacing: 0.2em; text-transform: uppercase;
+    font-weight: 700; color: ${L.accent};
+    border: 1px solid ${L.accent}; border-radius: 999px; padding: 2px 10px;
+  }
+  .res-no { font-size: 13px; font-weight: 700; color: ${L.primary}; font-family: 'SF Mono', Menlo, monospace; margin-top: 6px; }
+  .doc-date-small { font-size: 10px; color: #6B7C72; }
+
+  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
+  .card {
+    border: 1px solid #E5DFCB; border-radius: 4px;
+    background: rgba(250, 247, 240, 0.5); padding: 10px;
+  }
+  .card-label { font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 600; color: #6B7C72; }
+  .card-name { font-weight: 600; color: ${L.primary}; margin-top: 2px; }
+  .card-sub { font-family: 'SF Mono', Menlo, monospace; font-size: 11px; margin-top: 2px; }
+  .card-id { font-size: 10px; color: #6B7C72; margin-top: 4px; text-transform: capitalize; }
+  .stay-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 4px; }
+  .stay-tag { font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 700; color: ${L.accent}; }
+  .stay-date { font-size: 12px; font-weight: 600; color: ${L.primary}; line-height: 1.1; }
+  .stay-time { font-size: 10px; color: #6B7C72; line-height: 1.1; margin-top: 2px; }
+  .stay-occ { font-size: 10px; color: #6B7C72; margin-top: 6px; }
+
+  .section-cap { font-size: 10px; letter-spacing: 0.2em; text-transform: uppercase; font-weight: 700; color: ${L.accent}; margin: 16px 0 6px; }
+
+  table.rooms-allotted { width: 100%; border-collapse: collapse; font-size: 11px; }
+  table.rooms-allotted th {
+    text-align: left; padding: 5px 0; font-weight: 600; color: ${L.primary};
+    border-bottom: 1px solid ${L.primary}55;
+  }
+  table.rooms-allotted td { padding: 5px 0; border-bottom: 1px solid #E5DFCB; }
+  table.rooms-allotted .num { text-align: right; font-family: 'SF Mono', Menlo, monospace; }
+  table.rooms-allotted .roomno { font-family: 'SF Mono', Menlo, monospace; font-weight: 700; }
+  table.rooms-allotted .cap { text-transform: capitalize; }
+
+  .amount-banner {
+    margin-top: 14px; padding: 14px; border-radius: 6px; text-align: center;
+    background: ${L.primary}; color: #FAF7F0;
+  }
+  .amount-banner .cap {
+    font-size: 9px; letter-spacing: 0.25em; text-transform: uppercase; font-weight: 700; color: ${L.accent};
+  }
+  .amount-banner .amt {
+    font-size: 24px; font-weight: 700; font-family: 'SF Mono', Menlo, monospace; margin-top: 2px;
+  }
+  .amount-banner .method { font-size: 10px; margin-top: 2px; opacity: 0.9; text-transform: capitalize; }
+
+  .totals-wrap { margin-top: 14px; display: flex; justify-content: flex-end; }
+  table.totals-slip { width: 280px; font-size: 11px; border-collapse: collapse; }
+  table.totals-slip td { padding: 4px 0; }
+  table.totals-slip td.lbl { color: #6B7C72; }
+  table.totals-slip td.num { text-align: right; font-family: 'SF Mono', Menlo, monospace; }
+  table.totals-slip tr.gt td {
+    border-top: 1px solid ${L.primary}55;
+    padding-top: 7px; font-weight: 700; color: ${L.primary};
+  }
+  table.totals-slip tr.paid td { color: #2F7D4F; }
+  table.totals-slip tr.bal td { color: #B23A2E; font-weight: 700; }
+
+  .welcome-note {
+    margin-top: 16px; padding-top: 10px; border-top: 1px solid #E5DFCB;
+    font-size: 10px; color: #6B7C72; line-height: 1.6;
+  }
+
+  .sigs { display: flex; justify-content: space-between; gap: 12px; margin-top: 24px; }
+  .sig-line {
+    font-size: 10px; color: #6B7C72;
+    padding-top: 28px;
+    border-top: 1px solid #B4BCB8;
+    min-width: 140px; display: inline-block;
+  }
+</style></head>
 <body>
 
 ${L.showLogo && L.logoUrl ? `<div class="watermark"><img src="${esc(L.logoUrl)}" alt="" /></div>` : ""}
 
-<div class="page">
+<div class="page slip">
   <div class="top-rule"></div>
 
-  <div class="header">
-    ${brandHeader(L, settings.hotelName, settings.hotelAddress, settings.hotelGstin)}
+  <div class="slip-header">
+    <div class="hotel">
+      ${L.showLogo && L.logoUrl ? `<img class="hotel-logo" src="${esc(L.logoUrl)}" alt="" />` : ""}
+      <div>
+        <div class="hotel-name">${esc(settings.hotelName)}</div>
+        <div class="hotel-sub">${esc(settings.hotelAddress)}${
+          settings.hotelPhone || settings.ownerPhone
+            ? ` · ${[settings.hotelPhone, settings.ownerPhone].filter(Boolean).map((p) => esc(p as string)).join(" · ")}`
+            : ""
+        }</div>
+        ${L.showGstin && settings.hotelGstin ? `<div class="hotel-gstin">GSTIN: ${esc(settings.hotelGstin)}</div>` : ""}
+      </div>
+    </div>
     <div class="meta">
-      <div class="doc-label">${esc(L.receiptTitle)}</div>
-      <div class="doc-no">${esc(payment.receiptNumber ?? "(no number)")}</div>
-      <div class="doc-date">${format(new Date(payment.paymentDate), "dd MMM yyyy · HH:mm")}</div>
+      <div class="pill">${esc(pillLabel)}</div>
+      <div class="res-no">${esc(reservation.reservationNumber)}</div>
+      <div class="doc-date-small">${format(new Date(payment.paymentDate), "dd MMM yyyy · HH:mm")}</div>
+      ${payment.receiptNumber ? `<div class="doc-date-small" style="font-family:'SF Mono',Menlo,monospace;margin-top:2px;">${esc(payment.receiptNumber)}</div>` : ""}
+      <div style="font-size:8px;color:#9AA59E;margin-top:4px;">${esc(titleLabel)}</div>
     </div>
   </div>
 
-  <div class="info-grid">
-    <div class="info-card">
-      <div class="label">Received From</div>
-      <div class="name">${esc(guest.fullName)}</div>
-      <div class="sub mono">${esc(guest.phone)}</div>
+  <div class="cards">
+    <div class="card">
+      <div class="card-label">Guest</div>
+      <div class="card-name">${esc(guest.fullName)}</div>
+      <div class="card-sub">${esc(guest.phone)}</div>
+      ${
+        guest.idProofType && guest.idProofLast4
+          ? `<div class="card-id">${esc(guest.idProofType.replace("_", " "))} ····${esc(guest.idProofLast4)}</div>`
+          : ""
+      }
     </div>
-    <div class="info-card">
-      <div class="label">Reference</div>
-      <div class="name mono" style="font-size:12px;">${esc(reservation.reservationNumber)}</div>
-      ${invoice ? `<div class="sub mono">Invoice ${esc(invoice.invoiceNumber)}</div>` : `<div class="sub">Advance · pre-invoice</div>`}
+    <div class="card">
+      <div class="card-label">Stay</div>
+      <div class="stay-grid">
+        <div>
+          <div class="stay-tag">Check-in</div>
+          <div class="stay-date">${format(new Date(reservation.checkedInAt ?? reservation.checkInDate), "dd MMM yyyy")}</div>
+          <div class="stay-time">${
+            reservation.checkedInAt
+              ? `at ${format(new Date(reservation.checkedInAt), "h:mm a")}`
+              : settings.checkInTime
+                ? `from ${formatTime(settings.checkInTime)}`
+                : ""
+          }</div>
+        </div>
+        <div>
+          <div class="stay-tag">Check-out</div>
+          <div class="stay-date">${format(
+            shortStayCheckoutDate ?? new Date(reservation.checkOutDate),
+            "dd MMM yyyy",
+          )}</div>
+          ${
+            shortStayCheckoutDate
+              ? `<div class="stay-time">by ${format(shortStayCheckoutDate, "h:mm a")}</div>`
+              : settings.checkOutTime
+                ? `<div class="stay-time">by ${formatTime(settings.checkOutTime)}</div>`
+                : ""
+          }
+        </div>
+      </div>
+      <div class="stay-occ">${stayUnitLabel} · ${reservation.numAdults} adult${reservation.numAdults === 1 ? "" : "s"}${
+        reservation.numChildren > 0
+          ? `, ${reservation.numChildren} child${reservation.numChildren === 1 ? "" : "ren"}`
+          : ""
+      }</div>
     </div>
-  </div>
-
-  <div class="amount-box">
-    <div class="lbl">Amount Received</div>
-    <div class="amt">${inr(payment.amount, L.currency)}</div>
-    <div class="method">via ${esc(payment.paymentMethod.replace("_", " "))}${payment.notes ? ` · ${esc(payment.notes)}` : ""}</div>
-  </div>
-
-  <div class="section-title">Account Summary</div>
-  <div class="totals-wrap">
-    <table class="totals" style="width:100%">
-      <tr class="sub"><td>${isAdvance ? "Estimated Stay Total" : "Invoice Grand Total"}</td><td class="num mono">${inr(grandTotal, L.currency)}</td></tr>
-      <tr class="paid"><td>Total Paid${isAdvance ? " (incl. this receipt)" : ""}</td><td class="num mono">${inr(paidSoFar, L.currency)}</td></tr>
-      <tr class="balance"><td>Balance Due</td><td class="num mono ${balanceClass}">${inr(balanceDue, L.currency)}</td></tr>
-    </table>
   </div>
 
   ${
-    L.showTerms && L.termsText
-      ? `<div class="terms"><div class="terms-title">Terms &amp; Conditions</div>${esc(L.termsText)}</div>`
-      : `<div class="terms"><div class="terms-title">Note</div>${esc(sublabel)}</div>`
+    rooms.length
+      ? `
+  <div class="section-cap">Rooms Allotted</div>
+  <table class="rooms-allotted">
+    <thead>
+      <tr>
+        <th>Room</th>
+        <th>Type</th>
+        <th class="num">${isShortStay ? `Rate / ${durationHours} hrs` : "Rate/Night"}</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${rooms
+        .map(
+          (rm) => `
+        <tr>
+          <td class="roomno">${esc(rm.roomNumber)}</td>
+          <td class="cap">${esc(rm.displayType)}</td>
+          <td class="num">${inr(rm.ratePerNight, L.currency)}</td>
+        </tr>`,
+        )
+        .join("")}
+    </tbody>
+  </table>`
+      : ""
   }
 
-  <div class="footer">
-    <div class="thanks">
-      <div class="signoff">${esc(L.footerText)}</div>
-      <div>This receipt acknowledges payment received as listed above.</div>
-    </div>
-    ${L.showSignature ? `<div class="sign"><div class="line">${esc(L.signatoryLabel)}</div></div>` : ""}
+  <div class="amount-banner">
+    <div class="cap">${esc(amountLabel)}</div>
+    <div class="amt">${inr(payment.amount, L.currency)}</div>
+    <div class="method">via ${esc(payment.paymentMethod.replace(/_/g, " "))}${payment.notes ? ` · ${esc(payment.notes)}` : ""}</div>
   </div>
 
-  <div class="doc-id-strip">${esc(payment.receiptNumber ?? "")} &middot; ${format(new Date(), "dd MMM yyyy HH:mm")}</div>
+  <div class="totals-wrap">
+    <table class="totals-slip">
+      <tr>
+        <td class="lbl">Subtotal (${subtotalUnitLabel})</td>
+        <td class="num">${inr(subtotal, L.currency)}</td>
+      </tr>
+      ${
+        gstRate && gstAmount
+          ? `
+        <tr>
+          <td class="lbl">CGST @ ${halfGstRate}%</td>
+          <td class="num">${inr(halfGstAmount, L.currency)}</td>
+        </tr>
+        <tr>
+          <td class="lbl">SGST @ ${halfGstRate}%</td>
+          <td class="num">${inr(otherHalfGstAmount, L.currency)}</td>
+        </tr>`
+          : ""
+      }
+      <tr class="gt">
+        <td>Grand Total</td>
+        <td class="num">${inr(grandTotal, L.currency)}</td>
+      </tr>
+      ${
+        walletCreditApplied > 0.009
+          ? `
+        <tr class="paid">
+          <td>Wallet credit applied</td>
+          <td class="num">−${inr(walletCreditApplied, L.currency)}</td>
+        </tr>`
+          : ""
+      }
+      ${(() => {
+        // Split paid into Advance (at/before check-in) vs Later when both
+        // exist. Driven by reservation.checkedInAt — payments dated before
+        // are "advance", after are "later". Falls back to the single
+        // "Paid" line when allPayments isn't provided OR only one bucket
+        // has anything in it.
+        if (!allPayments || !allPayments.length) {
+          return `<tr class="paid"><td>Paid</td><td class="num">${inr(paidSoFar, L.currency)}</td></tr>`;
+        }
+        const checkedInAt = reservation.checkedInAt
+          ? new Date(reservation.checkedInAt).getTime()
+          : null;
+        let advance = 0;
+        let later = 0;
+        for (const p of allPayments) {
+          if (p.voided) continue;
+          if (p.status && p.status !== "received") continue;
+          const ts = new Date(p.paymentDate).getTime();
+          if (checkedInAt !== null && ts > checkedInAt) later += Number(p.amount);
+          else advance += Number(p.amount);
+        }
+        advance = +advance.toFixed(2);
+        later = +later.toFixed(2);
+        if (advance > 0.009 && later > 0.009) {
+          return `
+        <tr class="paid"><td>Advance Paid (at check-in)</td><td class="num">${inr(advance, L.currency)}</td></tr>
+        <tr class="paid"><td>Later Payments</td><td class="num">${inr(later, L.currency)}</td></tr>
+        <tr class="paid"><td>Total Paid</td><td class="num">${inr(paidSoFar, L.currency)}</td></tr>`;
+        }
+        return `<tr class="paid"><td>Paid</td><td class="num">${inr(paidSoFar, L.currency)}</td></tr>`;
+      })()}
+      <tr class="bal">
+        <td>Balance Due</td>
+        <td class="num">${inr(balanceDue, L.currency)}</td>
+      </tr>
+    </table>
+  </div>
+
+  <div class="welcome-note">
+    ${
+      isAdvance
+        ? `Welcome to ${esc(settings.hotelName)}. Please retain this slip for reference. Final invoice will be issued at check-out${
+            shortStayCheckoutDate
+              ? ` (by ${format(shortStayCheckoutDate, "h:mm a")})`
+              : settings.checkOutTime
+                ? ` (by ${formatTime(settings.checkOutTime)})`
+                : ""
+          }. For any assistance, contact the front desk.`
+        : esc(L.footerText)
+    }
+  </div>
+
+  ${
+    L.showSignature
+      ? `<div class="sigs">
+          <div class="sig-line">Guest Signature</div>
+          <div class="sig-line" style="text-align:right;">${esc(L.signatoryLabel)}</div>
+        </div>`
+      : ""
+  }
 </div>
 
 </body></html>`;
@@ -645,10 +1157,44 @@ export async function renderReceiptPdf(data: {
   invoice: Invoice | null;
   settings: Settings;
 }): Promise<Buffer> {
+  // Fetch the rooms allotted to this reservation so the receipt PDF can show
+  // the same "Rooms Allotted" table as the on-screen slip.
+  const roomRows = await db
+    .select({
+      roomNumber: rooms.roomNumber,
+      roomType: rooms.roomType,
+      soldAsType: reservationRooms.soldAsType,
+      ratePerNight: reservationRooms.ratePerNight,
+    })
+    .from(reservationRooms)
+    .innerJoin(rooms, eq(rooms.id, reservationRooms.roomId))
+    .where(eq(reservationRooms.reservationId, data.reservation.id));
+  const typeRows = await db
+    .select({ slug: roomTypes.slug, label: roomTypes.label })
+    .from(roomTypes);
+  const labelMap = new Map(typeRows.map((r) => [r.slug, r.label]));
+  const roomsForRender = roomRows.map((rm) => ({
+    roomNumber: rm.roomNumber,
+    ratePerNight: rm.ratePerNight,
+    displayType: combinedRoomTypeLabel(rm.roomType, rm.soldAsType, labelMap),
+  }));
+
+  // Fetch every non-voided payment for this reservation so renderReceiptHtml
+  // can split the "Paid" total into Advance (at/before check-in) and Later.
+  const allPayments = await db
+    .select()
+    .from(payments)
+    .where(eq(payments.reservationId, data.reservation.id));
+
   const browser = await getBrowser();
   const page = await browser.newPage();
   try {
-    const html = renderReceiptHtml(data);
+    await hardenPage(page);
+    const html = renderReceiptHtml({
+      ...data,
+      rooms: roomsForRender,
+      allPayments,
+    });
     await page.setContent(html, { waitUntil: "networkidle0", timeout: 15_000 });
     const pdf = await page.pdf({
       format: asPaper(data.settings.docReceiptPageSize),

@@ -11,11 +11,14 @@ import { logger } from "./lib/logger.js";
 import { startDashboardSubscriber } from "./lib/redis.js";
 import { errorHandler, notFound } from "./middleware/error.js";
 import { loginLimiter, readLimiter, writeLimiter } from "./middleware/rateLimit.js";
+import auditRoutes from "./routes/audit.js";
 import authRoutes from "./routes/auth.js";
+import creditsRoutes from "./routes/credits.js";
 import dashboardRoutes from "./routes/dashboard.js";
 import guestRoutes from "./routes/guests.js";
 import housekeepingRoutes from "./routes/housekeeping.js";
 import invoiceRoutes from "./routes/invoices.js";
+import ledgerRoutes from "./routes/ledger.js";
 import messageRoutes from "./routes/messages.js";
 import notificationRoutes from "./routes/notifications.js";
 import otpRoutes from "./routes/otp.js";
@@ -30,14 +33,68 @@ const app = express();
 
 app.set("trust proxy", 1);
 app.set("etag", false);
-app.use(helmet());
+
+// Explicit security headers. We extend Helmet's defaults rather than relying
+// on whatever happens to ship with the version we pin to.
+//
+// CSP rationale: this API serves JSON, not HTML, but we still set a strict
+// CSP in case an error page or future HTML endpoint lands here. Anything
+// that needs to embed an iframe of an invoice PDF will be served by the
+// front-end origin, not the API.
+//
+// HSTS: 1-year max-age + preload-ready. Only effective behind HTTPS in
+// production; harmless in dev.
+//
+// Referrer/Permissions/Frame: strip noisy data and lock down embeds.
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      useDefaults: true,
+      directives: {
+        defaultSrc: ["'none'"],
+        connectSrc: ["'self'"],
+        imgSrc: ["'self'", "data:"],
+        objectSrc: ["'none'"],
+        scriptSrc: ["'none'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        frameAncestors: ["'none'"],
+        formAction: ["'self'"],
+        baseUri: ["'none'"],
+      },
+    },
+    strictTransportSecurity: {
+      maxAge: 63072000, // 2 years
+      includeSubDomains: true,
+      preload: true,
+    },
+    referrerPolicy: { policy: "no-referrer" },
+    frameguard: { action: "deny" },
+    crossOriginOpenerPolicy: { policy: "same-origin" },
+    crossOriginResourcePolicy: { policy: "same-origin" },
+    // X-Permitted-Cross-Domain-Policies — only matters for Flash/Acrobat
+    // but cheap to lock anyway.
+    permittedCrossDomainPolicies: { permittedPolicies: "none" },
+  }),
+);
+// Permissions-Policy: Helmet doesn't include this by default (browser API,
+// not strict-security header). Disable the loud ones — camera/mic/geo —
+// since we never use them.
+app.use((_req, res, next) => {
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()");
+  next();
+});
+
 app.use(
   cors({
     origin: env.FRONTEND_URL,
     credentials: true,
   }),
 );
-app.use(express.json({ limit: "1mb" }));
+// Global JSON body limit. No JSON route in this app realistically needs
+// more than a handful of KB — see the schemas in packages/shared. Keeping
+// this tight blunts memory-exhaustion attacks. Multipart uploads use
+// multer and have their own per-route limits (see routes/guests.ts).
+app.use(express.json({ limit: "64kb" }));
 app.use(pinoHttp({ logger }));
 
 app.get("/health", (_req, res) => res.json({ status: "ok", time: new Date().toISOString() }));
@@ -57,6 +114,7 @@ v1.use("/guests", guestRoutes);
 v1.use("/reservations", reservationRoutes);
 v1.use("/invoices", invoiceRoutes);
 v1.use("/payments", paymentRoutes);
+v1.use("/credits", creditsRoutes);
 v1.use("/housekeeping", housekeepingRoutes);
 v1.use("/dashboard", dashboardRoutes);
 v1.use("/reports", reportRoutes);
@@ -66,6 +124,8 @@ v1.use("/otp", otpRoutes);
 v1.use("/notifications", notificationRoutes);
 v1.use("/messages", messageRoutes);
 v1.use("/rbac", rbacRoutes);
+v1.use("/audit", auditRoutes);
+v1.use("/", ledgerRoutes);
 
 app.use("/api/v1", v1);
 

@@ -1,13 +1,27 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { addDays, differenceInCalendarDays, format } from "date-fns";
-import { ChevronLeft, FileText, ShieldCheck, Snowflake, Upload, X } from "lucide-react";
+import { AlertTriangle, ChevronLeft, FileText, ShieldCheck, Snowflake, Tv, Upload, Wifi, X } from "lucide-react";
 import { CheckInReceiptModal, type CheckInReceiptData } from "@/components/CheckInReceiptModal";
 import { OtpModal } from "@/components/OtpModal";
-import { useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { useEffect, useMemo, useState } from "react";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { Loader } from "@/components/Loader";
-import { api } from "@/lib/api";
+import { ApiError, api } from "@/lib/api";
+import { invalidateReservationData } from "@/lib/invalidate";
 import { inr } from "@/lib/utils";
+
+function describeApiError(e: unknown): string {
+  if (e instanceof ApiError && e.code === "VALIDATION_ERROR") {
+    const details = e.details as { fieldErrors?: Record<string, string[]> } | undefined;
+    if (details?.fieldErrors) {
+      const fields = Object.entries(details.fieldErrors)
+        .map(([k, v]) => `${k}: ${v.join(", ")}`)
+        .join(" · ");
+      return fields ? `${e.message} (${fields})` : e.message;
+    }
+  }
+  return e instanceof Error ? e.message : "Something went wrong";
+}
 
 interface Guest {
   id: string;
@@ -26,6 +40,8 @@ interface AvailableRoom {
   baseRate: string;
   maxOccupancy: number;
   hasAc: boolean;
+  hasTv: boolean;
+  hasWifi: boolean;
 }
 
 const todayStr = format(new Date(), "yyyy-MM-dd");
@@ -50,12 +66,22 @@ function formatTime(hhmm: string | undefined | null): string {
 
 export default function NewReservation() {
   const navigate = useNavigate();
+  const qc = useQueryClient();
   const [searchParams] = useSearchParams();
   const preselectRoomId = searchParams.get("room");
   const preselectGuestId = searchParams.get("guestId");
   const initialMode = searchParams.get("mode") === "walkin" ? "walkin" : "reservation";
 
   const [mode, setMode] = useState<"reservation" | "walkin">(initialMode);
+  const [stayType, setStayType] = useState<"overnight" | "short_stay">("overnight");
+  // Selected duration for a short-stay booking. The room rate is derived
+  // from this: closest matching band on the room type, falling back to a
+  // pro-rated slice of the overnight default rate (rate/24 × hours).
+  const [shortStayHours, setShortStayHours] = useState<number>(6);
+  // The human label shown on the receipt / invoice. Set to the band's label
+  // when a band is picked; defaults to "Day use · N hours" otherwise.
+  const [shortStayLabel, setShortStayLabel] = useState<string | null>(null);
+  const isShortStay = stayType === "short_stay";
   const [checkInDate, setCheckInDate] = useState(todayStr);
   const [checkOutDate, setCheckOutDate] = useState(tomorrowStr);
   const [adults, setAdults] = useState(1);
@@ -69,7 +95,7 @@ export default function NewReservation() {
     fullName: "",
     phone: "",
     email: "",
-    idProofType: "aadhaar" as "aadhaar" | "pan" | "passport" | "driver_license" | "voter_id",
+    idProofType: "aadhaar" as "aadhaar" | "pan" | "passport" | "driving_license" | "voter_id",
     idProofNumber: "",
     address: "",
     nationality: "Indian",
@@ -81,6 +107,7 @@ export default function NewReservation() {
   >([]);
   const [kycFront, setKycFront] = useState<File | null>(null);
   const [kycBack, setKycBack] = useState<File | null>(null);
+  const [kycPhoto, setKycPhoto] = useState<File | null>(null);
   const [bookingSource, setBookingSource] = useState<
     "walkin" | "phone_whatsapp" | "complimentary"
   >("walkin");
@@ -89,22 +116,34 @@ export default function NewReservation() {
   const [paymentMethod, setPaymentMethod] = useState<
     "cash" | "card" | "upi" | "bank_transfer" | "cheque"
   >("cash");
+  // Wallet credit the staff has chosen to apply on this booking. Capped
+  // server-side at min(guest wallet balance, grand total) — we mirror the
+  // cap in the UI so the user can't over-type either.
+  const [walletApply, setWalletApply] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [acFilter, setAcFilter] = useState<"all" | "ac" | "non_ac">("all");
   const [walkInReceipt, setWalkInReceipt] = useState<CheckInReceiptData | null>(null);
-  // OTP defaults: on for pre-booking (remote guest), off for walk-in (guest is physically present + KYC done)
-  const [requireOtp, setRequireOtp] = useState(false);
-  const [otpReservationId, setOtpReservationId] = useState<string | null>(null);
-  const pendingPostOtp = useRef<(() => void) | null>(null);
+  const [receiptVariant, setReceiptVariant] = useState<"checkin" | "booking_advance">("checkin");
 
   useEffect(() => {
     if (mode === "walkin" && checkInDate !== todayStr) setCheckInDate(todayStr);
   }, [mode, checkInDate]);
 
-  // Smart default: pre-booking → OTP on (remote guest, verify by phone). Walk-in → off (guest present + KYC).
+  // Short-stay is by definition same-day. When the user picks short_stay or
+  // changes check-in while in short_stay, snap check-out to match. When
+  // switching back to overnight, push check-out to the following day so the
+  // form is immediately submit-ready.
   useEffect(() => {
-    setRequireOtp(mode !== "walkin");
-  }, [mode]);
+    if (isShortStay) {
+      if (checkOutDate !== checkInDate) setCheckOutDate(checkInDate);
+    } else if (checkOutDate <= checkInDate) {
+      setCheckOutDate(format(addDays(new Date(checkInDate), 1), "yyyy-MM-dd"));
+    }
+  }, [isShortStay, checkInDate, checkOutDate]);
+
+  // OTP verification is mandatory for every booking. The reservation row
+  // is never created until OTP succeeds, so abandoning the OTP modal /
+  // closing the tab / refreshing is a true no-op — no ghost rows.
 
   useEffect(() => {
     if (!preselectGuestId || selectedGuest) return;
@@ -122,31 +161,160 @@ export default function NewReservation() {
     return Math.max(0, d);
   }, [checkInDate, checkOutDate]);
 
+  // For short-stay we use durationHours as the pricing unit (FLAT room rate
+  // for that block). For overnight we use nights. canPriceStay gates
+  // availability + summary rendering.
+  const canPriceStay = isShortStay ? shortStayHours > 0 : nights > 0;
+
+  // Compute the FLAT short-stay rate for a room type. Pick the band whose
+  // hours ≥ the requested hours (smallest such band — "round up" to the
+  // next configured price tier). Otherwise pro-rate the overnight default
+  // rate over 24 h. Either way, the returned value is the price for the
+  // whole short-stay block.
+  function shortStayRateForType(slug: string): { rate: number; bandLabel: string | null } {
+    const rt = roomTypesQ.data?.find((t) => t.slug === slug);
+    if (!rt) return { rate: 0, bandLabel: null };
+    const bands = (rt.shortStayBands ?? []).slice().sort((a, b) => a.hours - b.hours);
+    const exact = bands.find((b) => Math.abs(b.hours - shortStayHours) < 0.01);
+    if (exact) return { rate: +Number(exact.rate).toFixed(2), bandLabel: exact.label };
+    const upper = bands.find((b) => b.hours >= shortStayHours);
+    if (upper) return { rate: +Number(upper.rate).toFixed(2), bandLabel: upper.label };
+    const fallback = +((Number(rt.defaultRate) / 24) * shortStayHours).toFixed(2);
+    return { rate: fallback, bandLabel: null };
+  }
+
   const guestsSearch = useQuery({
+    // Server expects `search` (see guestListQuerySchema in shared). Passing
+    // `q` here silently dropped the filter and returned every guest, which
+    // made the dropdown look like the typed text wasn't doing anything.
     queryKey: ["guests-search", guestQuery],
-    queryFn: () => api.get<Guest[]>("/guests", { q: guestQuery }),
+    queryFn: () => api.get<Guest[]>("/guests", { search: guestQuery }),
     enabled: guestQuery.length >= 2 && !useNewGuest,
   });
 
   const roomTypesQ = useQuery({
     queryKey: ["room-types-active"],
-    queryFn: () => api.get<{ id: string; slug: string; label: string; defaultRate: string }[]>("/settings/room-types"),
+    queryFn: () =>
+      api.get<
+        {
+          id: string;
+          slug: string;
+          label: string;
+          defaultRate: string;
+          // Day-use bands (hours+rate) configured per room type in
+          // Settings → Room Types. Empty when the property hasn't set any
+          // up — we then derive a custom-hours price by pro-rating the
+          // overnight default rate over 24 h.
+          shortStayBands?: { label: string; hours: number; rate: number }[];
+        }[]
+      >("/settings/room-types"),
   });
 
   const publicSettings = useQuery({
     queryKey: ["settings-public"],
-    queryFn: () => api.get<{ hotelName: string; checkInTime: string; checkOutTime: string } | null>("/settings/public"),
+    queryFn: () =>
+      api.get<{
+        hotelName: string;
+        checkInTime: string;
+        checkOutTime: string;
+        gstSlabExemptBelow: string;
+        gstSlabLowRate: string;
+        gstSlabLowMax: string;
+        gstSlabHighRate: string;
+        gstMode: "exclusive" | "inclusive";
+      } | null>("/settings/public"),
   });
 
+  // Wallet balance for the selected existing guest. Skipped when staff is
+  // creating a new guest (no history → no credit).
+  const walletQ = useQuery({
+    queryKey: ["guest-wallet", selectedGuest?.id],
+    queryFn: () =>
+      api.get<{
+        walletBalance: number;
+        // Surfaces from the guest record. We use these to skip the KYC
+        // upload step when the guest already has a verified record on file.
+        kycVerifiedAt: string | null;
+        guestPhoto: string | null;
+        idProofPhotoFront: string | null;
+        idProofPhotoBack: string | null;
+        idProofType: string | null;
+        idProofLast4: string | null;
+        photoUrl: string | null;
+      }>(`/guests/${selectedGuest!.id}`),
+    enabled: !!selectedGuest?.id && !useNewGuest,
+    staleTime: 30_000,
+  });
+  const walletBalance = walletQ.data?.walletBalance ?? 0;
+
+  // KYC-on-file rule: existing guest with a verified timestamp AND both
+  // a customer photo and an ID front photo. We allow KYC back to be
+  // missing because it isn't strictly required for check-in (only "front"
+  // is, per the walk-in guard).
+  const kycOnFile = !useNewGuest
+    && !!selectedGuest
+    && !!walletQ.data?.kycVerifiedAt
+    && !!walletQ.data?.guestPhoto
+    && !!walletQ.data?.idProofPhotoFront;
+
+  // "Did this guest forget to pay last time?" — surface unpaid balance from
+  // prior bookings so the front desk can ask before creating another stay.
+  // See GET /guests/:id/outstanding on the server.
+  const outstandingQ = useQuery({
+    queryKey: ["guest-outstanding", selectedGuest?.id],
+    queryFn: () =>
+      api.get<{
+        total: number;
+        count: number;
+        pendingPromiseCount: number;
+        mostRecent: {
+          reservationId: string;
+          reservationNumber: string;
+          invoiceNumber: string | null;
+          balanceDue: number;
+          date: string;
+        } | null;
+      }>(`/guests/${selectedGuest!.id}/outstanding`),
+    enabled: !!selectedGuest?.id && !useNewGuest,
+    staleTime: 30_000,
+  });
+
+  // For short-stay (same-day) we still want availability — the server-side
+  // availability check uses date ranges, so we pass [d, d+1) as the probe
+  // window so day-use bookings exclude any room that's currently occupied
+  // tonight or arriving today.
   const availRooms = useQuery({
-    queryKey: ["avail", checkInDate, checkOutDate],
+    queryKey: ["avail", checkInDate, checkOutDate, isShortStay],
     queryFn: () =>
       api.get<AvailableRoom[]>("/rooms/availability", {
         check_in: checkInDate,
-        check_out: checkOutDate,
+        check_out: isShortStay
+          ? format(addDays(new Date(checkInDate), 1), "yyyy-MM-dd")
+          : checkOutDate,
       }),
-    enabled: nights > 0,
+    enabled: canPriceStay,
   });
+
+  // Re-price already-selected rooms whenever the short-stay parameters
+  // change. This keeps the per-room rate, the subtotal, and the summary
+  // band label all in sync without the user having to deselect/reselect.
+  useEffect(() => {
+    if (!isShortStay) return;
+    let derivedLabel: string | null = null;
+    setSelectedRooms((prev) => {
+      let changed = false;
+      const next = prev.map((r) => {
+        const { rate, bandLabel } = shortStayRateForType(r.soldAsType ?? r.nativeType);
+        if (bandLabel && !derivedLabel) derivedLabel = bandLabel;
+        if (Math.abs(r.ratePerNight - rate) < 0.01) return r;
+        changed = true;
+        return { ...r, ratePerNight: rate };
+      });
+      return changed ? next : prev;
+    });
+    setShortStayLabel(derivedLabel ?? `Day use · ${shortStayHours} hours`);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isShortStay, shortStayHours, roomTypesQ.data]);
 
   useEffect(() => {
     if (!preselectRoomId || !availRooms.data) return;
@@ -168,7 +336,91 @@ export default function NewReservation() {
     );
   }, [preselectRoomId, availRooms.data]);
 
-  const subtotal = selectedRooms.reduce((a, r) => a + r.ratePerNight * nights, 0);
+  // Short-stay: ratePerNight on each selected room already holds the FLAT
+  // short-stay price for the chosen block. Overnight: multiply by nights.
+  // `roomAmount` is the raw user-typed total — its meaning depends on the
+  // GST mode (net in exclusive, gross in inclusive).
+  const roomAmount = selectedRooms.reduce(
+    (a, r) => a + r.ratePerNight * (isShortStay ? 1 : nights),
+    0,
+  );
+  const gstMode = publicSettings.data?.gstMode ?? "inclusive";
+
+  // GST preview — mirrors apps/api/src/lib/gst.ts so the booking screen shows
+  // the same total the server will compute. Uses the slabs from public
+  // settings; falls back to the standard slabs if settings haven't loaded yet.
+  const gstSlabs = {
+    exemptBelow: Number(publicSettings.data?.gstSlabExemptBelow ?? 1000),
+    lowRate: Number(publicSettings.data?.gstSlabLowRate ?? 5),
+    lowMax: Number(publicSettings.data?.gstSlabLowMax ?? 7500),
+    highRate: Number(publicSettings.data?.gstSlabHighRate ?? 18),
+  };
+  // For overnight: average nightly rate (roomAmount ÷ (rooms × nights)).
+  // For short_stay: average per-room flat rate (roomAmount ÷ rooms). The GST
+  // slab is keyed off this so room-type-aware tax still applies to day-use.
+  const avgRatePerNight =
+    isShortStay
+      ? selectedRooms.length > 0
+        ? roomAmount / selectedRooms.length
+        : 0
+      : selectedRooms.length > 0 && nights > 0
+        ? roomAmount / (nights * selectedRooms.length)
+        : 0;
+  const gstRate =
+    avgRatePerNight === 0
+      ? 0
+      : avgRatePerNight < gstSlabs.exemptBelow
+        ? 0
+        : avgRatePerNight <= gstSlabs.lowMax
+          ? gstSlabs.lowRate
+          : gstSlabs.highRate;
+  // Mode-aware breakdown — must mirror apps/api/src/lib/gst.ts exactly.
+  //   Inclusive: GST is a flat percentage of the gross amount the guest
+  //     pays. ₹1000 @ 5% → GST ₹50, net ₹950 (NOT the inverse-extraction
+  //     formula). The owner prefers this because the numbers stay round.
+  //   Exclusive: GST is added on top of the net.
+  const r = gstRate / 100;
+  const gstAmount =
+    gstMode === "inclusive"
+      ? +(roomAmount * r).toFixed(2)
+      : +(roomAmount * r).toFixed(2);
+  const subtotal =
+    gstMode === "inclusive"
+      ? +(roomAmount - gstAmount).toFixed(2)
+      : +roomAmount.toFixed(2);
+  const cgst = +(gstAmount / 2).toFixed(2);
+  const sgst = +(gstAmount - cgst).toFixed(2);
+  const grandTotal =
+    gstMode === "inclusive" ? +roomAmount.toFixed(2) : +(subtotal + gstAmount).toFixed(2);
+  // Cap wallet apply at min(wallet balance, grand total). If the user typed
+  // 1000 but only 600 is available, we treat it as 600.
+  const maxWalletApply = +Math.min(walletBalance, grandTotal).toFixed(2);
+  const effectiveWalletApply = isCreditBooking ? 0 : Math.max(0, Math.min(walletApply, maxWalletApply));
+  const balanceDue = +(
+    grandTotal -
+    (isCreditBooking ? 0 : advance || 0) -
+    effectiveWalletApply
+  ).toFixed(2);
+  // Hard rule, mirrored on the server: advance cannot exceed grand total.
+  // Anything more would silently park money as wallet credit, which we
+  // never want to happen by accident on the booking form. Surplus should
+  // be a separate credit-issued ledger entry, recorded explicitly.
+  const advanceTooHigh =
+    !isCreditBooking && advance > 0 && advance > grandTotal + 0.009;
+
+  // Two-phase booking submit so a reservation row is never created until
+  // OTP succeeds (no more "cancelled — OTP not completed" ghost rows on
+  // the reservations list).
+  //
+  //   create (Phase 1): resolves/creates the guest + uploads KYC. Then
+  //     opens the OTP modal in guestId mode. NO reservation row exists yet.
+  //
+  //   createAfterOtp (Phase 2): runs only after OTP verifies. POSTs the
+  //     full reservation payload INCLUDING the verified otpCode. Server
+  //     re-verifies the OTP atomically with the insert and marks it
+  //     consumed in the same transaction.
+
+  const [pendingOtpGuestId, setPendingOtpGuestId] = useState<string | null>(null);
 
   const create = useMutation({
     mutationFn: async () => {
@@ -183,20 +435,51 @@ export default function NewReservation() {
       }
       if (!guestId) throw new Error("Guest required");
 
-      if (mode === "walkin" && !kycFront) {
-        throw new Error("KYC front photo is required for walk-in check-in");
+      // Walk-in KYC guard. We bypass it when the selected existing guest
+      // already has a verified record on file — re-uploading every time is
+      // pure friction. Staff can still attach replacements via the optional
+      // "Replace" buttons in the KYC card below.
+      if (mode === "walkin" && !kycOnFile) {
+        if (!kycFront) {
+          throw new Error("KYC front photo is required for walk-in check-in");
+        }
+        if (!kycPhoto) {
+          throw new Error("Customer photo is required for walk-in check-in");
+        }
       }
-      if (kycFront) {
+      if (kycFront || kycPhoto) {
         const form = new FormData();
-        form.append("front", kycFront);
+        if (kycFront) form.append("front", kycFront);
         if (kycBack) form.append("back", kycBack);
+        if (kycPhoto) form.append("photo", kycPhoto);
         await api.upload(`/guests/${guestId}/kyc`, form);
       }
+
+      return { guestId };
+    },
+    onSuccess: ({ guestId }) => {
+      // Open OTP modal. The actual reservation gets created only in the
+      // OTP-verified callback (createAfterOtp.mutate). If staff abandons
+      // the OTP step, no DB write ever happens.
+      setPendingOtpGuestId(guestId);
+    },
+    onError: (e: Error) => setError(describeApiError(e)),
+  });
+
+  const createAfterOtp = useMutation({
+    mutationFn: async (otpCode: string) => {
+      const guestId = pendingOtpGuestId;
+      if (!guestId) throw new Error("Missing guest context");
 
       const reservation = await api.post<{ id: string }>("/reservations", {
         guestId,
         checkInDate,
         checkOutDate,
+        stayType,
+        durationHours: isShortStay ? shortStayHours : undefined,
+        shortStayLabel: isShortStay
+          ? shortStayLabel ?? `Day use · ${shortStayHours} hours`
+          : undefined,
         numAdults: adults,
         numChildren: children,
         specialRequests: specialRequests || undefined,
@@ -207,39 +490,41 @@ export default function NewReservation() {
         })),
         advancePaid: isCreditBooking ? 0 : advance > 0 ? advance : 0,
         advancePaymentMethod: isCreditBooking ? undefined : advance > 0 ? paymentMethod : undefined,
+        useWalletCredit: effectiveWalletApply > 0 ? effectiveWalletApply : undefined,
         bookingSource,
         creditNotes: isCreditBooking && creditNotes ? creditNotes : undefined,
+        otpCode,
       });
 
-      if (mode === "walkin") {
-        await api.post(`/reservations/${reservation.id}/check-in`);
-      }
       return reservation;
     },
     onSuccess: async (res) => {
-      // If OTP gating is on, hold the post-action and open the modal first
-      const finalize = async () => {
-        if (mode !== "walkin") {
-          navigate(`/reservations/${res.id}`);
+      setPendingOtpGuestId(null);
+      invalidateReservationData(qc, { reservationId: res.id });
+
+      const tookAdvance = !isCreditBooking && advance > 0;
+      if (mode === "walkin") {
+        try {
+          await api.post(`/reservations/${res.id}/check-in`);
+        } catch (e) {
+          setError(e instanceof Error ? e.message : "Check-in failed");
           return;
         }
+        setReceiptVariant("checkin");
         await buildAndShowReceipt(res.id);
-      };
-      if (requireOtp) {
-        pendingPostOtp.current = finalize;
-        setOtpReservationId(res.id);
         return;
       }
-      await finalize();
+      if (tookAdvance) {
+        setReceiptVariant("booking_advance");
+        await buildAndShowReceipt(res.id);
+      } else {
+        navigate(`/reservations/${res.id}`);
+      }
     },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: Error) => setError(describeApiError(e)),
   });
 
   async function buildAndShowReceipt(reservationId: string) {
-    if (mode !== "walkin") {
-      navigate(`/reservations/${reservationId}`);
-      return;
-    }
     try {
         const [detail, settings] = await Promise.all([
           api.get<{
@@ -248,6 +533,8 @@ export default function NewReservation() {
             checkOutDate: string;
             checkedInAt: string | null;
             numNights?: number;
+            stayType?: "overnight" | "short_stay";
+            durationHours?: string | null;
             numAdults: number;
             numChildren: number;
             subtotal: string;
@@ -261,9 +548,22 @@ export default function NewReservation() {
               phone: string;
               idProofType: string | null;
               idProofLast4: string | null;
+              photoUrl: string | null;
             };
-            rooms: { roomNumber: string; roomType: string; ratePerNight: string }[];
+            rooms: {
+              roomNumber: string;
+              roomType: string;
+              // soldAsType is the override from the "Sell as" picker at
+              // booking. displayType is the pre-rendered combined label
+              // ("AC SINGLE BED ROOMS booked as NON AC SINGLE BED ROOMS")
+              // computed server-side. We pass them through so the receipt
+              // modal shows the right label.
+              soldAsType?: string | null;
+              displayType?: string;
+              ratePerNight: string;
+            }[];
             payments: {
+              id: string;
               amount: string;
               paymentMethod: string;
               receiptNumber: string | null;
@@ -274,6 +574,7 @@ export default function NewReservation() {
             hotelName: string;
             hotelAddress: string;
             hotelPhone: string;
+            ownerPhone: string | null;
             hotelGstin: string;
             hotelLogoUrl: string | null;
             checkInTime: string | null;
@@ -296,6 +597,8 @@ export default function NewReservation() {
           checkOutDate: detail.checkOutDate,
           checkedInAt: detail.checkedInAt,
           numNights: detail.numNights ?? fallbackNights,
+          stayType: detail.stayType,
+          durationHours: detail.durationHours ? Number(detail.durationHours) : null,
           numAdults: detail.numAdults,
           numChildren: detail.numChildren,
           guest: {
@@ -303,10 +606,13 @@ export default function NewReservation() {
             phone: detail.guest.phone,
             idProofType: detail.guest.idProofType,
             idProofLast4: detail.guest.idProofLast4,
+            photoUrl: detail.guest.photoUrl,
           },
           rooms: detail.rooms.map((r) => ({
             roomNumber: r.roomNumber,
             roomType: r.roomType,
+            soldAsType: r.soldAsType ?? null,
+            displayType: r.displayType,
             ratePerNight: r.ratePerNight,
           })),
           subtotal: detail.subtotal,
@@ -318,16 +624,22 @@ export default function NewReservation() {
           latestPayment:
             detail.payments.length > 0
               ? {
+                  id: detail.payments[detail.payments.length - 1]!.id,
                   amount: detail.payments[detail.payments.length - 1]!.amount,
                   paymentMethod: detail.payments[detail.payments.length - 1]!.paymentMethod,
                   receiptNumber: detail.payments[detail.payments.length - 1]!.receiptNumber,
                   paymentDate: detail.payments[detail.payments.length - 1]!.paymentDate,
                 }
               : null,
+          allPayments: detail.payments.map((p) => ({
+            amount: p.amount,
+            paymentDate: p.paymentDate,
+          })),
           hotel: {
             name: settings.hotelName,
             address: settings.hotelAddress,
             phone: settings.hotelPhone,
+            ownerPhone: settings.ownerPhone,
             gstin: settings.hotelGstin,
             logoUrl: settings.hotelLogoUrl ?? "/logo.jpg",
             checkInTime: settings.checkInTime,
@@ -344,11 +656,17 @@ export default function NewReservation() {
     setSelectedRooms((prev) => {
       const exists = prev.find((r) => r.roomId === room.id);
       if (exists) return prev.filter((r) => r.roomId !== room.id);
+      // For short-stay, the initial rate is the FLAT short-stay price for
+      // the selected hours (derived from this room type's bands). The
+      // user can still override per-room.
+      const initialRate = isShortStay
+        ? shortStayRateForType(room.roomType).rate || Number(room.baseRate)
+        : Number(room.baseRate);
       return [
         ...prev,
         {
           roomId: room.id,
-          ratePerNight: Number(room.baseRate),
+          ratePerNight: initialRate,
           roomNumber: room.roomNumber,
           soldAsType: null,
           nativeType: room.roomType,
@@ -370,9 +688,10 @@ export default function NewReservation() {
   }
 
   const canSubmit =
-    nights > 0 &&
+    canPriceStay &&
     selectedRooms.length > 0 &&
-    (selectedGuest || (useNewGuest && newGuest.fullName && newGuest.phone && newGuest.idProofNumber));
+    (selectedGuest || (useNewGuest && newGuest.fullName && newGuest.phone && newGuest.idProofNumber)) &&
+    !advanceTooHigh;
 
   return (
     <div className="space-y-4">
@@ -414,6 +733,31 @@ export default function NewReservation() {
 
       <div className="card space-y-3">
         <h2 className="font-semibold text-navy">1. Stay Details</h2>
+        <div className="flex items-center gap-3 flex-wrap">
+          <span className="label">Stay type</span>
+          <div className="inline-flex rounded-sm border border-borderc overflow-hidden text-xs">
+            {([
+              { v: "overnight", label: "Overnight" },
+              { v: "short_stay", label: "Day use (hours)" },
+            ] as const).map((opt) => (
+              <button
+                key={opt.v}
+                type="button"
+                onClick={() => {
+                  setStayType(opt.v);
+                  if (opt.v === "short_stay") setCheckOutDate(checkInDate);
+                }}
+                className={`px-3 py-1.5 transition ${
+                  stayType === opt.v
+                    ? "bg-brand text-cream"
+                    : "bg-bg text-textSecondary hover:bg-borderc/40"
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+        </div>
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
           <div>
             <label className="label block mb-1">Check-in</label>
@@ -422,8 +766,18 @@ export default function NewReservation() {
               type="date"
               value={checkInDate}
               disabled={mode === "walkin"}
-              min={mode === "walkin" ? todayStr : undefined}
-              onChange={(e) => setCheckInDate(e.target.value)}
+              min={todayStr}
+              onChange={(e) => {
+                const next = e.target.value;
+                setCheckInDate(next);
+                // Keep check-out strictly after check-in (overnight). For
+                // short_stay, the same-day rule snaps it via useEffect.
+                if (isShortStay) {
+                  setCheckOutDate(next);
+                } else if (next && checkOutDate <= next) {
+                  setCheckOutDate(format(addDays(new Date(next), 1), "yyyy-MM-dd"));
+                }
+              }}
             />
             {publicSettings.data?.checkInTime && (
               <div className="text-[11px] text-textSecondary mt-1">
@@ -432,16 +786,31 @@ export default function NewReservation() {
             )}
           </div>
           <div>
-            <label className="label block mb-1">Check-out</label>
+            <label className="label block mb-1">
+              {isShortStay ? "Check-out (same day)" : "Check-out"}
+            </label>
             <input
               className="input"
               type="date"
               value={checkOutDate}
+              disabled={isShortStay}
+              min={
+                isShortStay
+                  ? checkInDate
+                  : checkInDate
+                    ? format(addDays(new Date(checkInDate), 1), "yyyy-MM-dd")
+                    : todayStr
+              }
               onChange={(e) => setCheckOutDate(e.target.value)}
             />
-            {publicSettings.data?.checkOutTime && (
+            {publicSettings.data?.checkOutTime && !isShortStay && (
               <div className="text-[11px] text-textSecondary mt-1">
                 by {formatTime(publicSettings.data.checkOutTime)} (hotel policy)
+              </div>
+            )}
+            {isShortStay && (
+              <div className="text-[11px] text-textSecondary mt-1">
+                day-use bookings end the same day
               </div>
             )}
           </div>
@@ -466,6 +835,77 @@ export default function NewReservation() {
             />
           </div>
         </div>
+        {isShortStay && (() => {
+          // Build a deduped band picker from all active room types. Each
+          // hours value gets a single pill — the per-room rate is derived
+          // from that room type's specific band when the user selects rooms
+          // below.
+          const seen = new Set<number>();
+          const allBands: { label: string; hours: number }[] = [];
+          for (const t of roomTypesQ.data ?? []) {
+            for (const b of t.shortStayBands ?? []) {
+              if (seen.has(b.hours)) continue;
+              seen.add(b.hours);
+              allBands.push({ label: b.label, hours: b.hours });
+            }
+          }
+          allBands.sort((a, b) => a.hours - b.hours);
+          // Fallback when no bands are configured — keep three sensible
+          // defaults so day-use still works out-of-the-box. Rates are
+          // pro-rated from the overnight default in shortStayRateForType.
+          const fallback = [
+            { label: "3 hrs", hours: 3 },
+            { label: "6 hrs", hours: 6 },
+            { label: "12 hrs", hours: 12 },
+          ];
+          const bands = allBands.length ? allBands : fallback;
+          return (
+            <div className="space-y-2">
+              <label className="label block">Duration</label>
+              <div className="flex flex-wrap gap-2">
+                {bands.map((b) => {
+                  const active = Math.abs(b.hours - shortStayHours) < 0.01;
+                  return (
+                    <button
+                      key={b.hours}
+                      type="button"
+                      onClick={() => setShortStayHours(b.hours)}
+                      className={`px-3 py-1.5 rounded-sm border text-sm transition ${
+                        active
+                          ? "bg-brand text-cream border-brand"
+                          : "bg-bg text-textSecondary border-borderc hover:border-brand/60"
+                      }`}
+                    >
+                      {b.label}
+                    </button>
+                  );
+                })}
+                <div className="flex items-center gap-2">
+                  <input
+                    className="input !h-9 !w-24"
+                    type="number"
+                    min={1}
+                    max={23.5}
+                    step={0.5}
+                    value={shortStayHours}
+                    onChange={(e) => {
+                      const n = Math.max(1, Math.min(23.5, Number(e.target.value)));
+                      setShortStayHours(n);
+                    }}
+                  />
+                  <span className="text-xs text-textSecondary">hours (custom)</span>
+                </div>
+              </div>
+              {allBands.length === 0 && (
+                <div className="text-[11px] text-textSecondary">
+                  No day-use bands configured. Rates are pro-rated from each
+                  room type's nightly default (24 h baseline) — set proper
+                  bands in Settings → Room Types.
+                </div>
+              )}
+            </div>
+          );
+        })()}
         <div className="grid grid-cols-2 gap-3">
           <div>
             <label className="label block mb-1">Purpose</label>
@@ -491,7 +931,15 @@ export default function NewReservation() {
           </div>
         </div>
         <div className="text-sm text-textSecondary">
-          Nights: <span className="font-semibold text-navy">{nights}</span>
+          {isShortStay ? (
+            <>
+              Duration: <span className="font-semibold text-navy">{shortStayHours} hours</span>
+            </>
+          ) : (
+            <>
+              Nights: <span className="font-semibold text-navy">{nights}</span>
+            </>
+          )}
         </div>
       </div>
 
@@ -535,6 +983,12 @@ export default function NewReservation() {
                   Clear
                 </button>
               </div>
+            )}
+            {selectedGuest && outstandingQ.data && outstandingQ.data.total > 0.009 && (
+              <OutstandingBanner
+                data={outstandingQ.data}
+                guestName={selectedGuest.fullName}
+              />
             )}
             {guestsSearch.data && guestsSearch.data.length > 0 && !selectedGuest && (
               <div className="max-h-48 overflow-auto border rounded-sm">
@@ -598,7 +1052,7 @@ export default function NewReservation() {
                 <option value="aadhaar">Aadhaar</option>
                 <option value="pan">PAN</option>
                 <option value="passport">Passport</option>
-                <option value="driver_license">Driver License</option>
+                <option value="driving_license">Driving License</option>
                 <option value="voter_id">Voter ID</option>
               </select>
             </div>
@@ -623,21 +1077,41 @@ export default function NewReservation() {
       </div>
 
       <div className="card space-y-3">
-        <div className="flex items-center gap-2">
-          <ShieldCheck className="w-4 h-4 text-accentBlue" />
-          <h2 className="font-semibold text-navy">
-            KYC Documents {mode === "walkin" ? "(required)" : "(optional now, required at check-in)"}
-          </h2>
-        </div>
-        <div className="text-xs text-textSecondary -mt-1">
-          {mode === "walkin"
-            ? "Walk-in guests must upload a government ID photo now. Check-in cannot proceed without it."
-            : "Upload a clear photo of the guest's government ID. You can skip now and upload later, but check-in will be blocked until KYC is verified."}
-        </div>
-        <div className="grid grid-cols-2 gap-3">
-          <KycFilePicker label="Front" file={kycFront} onChange={setKycFront} required={mode === "walkin"} />
-          <KycFilePicker label="Back" file={kycBack} onChange={setKycBack} />
-        </div>
+        {kycOnFile && selectedGuest && walletQ.data ? (
+          <KycOnFileCard
+            guestId={selectedGuest.id}
+            guestName={selectedGuest.fullName}
+            verifiedAt={walletQ.data.kycVerifiedAt!}
+            idProofType={walletQ.data.idProofType}
+            idProofLast4={walletQ.data.idProofLast4}
+            photoUrl={walletQ.data.photoUrl}
+            kycFront={kycFront}
+            setKycFront={setKycFront}
+            kycBack={kycBack}
+            setKycBack={setKycBack}
+            kycPhoto={kycPhoto}
+            setKycPhoto={setKycPhoto}
+          />
+        ) : (
+          <>
+            <div className="flex items-center gap-2">
+              <ShieldCheck className="w-4 h-4 text-accentBlue" />
+              <h2 className="font-semibold text-navy">
+                KYC Documents {mode === "walkin" ? "(required)" : "(optional now, required at check-in)"}
+              </h2>
+            </div>
+            <div className="text-xs text-textSecondary -mt-1">
+              {mode === "walkin"
+                ? "Walk-in guests must upload a customer photo and a government ID photo now. Check-in cannot proceed without them."
+                : "Upload a clear customer photo and government ID. You can skip now and upload later, but check-in will be blocked until both are verified."}
+            </div>
+            <div className="grid grid-cols-3 gap-3">
+              <KycFilePicker label="Customer Photo" file={kycPhoto} onChange={setKycPhoto} required={mode === "walkin"} />
+              <KycFilePicker label="ID Front" file={kycFront} onChange={setKycFront} required={mode === "walkin"} />
+              <KycFilePicker label="ID Back" file={kycBack} onChange={setKycBack} />
+            </div>
+          </>
+        )}
       </div>
 
       <div className="card space-y-3">
@@ -671,8 +1145,12 @@ export default function NewReservation() {
             </div>
           )}
         </div>
-        {nights === 0 ? (
-          <div className="text-textSecondary text-sm">Select valid dates to see available rooms.</div>
+        {!canPriceStay ? (
+          <div className="text-textSecondary text-sm">
+            {isShortStay
+              ? "Pick a duration to see available rooms."
+              : "Select valid dates to see available rooms."}
+          </div>
         ) : availRooms.isLoading ? (
           <Loader label="Loading availability…" size="sm" />
         ) : !availRooms.data?.length ? (
@@ -694,8 +1172,8 @@ export default function NewReservation() {
                   onClick={() => toggleRoom(r)}
                 >
                   <div className="flex justify-between items-start">
-                    <div>
-                      <div className="flex items-center gap-2">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
                         <div className="font-mono font-bold">{r.roomNumber}</div>
                         {r.hasAc ? (
                           <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-sm text-[10px] font-semibold bg-accentBlue/15 text-accentBlue">
@@ -704,6 +1182,16 @@ export default function NewReservation() {
                         ) : (
                           <span className="inline-flex items-center px-1.5 py-0.5 rounded-sm text-[10px] font-semibold bg-gray-200 text-textSecondary">
                             Non-AC
+                          </span>
+                        )}
+                        {r.hasTv && (
+                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-sm text-[10px] font-semibold bg-brand-soft text-brand-dark">
+                            <Tv className="w-3 h-3" /> TV
+                          </span>
+                        )}
+                        {r.hasWifi && (
+                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-sm text-[10px] font-semibold bg-success/15 text-success">
+                            <Wifi className="w-3 h-3" /> Wi-Fi
                           </span>
                         )}
                       </div>
@@ -726,7 +1214,16 @@ export default function NewReservation() {
                             updateSoldAs(r.id, slug, t ? Number(t.defaultRate) : null);
                           }}
                         >
-                          <option value="">{selected.nativeType.replace(/_/g, " ")} (native)</option>
+                          {(() => {
+                            const native = roomTypesQ.data?.find(
+                              (t) => t.slug === selected.nativeType,
+                            );
+                            const nativeLabel = native?.label
+                              ?? selected.nativeType.replace(/_/g, " ").toUpperCase();
+                            return (
+                              <option value="">{nativeLabel} (native)</option>
+                            );
+                          })()}
                           {roomTypesQ.data
                             ?.filter((t) => t.slug !== selected.nativeType)
                             .map((t) => (
@@ -737,11 +1234,14 @@ export default function NewReservation() {
                         </select>
                       </div>
                       <div>
-                        <label className="label block mb-1">Rate/night</label>
+                        <label className="label block mb-1">
+                          {isShortStay ? `Rate for ${shortStayHours} hrs` : "Rate/night"}
+                        </label>
                         <input
                           className="input !h-8 text-sm"
                           type="number"
-                          value={selected.ratePerNight}
+                          value={selected.ratePerNight || ""}
+                          placeholder="0"
                           onChange={(e) => updateRate(r.id, Number(e.target.value))}
                         />
                       </div>
@@ -796,22 +1296,17 @@ export default function NewReservation() {
           </>
         )}
 
-        <label className="flex items-start gap-3 px-3 py-2.5 border border-borderc rounded-sm bg-bg cursor-pointer hover:border-brand/40 select-none">
-          <input
-            type="checkbox"
-            checked={requireOtp}
-            onChange={(e) => setRequireOtp(e.target.checked)}
-            className="w-4 h-4 mt-0.5 accent-brand"
-          />
+        <div className="flex items-start gap-3 px-3 py-2.5 border border-borderc rounded-sm bg-bg select-none">
+          <div className="w-4 h-4 mt-0.5 rounded-sm bg-brand grid place-items-center">
+            <span className="text-white text-[10px] leading-none">✓</span>
+          </div>
           <div className="text-sm">
-            <div className="font-medium text-textPrimary">Verify guest by OTP before receipt</div>
+            <div className="font-medium text-textPrimary">OTP verification (required)</div>
             <div className="text-xs text-textSecondary mt-0.5">
-              {mode === "walkin"
-                ? "Off by default for walk-ins (guest is present + KYC done). Enable for extra verification."
-                : "Recommended for pre-bookings. A code is sent to the guest's phone or email and must be entered before the booking is finalised."}
+              A code will be sent to the guest's phone or email and must be entered before check-in is completed.
             </div>
           </div>
-        </label>
+        </div>
       </div>
 
       {!isCreditBooking && (
@@ -821,13 +1316,27 @@ export default function NewReservation() {
             <div>
               <label className="label block mb-1">Amount (₹)</label>
               <input
-                className="input"
+                className={`input ${
+                  advanceTooHigh
+                    ? "border-danger focus:border-danger focus:ring-danger/30"
+                    : ""
+                }`}
                 type="number"
                 min={0}
+                max={grandTotal || undefined}
                 value={advance || ""}
                 placeholder="0"
                 onChange={(e) => setAdvance(Number(e.target.value))}
+                aria-invalid={advanceTooHigh}
               />
+              {advanceTooHigh && (
+                <div className="text-[11px] text-danger mt-1">
+                  Advance can't exceed grand total{" "}
+                  <span className="font-mono">{inr(grandTotal)}</span>. If the
+                  guest is pre-paying for another visit, record it as wallet
+                  credit instead.
+                </div>
+              )}
             </div>
             <div>
               <label className="label block mb-1">Method</label>
@@ -847,14 +1356,138 @@ export default function NewReservation() {
         </div>
       )}
 
+      {/* Wallet credit — only shown when an existing guest is selected and
+          they actually have a positive balance. Discounts the booking. */}
+      {!isCreditBooking && selectedGuest && walletBalance > 0.009 && grandTotal > 0 && (
+        <div className="card space-y-3 border-2 border-brand/30">
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <div>
+              <h2 className="font-semibold text-navy">6. Wallet Credit</h2>
+              <p className="text-xs text-textSecondary mt-0.5">
+                Available balance:{" "}
+                <span className="font-mono font-semibold text-brand-dark">
+                  {inr(walletBalance)}
+                </span>
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setWalletApply(0)}
+                className={`text-xs px-2 py-1 rounded-sm border ${
+                  walletApply === 0
+                    ? "bg-brand-dark text-cream border-brand-dark"
+                    : "border-borderc text-textSecondary hover:border-brand"
+                }`}
+              >
+                Don't apply
+              </button>
+              <button
+                type="button"
+                onClick={() => setWalletApply(maxWalletApply)}
+                className={`text-xs px-2 py-1 rounded-sm border ${
+                  walletApply >= maxWalletApply - 0.009 && walletApply > 0
+                    ? "bg-brand text-cream border-brand"
+                    : "border-borderc text-textSecondary hover:border-brand"
+                }`}
+              >
+                Apply max ({inr(maxWalletApply)})
+              </button>
+            </div>
+          </div>
+          <div>
+            <label className="label block mb-1">Amount to apply (₹)</label>
+            <input
+              className="input"
+              type="number"
+              min={0}
+              max={maxWalletApply}
+              step="0.01"
+              value={walletApply || ""}
+              placeholder="0"
+              onChange={(e) => {
+                const n = Math.max(0, Math.min(maxWalletApply, Number(e.target.value)));
+                setWalletApply(n);
+              }}
+            />
+            {walletApply > 0 && (
+              <div className="text-[11px] text-textSecondary mt-1">
+                Reduces the bill directly. Remaining wallet after this booking:{" "}
+                <span className="font-mono">
+                  {inr(Math.max(0, walletBalance - effectiveWalletApply))}
+                </span>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       <div className="card">
+        {gstMode === "inclusive" && roomAmount > 0 && (
+          <div className="flex justify-between text-sm">
+            <span className="text-textSecondary">
+              Quoted rate (
+              {isShortStay
+                ? `${shortStayHours} hrs × ${selectedRooms.length}`
+                : `${nights} × ${selectedRooms.length}`}{" "}
+              room{selectedRooms.length === 1 ? "" : "s"}) — GST included
+            </span>
+            <span className="font-mono">{inr(roomAmount)}</span>
+          </div>
+        )}
         <div className="flex justify-between text-sm">
-          <span>Subtotal ({nights} × {selectedRooms.length} room{selectedRooms.length === 1 ? "" : "s"})</span>
+          <span>
+            {isShortStay
+              ? `Subtotal (${shortStayHours} hrs × ${selectedRooms.length} room${selectedRooms.length === 1 ? "" : "s"})`
+              : `Subtotal (${nights} × ${selectedRooms.length} room${selectedRooms.length === 1 ? "" : "s"})`}
+            {gstMode === "inclusive" && (
+              <span className="text-[10px] text-textSecondary"> · net, after GST extracted</span>
+            )}
+          </span>
           <span className="font-mono">{inr(subtotal)}</span>
         </div>
-        <div className="flex justify-between text-xs text-textSecondary mt-1">
-          <span>+ GST (calculated at check-out based on slab)</span>
-        </div>
+        {subtotal > 0 && (
+          <>
+            <div className="flex justify-between text-sm mt-1">
+              <span>CGST @ {(gstRate / 2).toFixed(gstRate % 2 === 0 ? 0 : 1)}%</span>
+              <span className="font-mono">{inr(cgst)}</span>
+            </div>
+            <div className="flex justify-between text-sm mt-1">
+              <span>SGST @ {(gstRate / 2).toFixed(gstRate % 2 === 0 ? 0 : 1)}%</span>
+              <span className="font-mono">{inr(sgst)}</span>
+            </div>
+            <div className="flex justify-between text-base font-bold text-brand-dark mt-2 pt-2 border-t border-borderc">
+              <span>Grand Total</span>
+              <span className="font-mono">{inr(grandTotal)}</span>
+            </div>
+            {!isCreditBooking && effectiveWalletApply > 0 && (
+              <div className="flex justify-between text-sm text-brand mt-1">
+                <span>Wallet credit applied</span>
+                <span className="font-mono">−{inr(effectiveWalletApply)}</span>
+              </div>
+            )}
+            {!isCreditBooking && advance > 0 && (
+              <div className="flex justify-between text-sm text-textSecondary mt-1">
+                <span>Advance</span>
+                <span className="font-mono">−{inr(advance)}</span>
+              </div>
+            )}
+            {!isCreditBooking && (advance > 0 || effectiveWalletApply > 0) && (
+              <div className="flex justify-between text-sm font-semibold mt-1">
+                <span>Balance Due</span>
+                <span className={`font-mono ${balanceDue > 0 ? "text-danger" : "text-success"}`}>
+                  {inr(balanceDue)}
+                </span>
+              </div>
+            )}
+            <div className="text-[11px] text-textSecondary mt-2">
+              GST {gstRate}% applied via slab (avg rate ₹{avgRatePerNight.toFixed(2)}
+              {isShortStay ? `/${shortStayHours} hrs` : "/night"}
+              {gstMode === "inclusive" ? ", GST-inclusive" : ", GST extra"}). Final tax
+              recomputed at check-out if charges change.
+            </div>
+          </>
+        )}
         {error && <div className="text-danger text-sm mt-3">{error}</div>}
         <div className="flex justify-end gap-2 mt-4">
           <button className="btn-secondary" onClick={() => navigate(-1)}>
@@ -879,6 +1512,7 @@ export default function NewReservation() {
       {walkInReceipt && (
         <CheckInReceiptModal
           data={walkInReceipt}
+          variant={receiptVariant}
           onClose={() => {
             const id = walkInReceipt.reservationId;
             setWalkInReceipt(null);
@@ -888,22 +1522,190 @@ export default function NewReservation() {
       )}
 
       <OtpModal
-        reservationId={otpReservationId ?? ""}
-        open={!!otpReservationId}
+        guestId={pendingOtpGuestId ?? undefined}
+        open={!!pendingOtpGuestId}
         onClose={() => {
-          // Cancel: leave reservation as created but skip OTP and continue
-          const cb = pendingPostOtp.current;
-          pendingPostOtp.current = null;
-          setOtpReservationId(null);
-          cb?.();
+          // OTP abandoned: no reservation row was ever created. Nothing
+          // to clean up server-side. Just dismiss the modal and leave
+          // staff on the form so they can retry or back out.
+          setPendingOtpGuestId(null);
         }}
-        onVerified={() => {
-          const cb = pendingPostOtp.current;
-          pendingPostOtp.current = null;
-          setOtpReservationId(null);
-          cb?.();
+        onVerified={(code) => {
+          // OTP verified — now POST the reservation with the code so the
+          // server can re-verify atomically with the insert.
+          if (!code) return;
+          createAfterOtp.mutate(code);
         }}
       />
+    </div>
+  );
+}
+
+function KycOnFileCard({
+  guestId,
+  guestName,
+  verifiedAt,
+  idProofType,
+  idProofLast4,
+  photoUrl,
+  kycPhoto,
+  setKycPhoto,
+  kycFront,
+  setKycFront,
+  kycBack,
+  setKycBack,
+}: {
+  guestId: string;
+  guestName: string;
+  verifiedAt: string;
+  idProofType: string | null;
+  idProofLast4: string | null;
+  photoUrl: string | null;
+  kycPhoto: File | null;
+  setKycPhoto: (f: File | null) => void;
+  kycFront: File | null;
+  setKycFront: (f: File | null) => void;
+  kycBack: File | null;
+  setKycBack: (f: File | null) => void;
+}) {
+  const [showReplace, setShowReplace] = useState(false);
+  const verified = new Date(verifiedAt);
+  return (
+    <div className="space-y-3">
+      <div className="flex items-start gap-3">
+        {photoUrl ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={photoUrl}
+            alt={`KYC photo of ${guestName}`}
+            className="w-14 h-14 rounded-sm object-cover border border-borderc shrink-0"
+          />
+        ) : (
+          <div className="w-14 h-14 rounded-sm bg-success/10 grid place-items-center shrink-0">
+            <ShieldCheck className="w-6 h-6 text-success" />
+          </div>
+        )}
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-sm text-[10px] font-semibold bg-success/15 text-success">
+              <ShieldCheck className="w-3 h-3" /> KYC ON FILE
+            </span>
+            <span className="text-xs text-textSecondary">
+              Verified {verified.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" })}
+            </span>
+          </div>
+          <div className="text-sm text-textPrimary mt-1">
+            {idProofType ? (
+              <>
+                <span className="capitalize">{idProofType.replace(/_/g, " ")}</span>
+                {idProofLast4 && (
+                  <>
+                    {" "}
+                    ending in <span className="font-mono">{idProofLast4}</span>
+                  </>
+                )}
+              </>
+            ) : (
+              "Documents on file"
+            )}
+          </div>
+          <div className="text-xs text-textSecondary mt-0.5">
+            No need to re-upload. Existing documents will be used for this booking.
+          </div>
+          <div className="flex gap-3 mt-2 text-xs">
+            <Link to={`/guests/${guestId}`} className="text-accentBlue hover:underline">
+              View documents
+            </Link>
+            <button
+              type="button"
+              onClick={() => setShowReplace((v) => !v)}
+              className="text-textSecondary hover:text-brand-dark"
+            >
+              {showReplace ? "Hide replace options" : "Replace if guest brought new ID"}
+            </button>
+          </div>
+        </div>
+      </div>
+      {showReplace && (
+        <div className="grid grid-cols-3 gap-3 border-t border-borderc pt-3">
+          <KycFilePicker label="Customer Photo" file={kycPhoto} onChange={setKycPhoto} />
+          <KycFilePicker label="ID Front" file={kycFront} onChange={setKycFront} />
+          <KycFilePicker label="ID Back" file={kycBack} onChange={setKycBack} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function OutstandingBanner({
+  data,
+  guestName,
+}: {
+  data: {
+    total: number;
+    count: number;
+    pendingPromiseCount: number;
+    mostRecent: {
+      reservationId: string;
+      reservationNumber: string;
+      invoiceNumber: string | null;
+      balanceDue: number;
+      date: string;
+    } | null;
+  };
+  guestName: string;
+}) {
+  const daysAgo = data.mostRecent
+    ? Math.max(
+        0,
+        Math.floor((Date.now() - new Date(data.mostRecent.date).getTime()) / 86_400_000),
+      )
+    : null;
+  return (
+    <div className="border-2 border-danger/40 bg-danger/5 rounded-sm p-3 flex gap-3 items-start">
+      <AlertTriangle className="w-5 h-5 text-danger shrink-0 mt-0.5" />
+      <div className="min-w-0 flex-1 text-sm">
+        <div className="font-bold text-danger uppercase tracking-wider text-xs mb-1">
+          Outstanding balance
+        </div>
+        <div className="text-textPrimary">
+          <strong>{guestName}</strong> owes{" "}
+          <span className="font-mono font-bold text-danger">{inr(data.total)}</span> from{" "}
+          {data.count === 1 ? "a previous booking" : `${data.count} previous bookings`}.
+        </div>
+        {data.mostRecent && (
+          <div className="text-xs text-textSecondary mt-1">
+            Most recent:{" "}
+            <Link
+              to={`/reservations/${data.mostRecent.reservationId}`}
+              className="font-mono text-accentBlue hover:underline"
+            >
+              {data.mostRecent.reservationNumber}
+            </Link>
+            {data.mostRecent.invoiceNumber && (
+              <>
+                {" · "}
+                <span className="font-mono">{data.mostRecent.invoiceNumber}</span>
+              </>
+            )}
+            {daysAgo !== null && (
+              <>
+                {" · "}
+                {daysAgo === 0 ? "today" : `${daysAgo}d ago`}
+              </>
+            )}
+          </div>
+        )}
+        {data.pendingPromiseCount > 0 && (
+          <div className="text-[11px] text-warning mt-1">
+            {data.pendingPromiseCount} pending payment promise
+            {data.pendingPromiseCount === 1 ? "" : "s"} on file.
+          </div>
+        )}
+        <div className="text-xs text-textSecondary mt-2 italic">
+          Collect at check-in or remind the guest to settle the previous balance.
+        </div>
+      </div>
     </div>
   );
 }

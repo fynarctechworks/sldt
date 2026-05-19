@@ -1,12 +1,10 @@
-import { editInvoiceSchema, voidInvoiceSchema } from "@hoteldesk/shared";
+import { editInvoiceSchema } from "@hoteldesk/shared";
 import { and, desc, eq, gte, lte, sql } from "drizzle-orm";
 import { Router } from "express";
 import { db } from "../db/client.js";
 import { invoiceLineItems, invoices, payments } from "../db/schema/invoices.js";
 import { reservations } from "../db/schema/reservations.js";
 import { logActivity } from "../lib/activity.js";
-import { nextInvoiceSequence } from "../lib/availability.js";
-import { invoiceNumber } from "../lib/numbers.js";
 import { renderInvoicePdf } from "../lib/pdf.js";
 import { invalidateDashboard } from "../lib/redis.js";
 import { getSettings } from "../lib/settings.js";
@@ -15,7 +13,6 @@ import { requireAuth, requirePermission } from "../middleware/auth.js";
 import { validate } from "../middleware/validate.js";
 
 const router = Router();
-const STAFF = ["admin", "frontdesk"] as const;
 
 router.get("/", requireAuth, requirePermission("view_invoices"), async (req, res) => {
   const { status, date_from, date_to } = req.query as Record<string, string | undefined>;
@@ -48,23 +45,51 @@ router.get("/:id", requireAuth, requirePermission("view_invoices"), async (req, 
   const id = req.params.id!;
   const inv = await db.select().from(invoices).where(eq(invoices.id, id)).limit(1);
   if (!inv.length) return fail(res, 404, "NOT_FOUND", "Invoice not found");
-  const [items, pays] = await Promise.all([
+  const [items, pays, [resRow]] = await Promise.all([
     db.select().from(invoiceLineItems).where(eq(invoiceLineItems.invoiceId, id)),
     db.select().from(payments).where(eq(payments.invoiceId, id)).orderBy(desc(payments.paymentDate)),
+    db.select().from(reservations).where(eq(reservations.id, inv[0]!.reservationId)).limit(1),
   ]);
-  return ok(res, { ...inv[0], lineItems: items, payments: pays });
+  return ok(res, {
+    ...inv[0],
+    lineItems: items,
+    payments: pays,
+    // Surface the reservation's stay dates so the invoice editor can
+    // display + modify them without a separate fetch.
+    checkInDate: resRow?.checkInDate ?? null,
+    checkOutDate: resRow?.checkOutDate ?? null,
+    numNights: resRow ? Number(resRow.numNights) : null,
+  });
 });
 
 router.get("/:id/pdf", requireAuth, requirePermission("view_invoices"), async (req, res) => {
   const id = req.params.id!;
   const inv = await db.select().from(invoices).where(eq(invoices.id, id)).limit(1);
   if (!inv.length) return fail(res, 404, "NOT_FOUND", "Invoice not found");
-  const [items, pays] = await Promise.all([
+  const [items, pays, [resRow]] = await Promise.all([
     db.select().from(invoiceLineItems).where(eq(invoiceLineItems.invoiceId, id)),
     db.select().from(payments).where(eq(payments.invoiceId, id)),
+    db.select().from(reservations).where(eq(reservations.id, inv[0]!.reservationId)).limit(1),
   ]);
   const settings = await getSettings();
-  const pdf = await renderInvoicePdf({ invoice: inv[0]!, lineItems: items, payments: pays, settings });
+  const companionCollections = await collectCompanionCollections(inv[0]!.reservationId, id);
+  const pdf = await renderInvoicePdf({
+    invoice: inv[0]!,
+    lineItems: items,
+    payments: pays,
+    settings,
+    stay: resRow
+      ? {
+          checkInDate: resRow.checkInDate,
+          checkOutDate: resRow.checkOutDate,
+          numNights: Number(resRow.numNights),
+          checkedInAt: resRow.checkedInAt
+            ? resRow.checkedInAt.toISOString()
+            : null,
+        }
+      : undefined,
+    companionCollections,
+  });
   const inline = req.query.disposition === "inline";
   res.setHeader("Content-Type", "application/pdf");
   res.setHeader(
@@ -74,6 +99,90 @@ router.get("/:id/pdf", requireAuth, requirePermission("view_invoices"), async (r
   return res.send(pdf);
 });
 
+// Looks up other bookings that were settled at the same desk visit as
+// this reservation's check-out. The "Collect previous balance" flow
+// records payments with notes = "Collected at check-out of <thisResId>".
+// Those payments may EITHER target an existing invoice (older paid-off
+// stay) OR a pre-invoice reservation (active stay not checked out yet).
+// We join via the payment's reservationId (always present) and LEFT JOIN
+// invoices so pre-invoice rows aren't filtered out. The footer shows the
+// invoice number when one exists, otherwise the reservation number.
+async function collectCompanionCollections(
+  reservationId: string,
+  thisInvoiceId: string,
+): Promise<
+  { invoiceNumber: string | null; reservationNumber: string; amount: string }[]
+> {
+  // We accept two marker formats:
+  //   - "Collected at check-out of SLDT-RES-XXXX" (new — human-readable)
+  //   - "Collected at check-out of <uuid>"       (legacy — old payments)
+  // Look up the reservation number so we can match the new format.
+  const [thisRes] = await db
+    .select({ reservationNumber: reservations.reservationNumber })
+    .from(reservations)
+    .where(eq(reservations.id, reservationId))
+    .limit(1);
+  const newMarker = thisRes
+    ? `Collected at check-out of ${thisRes.reservationNumber}`
+    : null;
+  const legacyMarker = `Collected at check-out of ${reservationId}`;
+  const rows = await db
+    .select({
+      paymentReservationId: payments.reservationId,
+      amount: payments.amount,
+      invoiceId: invoices.id,
+      invoiceNumber: invoices.invoiceNumber,
+      otherReservationNumber: reservations.reservationNumber,
+    })
+    .from(payments)
+    .innerJoin(reservations, eq(reservations.id, payments.reservationId))
+    .leftJoin(invoices, eq(invoices.reservationId, payments.reservationId))
+    .where(
+      and(
+        eq(payments.voided, false),
+        newMarker
+          ? sql`${payments.notes} IN (${legacyMarker}, ${newMarker})`
+          : eq(payments.notes, legacyMarker),
+        // Belt-and-braces: skip rows accidentally pointing at this same invoice.
+        sql`(${invoices.id} IS NULL OR ${invoices.id} <> ${thisInvoiceId})`,
+      ),
+    );
+  // Sum per source-reservation in case multiple FIFO slices landed on the
+  // same target. Keying by reservationId (not invoiceId) so pre-invoice
+  // rows group correctly.
+  const byReservation = new Map<
+    string,
+    {
+      invoiceNumber: string | null;
+      reservationNumber: string;
+      total: number;
+    }
+  >();
+  for (const r of rows) {
+    if (!r.paymentReservationId) continue;
+    const cur = byReservation.get(r.paymentReservationId);
+    const amt = Number(r.amount);
+    if (cur) cur.total += amt;
+    else
+      byReservation.set(r.paymentReservationId, {
+        invoiceNumber: r.invoiceNumber ?? null,
+        reservationNumber: r.otherReservationNumber,
+        total: amt,
+      });
+  }
+  return Array.from(byReservation.values()).map((v) => ({
+    invoiceNumber: v.invoiceNumber,
+    reservationNumber: v.reservationNumber,
+    amount: v.total.toFixed(2),
+  }));
+}
+
+// In-place edit of an issued invoice. Lets staff fix anything on the bill
+// without spawning a new invoice number — like the receipt edit, but for
+// the invoice. Voided invoices are still rejected (nothing to edit).
+//
+// The full before/after is captured in activity_log so a CA can reconstruct
+// the original state from the audit trail.
 router.patch(
   "/:id",
   requireAuth,
@@ -81,164 +190,185 @@ router.patch(
   validate(editInvoiceSchema),
   async (req, res) => {
     const id = req.params.id!;
-    const input = req.body as { issueDate?: string; notes?: string | null };
+    const input = req.body as {
+      issueDate?: string;
+      notes?: string | null;
+      guestName?: string;
+      guestAddress?: string | null;
+      guestGstin?: string | null;
+      checkInDate?: string;
+      checkOutDate?: string;
+      lineItems?: Array<{
+        description: string;
+        sacCode: string;
+        quantity: number;
+        rate: number;
+        gstRate: number;
+        itemType: "room_charge" | "additional_charge";
+      }>;
+    };
 
     const inv = await db.select().from(invoices).where(eq(invoices.id, id)).limit(1);
     if (!inv.length) return fail(res, 404, "NOT_FOUND", "Invoice not found");
-    if (inv[0]!.status === "paid") {
-      return fail(res, 400, "PAID", "Cannot edit a paid invoice. Use Reissue instead");
-    }
     if (inv[0]!.status === "voided") {
       return fail(res, 400, "VOIDED", "Invoice is voided");
     }
 
-    const patch: Record<string, unknown> = { updatedAt: new Date() };
-    if (input.issueDate !== undefined) patch.issueDate = input.issueDate;
-    if (input.notes !== undefined) patch.notes = input.notes;
+    const original = inv[0]!;
+    const beforeSnapshot = {
+      subtotal: original.subtotal,
+      cgstAmount: original.cgstAmount,
+      sgstAmount: original.sgstAmount,
+      grandTotal: original.grandTotal,
+      balanceDue: original.balanceDue,
+      status: original.status,
+      notes: original.notes,
+      guestName: original.guestName,
+      guestAddress: original.guestAddress,
+      guestGstin: original.guestGstin,
+      issueDate: original.issueDate,
+    };
 
-    const [updated] = await db.update(invoices).set(patch).where(eq(invoices.id, id)).returning();
+    const updated = await db.transaction(async (tx) => {
+      const patch: Record<string, unknown> = { updatedAt: new Date() };
+      if (input.issueDate !== undefined) patch.issueDate = input.issueDate;
+      if (input.notes !== undefined) patch.notes = input.notes;
+      if (input.guestName !== undefined) patch.guestName = input.guestName;
+      if (input.guestAddress !== undefined) patch.guestAddress = input.guestAddress;
+      if (input.guestGstin !== undefined) patch.guestGstin = input.guestGstin;
+
+      // Replace line items + recompute totals when provided.
+      if (input.lineItems) {
+        // Delete old line items first. Cascade isn't enough — we want to
+        // be explicit about the replacement.
+        await tx.delete(invoiceLineItems).where(eq(invoiceLineItems.invoiceId, id));
+
+        let subtotal = 0;
+        let totalCgst = 0;
+        let totalSgst = 0;
+        const newRows = input.lineItems.map((li) => {
+          const amount = +(li.rate * li.quantity).toFixed(2);
+          // CGST + SGST split equally from the line's GST rate. Same model
+          // as initial invoice creation.
+          const gstAmount = +(amount * (li.gstRate / 100)).toFixed(2);
+          const halfGst = +(gstAmount / 2).toFixed(2);
+          subtotal += amount;
+          totalCgst += halfGst;
+          totalSgst += halfGst;
+          return {
+            invoiceId: id,
+            description: li.description,
+            sacCode: li.sacCode,
+            quantity: li.quantity,
+            rate: String(li.rate),
+            amount: String(amount),
+            gstRate: String(li.gstRate),
+            gstAmount: String(gstAmount),
+            itemType: li.itemType,
+          };
+        });
+        if (newRows.length) {
+          await tx.insert(invoiceLineItems).values(newRows);
+        }
+        const grandTotal = +(subtotal + totalCgst + totalSgst).toFixed(2);
+        // Use the original cgst/sgst RATE (most lines share one). If the
+        // line items disagree we just store the effective totals; rate
+        // columns become a "headline" reference.
+        const headlineGstRate =
+          input.lineItems.length > 0 ? input.lineItems[0]!.gstRate : Number(original.cgstRate) * 2;
+        const halfHeadline = +(headlineGstRate / 2).toFixed(2);
+
+        // Re-derive balance + status from the new total against existing
+        // payments and wallet credit.
+        const carriedPaid = Number(original.totalPaid);
+        const carriedWalletCredit = Number(original.walletCreditApplied);
+        const balanceDue = +(grandTotal - carriedPaid - carriedWalletCredit).toFixed(2);
+        const status =
+          balanceDue <= 0.009
+            ? "paid"
+            : carriedPaid + carriedWalletCredit > 0
+              ? "partial"
+              : "issued";
+
+        patch.subtotal = String(subtotal.toFixed(2));
+        patch.cgstRate = String(halfHeadline);
+        patch.cgstAmount = String(totalCgst.toFixed(2));
+        patch.sgstRate = String(halfHeadline);
+        patch.sgstAmount = String(totalSgst.toFixed(2));
+        patch.grandTotal = String(grandTotal);
+        patch.balanceDue = String(balanceDue);
+        patch.status = status;
+
+        // Keep the reservation's balance_due in sync — it's used by the
+        // dashboard + outstanding banner.
+        await tx
+          .update(reservations)
+          .set({ balanceDue: String(balanceDue), updatedAt: new Date() })
+          .where(eq(reservations.id, original.reservationId));
+      }
+
+      // Stay window edits live on the reservation, not the invoice. The
+      // invoice PDF reads them from the reservation when rendering.
+      // NOTE: `num_nights` is a Postgres GENERATED column derived from
+      // check_in_date and check_out_date — we must NOT try to set it,
+      // or Postgres errors with 428C9.
+      if (input.checkInDate !== undefined || input.checkOutDate !== undefined) {
+        const [resRow] = await tx
+          .select()
+          .from(reservations)
+          .where(eq(reservations.id, original.reservationId))
+          .limit(1);
+        if (resRow) {
+          const newIn = (input.checkInDate ?? resRow.checkInDate) as string;
+          const newOut = (input.checkOutDate ?? resRow.checkOutDate) as string;
+          if (newIn >= newOut) {
+            throw new Error("Check-out date must be after check-in date");
+          }
+        }
+        const resPatch: Record<string, unknown> = { updatedAt: new Date() };
+        if (input.checkInDate !== undefined) resPatch.checkInDate = input.checkInDate;
+        if (input.checkOutDate !== undefined) resPatch.checkOutDate = input.checkOutDate;
+        await tx
+          .update(reservations)
+          .set(resPatch)
+          .where(eq(reservations.id, original.reservationId));
+      }
+
+      const [row] = await tx.update(invoices).set(patch).where(eq(invoices.id, id)).returning();
+      return row!;
+    });
+
+    const afterSnapshot = {
+      subtotal: updated.subtotal,
+      cgstAmount: updated.cgstAmount,
+      sgstAmount: updated.sgstAmount,
+      grandTotal: updated.grandTotal,
+      balanceDue: updated.balanceDue,
+      status: updated.status,
+      notes: updated.notes,
+      guestName: updated.guestName,
+      guestAddress: updated.guestAddress,
+      guestGstin: updated.guestGstin,
+      issueDate: updated.issueDate,
+    };
+
     await logActivity({
       action: "invoice_edited",
       entityType: "invoice",
       entityId: id,
-      description: `${updated!.invoiceNumber} edited`,
+      description: `${updated.invoiceNumber} edited (₹${beforeSnapshot.grandTotal} → ₹${afterSnapshot.grandTotal})`,
       performedBy: req.user!.id,
       ipAddress: req.ip,
-      metadata: input,
-    });
-    return ok(res, updated);
-  },
-);
-
-router.post(
-  "/:id/reissue",
-  requireAuth,
-  requirePermission("reissue_invoices"),
-  validate(voidInvoiceSchema),
-  async (req, res) => {
-    const id = req.params.id!;
-    const { reason } = req.body as { reason: string };
-
-    const old = await db.select().from(invoices).where(eq(invoices.id, id)).limit(1);
-    if (!old.length) return fail(res, 404, "NOT_FOUND", "Invoice not found");
-    const original = old[0]!;
-    if (original.status === "voided") return fail(res, 400, "ALREADY_VOIDED", "Already voided");
-
-    const oldItems = await db
-      .select()
-      .from(invoiceLineItems)
-      .where(eq(invoiceLineItems.invoiceId, id));
-
-    const nextSeq = await nextInvoiceSequence(`SLDT-INV-%`);
-    const newNumber = invoiceNumber("SLDT", nextSeq);
-
-    const created = await db.transaction(async (tx) => {
-      await tx
-        .update(invoices)
-        .set({
-          status: "voided",
-          voidedReason: `Reissued: ${reason}`,
-          voidedBy: req.user!.id,
-          updatedAt: new Date(),
-        })
-        .where(eq(invoices.id, id));
-
-      const [newInv] = await tx
-        .insert(invoices)
-        .values({
-          invoiceNumber: newNumber,
-          reservationId: original.reservationId,
-          guestId: original.guestId,
-          hotelName: original.hotelName,
-          hotelAddress: original.hotelAddress,
-          hotelGstin: original.hotelGstin,
-          guestName: original.guestName,
-          guestAddress: original.guestAddress,
-          guestGstin: original.guestGstin,
-          subtotal: original.subtotal,
-          cgstRate: original.cgstRate,
-          cgstAmount: original.cgstAmount,
-          sgstRate: original.sgstRate,
-          sgstAmount: original.sgstAmount,
-          grandTotal: original.grandTotal,
-          totalPaid: "0",
-          balanceDue: original.grandTotal,
-          status: "issued",
-          notes: `Reissued from ${original.invoiceNumber}. ${reason}`,
-          reissuedFrom: id,
-          issuedBy: req.user!.id,
-        })
-        .returning();
-
-      if (oldItems.length) {
-        await tx.insert(invoiceLineItems).values(
-          oldItems.map((it) => ({
-            invoiceId: newInv!.id,
-            description: it.description,
-            sacCode: it.sacCode,
-            quantity: it.quantity,
-            rate: it.rate,
-            amount: it.amount,
-            gstRate: it.gstRate,
-            gstAmount: it.gstAmount,
-            itemType: it.itemType,
-          })),
-        );
-      }
-
-      await tx
-        .update(reservations)
-        .set({ balanceDue: original.grandTotal, updatedAt: new Date() })
-        .where(eq(reservations.id, original.reservationId));
-
-      return newInv!;
-    });
-
-    await logActivity({
-      action: "invoice_reissued",
-      entityType: "invoice",
-      entityId: created.id,
-      description: `${original.invoiceNumber} → ${created.invoiceNumber}: ${reason}`,
-      performedBy: req.user!.id,
-      ipAddress: req.ip,
-      metadata: { originalId: id, reason },
-    });
-    await invalidateDashboard();
-    return ok(res, created, 201);
-  },
-);
-
-router.post(
-  "/:id/void",
-  requireAuth,
-  requirePermission("void_invoices"),
-  validate(voidInvoiceSchema),
-  async (req, res) => {
-    const id = req.params.id!;
-    const { reason } = req.body as { reason: string };
-    const [updated] = await db
-      .update(invoices)
-      .set({
-        status: "voided",
-        voidedReason: reason,
-        voidedBy: req.user!.id,
-        updatedAt: new Date(),
-      })
-      .where(eq(invoices.id, id))
-      .returning();
-    if (!updated) return fail(res, 404, "NOT_FOUND", "Invoice not found");
-
-    await logActivity({
-      action: "invoice_voided",
-      entityType: "invoice",
-      entityId: id,
-      description: `${updated.invoiceNumber} voided: ${reason}`,
-      performedBy: req.user!.id,
-      ipAddress: req.ip,
+      metadata: {
+        before: beforeSnapshot,
+        after: afterSnapshot,
+        lineItemsReplaced: !!input.lineItems,
+      },
     });
     await invalidateDashboard();
     return ok(res, updated);
   },
 );
+
 
 export default router;

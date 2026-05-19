@@ -8,6 +8,7 @@ interface KycStatus {
   kycVerifiedAt: string | null;
   frontUrl: string | null;
   backUrl: string | null;
+  photoUrl: string | null;
 }
 
 export function KycModal({
@@ -21,6 +22,7 @@ export function KycModal({
 }) {
   const [front, setFront] = useState<File | null>(null);
   const [back, setBack] = useState<File | null>(null);
+  const [photo, setPhoto] = useState<File | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
   const { data: status, refetch } = useQuery({
@@ -30,10 +32,13 @@ export function KycModal({
 
   const upload = useMutation({
     mutationFn: async () => {
-      if (!front) throw new Error("Select the front photo of the ID proof");
+      if (!front && !status?.frontUrl) throw new Error("Select the front photo of the ID proof");
+      if (!photo && !status?.photoUrl) throw new Error("Customer photo is required");
+      if (!front && !back && !photo) throw new Error("Select at least one file to upload");
       const form = new FormData();
-      form.append("front", front);
+      if (front) form.append("front", front);
       if (back) form.append("back", back);
+      if (photo) form.append("photo", photo);
       return api.upload(`/guests/${guestId}/kyc`, form);
     },
     onSuccess: () => {
@@ -65,18 +70,24 @@ export function KycModal({
           </div>
         )}
 
-        {(status?.frontUrl || status?.backUrl) && (
-          <div className="grid grid-cols-2 gap-2 mb-3">
+        {(status?.frontUrl || status?.backUrl || status?.photoUrl) && (
+          <div className="grid grid-cols-3 gap-2 mb-3">
+            {status?.photoUrl && (
+              <a href={status.photoUrl} target="_blank" rel="noreferrer" className="block">
+                <img src={status.photoUrl} alt="Customer photo" className="w-full h-32 object-cover border rounded" />
+                <div className="text-xs text-center mt-1 text-textSecondary">Customer</div>
+              </a>
+            )}
             {status?.frontUrl && (
               <a href={status.frontUrl} target="_blank" rel="noreferrer" className="block">
                 <img src={status.frontUrl} alt="ID front" className="w-full h-32 object-cover border rounded" />
-                <div className="text-xs text-center mt-1 text-textSecondary">Front</div>
+                <div className="text-xs text-center mt-1 text-textSecondary">ID Front</div>
               </a>
             )}
             {status?.backUrl && (
               <a href={status.backUrl} target="_blank" rel="noreferrer" className="block">
                 <img src={status.backUrl} alt="ID back" className="w-full h-32 object-cover border rounded" />
-                <div className="text-xs text-center mt-1 text-textSecondary">Back</div>
+                <div className="text-xs text-center mt-1 text-textSecondary">ID Back</div>
               </a>
             )}
           </div>
@@ -84,19 +95,32 @@ export function KycModal({
 
         <div className="space-y-3">
           <div>
-            <label className="label block mb-1">Front (required)</label>
+            <label className="label block mb-1">
+              Customer Photo {status?.photoUrl ? "(replace)" : "(required)"}
+            </label>
             <input
               type="file"
-              accept="image/jpeg,image/png,image/webp,application/pdf"
+              accept="image/jpeg,image/png,image/webp"
+              onChange={(e) => setPhoto(e.target.files?.[0] ?? null)}
+              className="input"
+            />
+          </div>
+          <div>
+            <label className="label block mb-1">
+              ID Front {status?.frontUrl ? "(replace)" : "(required)"}
+            </label>
+            <input
+              type="file"
+              accept="image/jpeg,image/png,image/webp"
               onChange={(e) => setFront(e.target.files?.[0] ?? null)}
               className="input"
             />
           </div>
           <div>
-            <label className="label block mb-1">Back (optional, for Aadhaar / DL)</label>
+            <label className="label block mb-1">ID Back (optional, for Aadhaar / DL)</label>
             <input
               type="file"
-              accept="image/jpeg,image/png,image/webp,application/pdf"
+              accept="image/jpeg,image/png,image/webp"
               onChange={(e) => setBack(e.target.files?.[0] ?? null)}
               className="input"
             />
@@ -106,7 +130,12 @@ export function KycModal({
             <button className="btn-secondary" onClick={onClose}>Close</button>
             <button
               className="btn-primary inline-flex items-center gap-2"
-              disabled={!front || upload.isPending}
+              disabled={
+                (!front && !status?.frontUrl) ||
+                (!photo && !status?.photoUrl) ||
+                (!front && !back && !photo) ||
+                upload.isPending
+              }
               onClick={() => upload.mutate()}
             >
               <Upload className="w-4 h-4" />

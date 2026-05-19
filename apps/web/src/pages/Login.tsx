@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import { Navigate, useLocation } from "react-router-dom";
 import {
   AlertCircle,
@@ -33,6 +33,13 @@ export default function Login() {
     const saved = localStorage.getItem("hd:lastEmail");
     if (saved) setEmail(saved);
   }, []);
+
+  // Shown when api.ts redirects here after a 401. Avoids confusing the user
+  // ("why am I back at login?") and tells them what happened.
+  const expired = useMemo(
+    () => new URLSearchParams(location.search).get("expired") === "1",
+    [location.search],
+  );
 
   if (session) {
     const from =
@@ -133,6 +140,16 @@ export default function Login() {
               Sign in to continue to your workspace.
             </p>
           </div>
+
+          {expired && !error && (
+            <div
+              role="status"
+              className="flex items-start gap-2 rounded-sm border border-warning/40 bg-warning/10 px-3 py-2 text-warning text-sm"
+            >
+              <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+              <span>Your session expired. Please sign in again.</span>
+            </div>
+          )}
 
           {error && (
             <div

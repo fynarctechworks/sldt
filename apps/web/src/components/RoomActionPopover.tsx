@@ -98,7 +98,17 @@ export function RoomActionPopover({ roomId, roomNumber, status, trigger, onChang
       toast(msg, "error");
     },
     onSettled: () => {
-      const keys = invalidateKeys ?? [["dashboard"], ["reservation"]];
+      // Default set covers everything that depends on room status: the
+      // dashboard tile grid, the Rooms page list, the Housekeeping board,
+      // any open reservation detail, and the availability query used by
+      // NewReservation. Caller can still override via invalidateKeys.
+      const keys = invalidateKeys ?? [
+        ["dashboard"],
+        ["reservation"],
+        ["rooms"],
+        ["hk"],
+        ["avail"],
+      ];
       keys.forEach((k) => qc.invalidateQueries({ queryKey: k }));
       onChanged?.();
     },

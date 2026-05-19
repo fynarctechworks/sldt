@@ -3,10 +3,22 @@ import { Loader2, Mail, Phone, ShieldCheck, X } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 
 interface Props {
-  reservationId: string;
+  // EXACTLY ONE of reservationId / guestId.
+  //   - reservationId: OTP runs against an existing reservation. Used by
+  //     ReservationDetail when staff re-verifies a guest before check-in.
+  //     The modal consumes the OTP itself (/otp/verify marks it used).
+  //   - guestId: pre-create OTP — no reservation row exists yet. Used by
+  //     the booking flow on NewReservation. The modal does NOT consume
+  //     the OTP; it hands the raw code back to the caller so the
+  //     reservation-create endpoint can verify + consume atomically.
+  reservationId?: string;
+  guestId?: string;
   open: boolean;
   onClose: () => void;
-  onVerified: () => void;
+  // In reservationId mode the modal calls /otp/verify itself; onVerified
+  // is invoked with no args. In guestId mode onVerified receives the raw
+  // code so the caller can include it in POST /reservations.
+  onVerified: (code?: string) => void;
 }
 
 interface SendResp {
@@ -17,7 +29,7 @@ interface SendResp {
   devCode?: string;
 }
 
-export function OtpModal({ reservationId, open, onClose, onVerified }: Props) {
+export function OtpModal({ reservationId, guestId, open, onClose, onVerified }: Props) {
   const [step, setStep] = useState<"choose" | "verify">("choose");
   const [channel, setChannel] = useState<"sms" | "email">("sms");
   const [send, setSend] = useState<SendResp | null>(null);
@@ -43,11 +55,20 @@ export function OtpModal({ reservationId, open, onClose, onVerified }: Props) {
     return () => clearTimeout(t);
   }, [secondsLeft]);
 
+  // Server-side: /otp/send and /otp/verify both accept either anchor,
+  // so we just forward whichever was provided.
+  const anchor = reservationId
+    ? { reservationId }
+    : guestId
+      ? { guestId }
+      : null;
+
   async function onSend() {
+    if (!anchor) return;
     setBusy(true);
     setError(null);
     try {
-      const r = await api.post<SendResp>("/otp/send", { reservationId, channel });
+      const r = await api.post<SendResp>("/otp/send", { ...anchor, channel });
       setSend(r);
       setSecondsLeft(r.expiresInSeconds);
       setStep("verify");
@@ -59,12 +80,15 @@ export function OtpModal({ reservationId, open, onClose, onVerified }: Props) {
   }
 
   async function onVerify() {
-    if (code.length < 4) return;
+    if (code.length < 4 || !anchor) return;
     setBusy(true);
     setError(null);
     try {
-      await api.post("/otp/verify", { reservationId, code });
-      onVerified();
+      await api.post("/otp/verify", { ...anchor, code });
+      // In guestId mode we don't consume the OTP here — the create-
+      // reservation endpoint does that atomically. We hand the code back
+      // so the caller can include it in POST /reservations.
+      onVerified(guestId ? code : undefined);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Verification failed");
     } finally {

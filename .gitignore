@@ -1,9 +1,12 @@
 node_modules
 dist
 build
+# Env files: every .env* is ignored (they hold real secrets) EXCEPT the
+# committed *.example templates and the root .env.example.
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+!.env.*.example
 *.log
 .DS_Store
 .vercel

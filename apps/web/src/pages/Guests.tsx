@@ -1,10 +1,125 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Bell, Plus, Search, Tag } from "lucide-react";
+import {
+  Bell,
+  Ban,
+  BadgeIndianRupee,
+  Building2,
+  CalendarDays,
+  ChevronRight,
+  IdCard,
+  Mail,
+  MapPin,
+  Phone,
+  Plus,
+  RefreshCw,
+  Search,
+  Sparkles,
+  Star,
+  Tag,
+  Users,
+} from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Loader } from "@/components/Loader";
 import { getList, api } from "@/lib/api";
 import { GUEST_TAGS, ID_PROOF_TYPES, type IdProofType } from "@hoteldesk/shared";
+
+// Tag style registry. Each tag gets its own icon + color so the row of
+// filters reads at a glance instead of looking like a row of identical pills.
+// Filter chips (large) and table cell tags (compact) both consume this map.
+interface TagStyle {
+  label: string;
+  icon: LucideIcon;
+  // Solid color used when the chip is active (filter selection) or as the
+  // dot/icon background in compact mode.
+  solidBg: string;
+  solidText: string;
+  // Tinted color used when the chip is idle.
+  tintBg: string;
+  tintText: string;
+  tintBorder: string;
+}
+
+const TAG_STYLES: Record<string, TagStyle> = {
+  first_time: {
+    label: "First-time",
+    icon: Sparkles,
+    solidBg: "bg-[#6FAE94]",
+    solidText: "text-white",
+    tintBg: "bg-[#6FAE94]/15",
+    tintText: "text-[#2F6E55]",
+    tintBorder: "border-[#6FAE94]/35",
+  },
+  vip: {
+    label: "VIP",
+    icon: Star,
+    solidBg: "bg-[#B08A4A]",
+    solidText: "text-white",
+    tintBg: "bg-[#B08A4A]/12",
+    tintText: "text-[#7A5E2E]",
+    tintBorder: "border-[#B08A4A]/30",
+  },
+  corporate: {
+    label: "Corporate",
+    icon: Building2,
+    solidBg: "bg-[#3F6B8C]",
+    solidText: "text-white",
+    tintBg: "bg-[#3F6B8C]/10",
+    tintText: "text-[#2E4F6B]",
+    tintBorder: "border-[#5B8BAF]/30",
+  },
+  repeat: {
+    label: "Repeat",
+    icon: RefreshCw,
+    solidBg: "bg-brand",
+    solidText: "text-cream",
+    tintBg: "bg-brand/10",
+    tintText: "text-brand-dark",
+    tintBorder: "border-brand/25",
+  },
+  blacklist: {
+    label: "Blacklist",
+    icon: Ban,
+    solidBg: "bg-danger",
+    solidText: "text-white",
+    tintBg: "bg-danger/10",
+    tintText: "text-danger",
+    tintBorder: "border-danger/30",
+  },
+  long_stay: {
+    label: "Long Stay",
+    icon: CalendarDays,
+    solidBg: "bg-[#0F3D2E]",
+    solidText: "text-cream",
+    tintBg: "bg-[#0F3D2E]/8",
+    tintText: "text-[#0F3D2E]",
+    tintBorder: "border-[#0F3D2E]/25",
+  },
+  high_value: {
+    label: "High Value",
+    icon: BadgeIndianRupee,
+    solidBg: "bg-success",
+    solidText: "text-white",
+    tintBg: "bg-success/12",
+    tintText: "text-success",
+    tintBorder: "border-success/30",
+  },
+};
+
+const FALLBACK_TAG_STYLE: TagStyle = {
+  label: "Tag",
+  icon: Tag,
+  solidBg: "bg-textSecondary",
+  solidText: "text-white",
+  tintBg: "bg-borderc/40",
+  tintText: "text-textSecondary",
+  tintBorder: "border-borderc",
+};
+
+function tagStyle(key: string): TagStyle {
+  return TAG_STYLES[key] ?? { ...FALLBACK_TAG_STYLE, label: key.replace(/_/g, " ") };
+}
 
 interface Guest {
   id: string;
@@ -66,30 +181,46 @@ export default function Guests() {
             }}
           />
         </div>
-        <div className="flex flex-wrap items-center gap-2 text-xs">
-          <Tag className="w-4 h-4 text-textSecondary" />
-          <button
-            className={`px-2 py-1 rounded border ${!tag ? "bg-navy text-white border-navy" : "border-gray-300 hover:bg-gray-50"}`}
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="inline-flex items-center gap-1 text-[10px] uppercase tracking-wider text-textSecondary font-semibold pr-1">
+            <Tag className="w-3.5 h-3.5" /> Filter
+          </span>
+
+          <FilterChip
+            active={!tag}
+            icon={Users}
+            label="All"
             onClick={() => {
               setTag("");
               setPage(1);
             }}
-          >
-            All
-          </button>
-          {GUEST_TAGS.map((t) => (
-            <button
-              key={t}
-              className={`px-2 py-1 rounded border capitalize ${tag === t ? "bg-navy text-white border-navy" : "border-gray-300 hover:bg-gray-50"}`}
-              onClick={() => {
-                setTag(t);
-                setPage(1);
-              }}
-            >
-              {t.replace("_", " ")}
-            </button>
-          ))}
-          <label className="ml-auto inline-flex items-center gap-1.5 cursor-pointer">
+          />
+
+          {GUEST_TAGS.map((t) => {
+            const s = tagStyle(t);
+            const active = tag === t;
+            return (
+              <button
+                key={t}
+                type="button"
+                aria-pressed={active}
+                onClick={() => {
+                  setTag(t);
+                  setPage(1);
+                }}
+                className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-semibold border transition ${
+                  active
+                    ? `${s.solidBg} ${s.solidText} border-transparent shadow-sm`
+                    : `${s.tintBg} ${s.tintText} ${s.tintBorder} hover:brightness-95`
+                }`}
+              >
+                <s.icon className="w-3.5 h-3.5" />
+                {s.label}
+              </button>
+            );
+          })}
+
+          <label className="ml-auto inline-flex items-center gap-2 text-xs cursor-pointer text-textSecondary hover:text-brand-dark">
             <input
               type="checkbox"
               checked={hasFollowup}
@@ -97,61 +228,24 @@ export default function Guests() {
                 setHasFollowup(e.target.checked);
                 setPage(1);
               }}
+              className="accent-brand"
             />
             <Bell className="w-3.5 h-3.5" /> Pending follow-up
           </label>
         </div>
       </div>
 
-      <div className="card p-0 overflow-hidden">
-        {isLoading ? (
-          <Loader />
-        ) : guests.length === 0 ? (
-          <div className="p-6 text-textSecondary">No guests found.</div>
-        ) : (
-          <table className="table-base">
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Phone</th>
-                <th>Tags</th>
-                <th>Email</th>
-                <th>ID Type</th>
-                <th>ID</th>
-                <th>City</th>
-              </tr>
-            </thead>
-            <tbody>
-              {guests.map((g) => (
-                <tr
-                  key={g.id}
-                  className="cursor-pointer hover:bg-accentBlue/5"
-                  onClick={() => navigate(`/guests/${g.id}`)}
-                >
-                  <td className="font-medium">{g.fullName}</td>
-                  <td className="font-mono">{g.phone}</td>
-                  <td>
-                    <div className="flex flex-wrap gap-1">
-                      {(g.tags ?? []).map((t) => (
-                        <span
-                          key={t}
-                          className="text-[10px] px-1.5 py-0.5 rounded bg-accentBlue/10 text-navy capitalize"
-                        >
-                          {t.replace("_", " ")}
-                        </span>
-                      ))}
-                    </div>
-                  </td>
-                  <td className="text-textSecondary">{g.email ?? "-"}</td>
-                  <td className="capitalize">{g.idProofType.replace("_", " ")}</td>
-                  <td className="font-mono text-xs">{g.idProofMasked ?? `••••${g.idProofLast4}`}</td>
-                  <td>{g.city ?? "-"}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </div>
+      {isLoading ? (
+        <Loader />
+      ) : guests.length === 0 ? (
+        <div className="card text-textSecondary text-center py-10">No guests found.</div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+          {guests.map((g) => (
+            <GuestCard key={g.id} g={g} onOpen={() => navigate(`/guests/${g.id}`)} />
+          ))}
+        </div>
+      )}
 
       {pages > 1 && (
         <div className="flex items-center justify-between text-xs text-textSecondary">
@@ -179,6 +273,101 @@ export default function Guests() {
       )}
 
       {showAdd && <AddGuestModal onClose={() => setShowAdd(false)} />}
+    </div>
+  );
+}
+
+// Stable two-tone background for the avatar circle. We hash the guest's
+// full name so the same guest always gets the same shade — useful for
+// quick visual scanning of the grid without surfacing a real photo.
+function initialsOf(name: string): string {
+  const parts = name.trim().split(/\s+/);
+  if (parts.length === 0) return "?";
+  if (parts.length === 1) return parts[0]!.slice(0, 2).toUpperCase();
+  return (parts[0]![0]! + parts[parts.length - 1]![0]!).toUpperCase();
+}
+
+function avatarTone(seed: string): string {
+  const tones = [
+    "bg-[#6FAE94] text-white",
+    "bg-[#B08A4A] text-white",
+    "bg-[#3F6B8C] text-white",
+    "bg-brand text-cream",
+    "bg-[#A33A30] text-white",
+    "bg-[#2F6E55] text-white",
+  ];
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+  return tones[h % tones.length]!;
+}
+
+function GuestCard({ g, onOpen }: { g: Guest; onOpen: () => void }) {
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={onOpen}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onOpen();
+        }
+      }}
+      className="group card !p-4 cursor-pointer transition border border-borderc hover:border-brand/50 hover:shadow-sm focus:outline-none focus:ring-2 focus:ring-brand/40"
+    >
+      <div className="flex items-start gap-3">
+        <div
+          className={`w-10 h-10 rounded-full grid place-items-center font-semibold text-sm shrink-0 ${avatarTone(g.fullName)}`}
+        >
+          {initialsOf(g.fullName)}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="text-base font-semibold text-brand-dark truncate">{g.fullName}</div>
+          <div className="text-xs text-textSecondary font-mono flex items-center gap-1 mt-0.5">
+            <Phone className="w-3 h-3" />
+            {g.phone}
+          </div>
+        </div>
+        <ChevronRight className="w-5 h-5 text-textSecondary/50 group-hover:text-brand shrink-0 mt-1" />
+      </div>
+
+      {(g.tags ?? []).length > 0 && (
+        <div className="flex flex-wrap gap-1 mt-2">
+          {(g.tags ?? []).map((t) => {
+            const s = tagStyle(t);
+            return (
+              <span
+                key={t}
+                className={`inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded-full border ${s.tintBg} ${s.tintText} ${s.tintBorder}`}
+                title={s.label}
+              >
+                <s.icon className="w-2.5 h-2.5" />
+                {s.label}
+              </span>
+            );
+          })}
+        </div>
+      )}
+
+      <div className="mt-3 pt-3 border-t border-borderc space-y-1.5 text-xs">
+        <div className="flex items-center gap-2 text-textSecondary">
+          <Mail className="w-3.5 h-3.5 shrink-0" />
+          <span className="truncate">{g.email ?? "—"}</span>
+        </div>
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 text-textSecondary min-w-0">
+            <IdCard className="w-3.5 h-3.5 shrink-0" />
+            <span className="capitalize truncate">{g.idProofType.replace("_", " ")}</span>
+          </div>
+          <span className="font-mono text-textSecondary shrink-0">
+            {g.idProofMasked ?? `••••${g.idProofLast4}`}
+          </span>
+        </div>
+        <div className="flex items-center gap-2 text-textSecondary">
+          <MapPin className="w-3.5 h-3.5 shrink-0" />
+          <span className="truncate">{g.city ?? "—"}</span>
+        </div>
+      </div>
     </div>
   );
 }
@@ -351,6 +540,34 @@ function AddGuestModal({ onClose }: { onClose: () => void }) {
         </div>
       </div>
     </div>
+  );
+}
+
+function FilterChip({
+  active,
+  icon: Icon,
+  label,
+  onClick,
+}: {
+  active: boolean;
+  icon: LucideIcon;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={active}
+      onClick={onClick}
+      className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-semibold border transition ${
+        active
+          ? "bg-brand text-cream border-transparent shadow-sm"
+          : "bg-surface text-textSecondary border-borderc hover:border-brand/40 hover:text-brand-dark"
+      }`}
+    >
+      <Icon className="w-3.5 h-3.5" />
+      {label}
+    </button>
   );
 }
 

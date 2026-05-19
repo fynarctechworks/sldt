@@ -6,6 +6,7 @@ import { useDialog } from "@/components/Dialog";
 import { Loader } from "@/components/Loader";
 import { StatusBadge } from "@/components/StatusBadge";
 import { api } from "@/lib/api";
+import { invalidateRoomData } from "@/lib/invalidate";
 
 interface Room {
   id: string;
@@ -62,33 +63,39 @@ export default function Housekeeping() {
     refetchInterval: 15_000,
   });
 
+  // Room status changes affect: this board, the Rooms grid, the dashboard
+  // room tiles, and any availability query already on screen. Centralised
+  // via invalidateRoomData so we don't have to remember the list per
+  // mutation.
+  function invalidateRooms() {
+    invalidateRoomData(qc);
+    setErr(null);
+  }
+
   const updateStatus = useMutation({
     mutationFn: (v: { id: string; status: string }) =>
       api.patch(`/housekeeping/${v.id}`, { status: v.status }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["hk"] });
-      setErr(null);
-    },
+    onSuccess: invalidateRooms,
     onError: (e: Error) => setErr(e.message),
   });
 
   const flagMaint = useMutation({
     mutationFn: (v: { id: string; reason: string }) =>
       api.post(`/housekeeping/${v.id}/maintenance`, { reason: v.reason }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["hk"] }),
+    onSuccess: invalidateRooms,
     onError: (e: Error) => setErr(e.message),
   });
 
   const resolveMaint = useMutation({
     mutationFn: (id: string) => api.post(`/housekeeping/${id}/resolve`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["hk"] }),
+    onSuccess: invalidateRooms,
     onError: (e: Error) => setErr(e.message),
   });
 
   const updateNotes = useMutation({
     mutationFn: (v: { id: string; notes: string | null }) =>
       api.patch(`/housekeeping/${v.id}/notes`, { notes: v.notes }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["hk"] }),
+    onSuccess: invalidateRooms,
     onError: (e: Error) => setErr(e.message),
   });
 

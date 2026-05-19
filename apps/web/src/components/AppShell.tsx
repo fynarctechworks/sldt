@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { useMemo } from "react";
 import { api } from "@/lib/api";
+import { CheckoutAlerts } from "./CheckoutAlerts";
 import { Sidebar } from "./Sidebar";
 import { useNotificationToasts } from "./Toast";
 
@@ -35,6 +36,9 @@ export function AppShell({ children }: { children: ReactNode }) {
     <div className="min-h-screen bg-bg">
       <Sidebar />
       <div className="ml-60">
+        {/* CheckoutAlerts is sticky at top of the scroll area so it stays
+            visible regardless of which page is mounted. */}
+        <CheckoutAlerts />
         <main className="p-6">{children}</main>
       </div>
     </div>

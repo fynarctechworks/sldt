@@ -1,30 +1,35 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Pencil, Plus, Trash2, UserPlus } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { Download, Pencil, Plus, Trash2, UserPlus } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { useAuth } from "@/auth/AuthContext";
 import { useDialog } from "@/components/Dialog";
 import { Loader } from "@/components/Loader";
 import { useToast } from "@/components/Toast";
 import { api } from "@/lib/api";
+import { supabase } from "@/lib/supabase";
 import { inr } from "@/lib/utils";
 
-type Tab = "hotel" | "documents" | "messages" | "room-types" | "staff" | "roles";
-
-const TABS: { id: Tab; label: string }[] = [
-  { id: "hotel", label: "Hotel Profile" },
-  { id: "documents", label: "Invoice & Receipt" },
-  { id: "messages", label: "Messages" },
-  { id: "room-types", label: "Room Types" },
-  { id: "staff", label: "Staff" },
-  { id: "roles", label: "Roles & Permissions" },
-];
+type Tab = "hotel" | "room-types" | "staff" | "roles" | "audit";
 
 export default function Settings() {
+  const { can } = useAuth();
+  const canAudit = can("manage_staff");
+  const tabs = useMemo<{ id: Tab; label: string }[]>(() => {
+    const base: { id: Tab; label: string }[] = [
+      { id: "hotel", label: "Hotel Profile" },
+      { id: "room-types", label: "Room Types" },
+      { id: "staff", label: "Staff" },
+      { id: "roles", label: "Roles & Permissions" },
+    ];
+    if (canAudit) base.push({ id: "audit", label: "Audit Log" });
+    return base;
+  }, [canAudit]);
   const [tab, setTab] = useState<Tab>("hotel");
   return (
     <div className="space-y-4">
       <h1 className="text-2xl font-bold text-navy">Settings</h1>
       <div className="flex gap-1 flex-wrap border-b border-borderc">
-        {TABS.map((t) => (
+        {tabs.map((t) => (
           <button
             key={t.id}
             onClick={() => setTab(t.id)}
@@ -39,11 +44,10 @@ export default function Settings() {
         ))}
       </div>
       {tab === "hotel" && <HotelTab />}
-      {tab === "documents" && <DocumentsTab />}
-      {tab === "messages" && <MessagesTab />}
       {tab === "room-types" && <RoomTypesTab />}
       {tab === "staff" && <StaffTab />}
       {tab === "roles" && <RolesTab />}
+      {tab === "audit" && canAudit && <AuditTab />}
     </div>
   );
 }
@@ -62,6 +66,10 @@ interface HotelSettings {
   ownerNotifyEnabled: boolean;
   wifiSsid: string | null;
   wifiPassword: string | null;
+  // Property-wide GST pricing mode. 'inclusive' = rate the staff types
+  // already contains GST; 'exclusive' = GST is added on top. Only
+  // affects NEW bookings; existing reservations keep their own snapshot.
+  gstMode: "exclusive" | "inclusive";
 }
 
 function HotelTab() {
@@ -96,6 +104,7 @@ function HotelTab() {
         ownerNotifyEnabled: f.ownerNotifyEnabled,
         wifiSsid: f.wifiSsid && f.wifiSsid.trim() !== "" ? f.wifiSsid : null,
         wifiPassword: f.wifiPassword && f.wifiPassword.trim() !== "" ? f.wifiPassword : null,
+        gstMode: f.gstMode,
       };
       for (const k of Object.keys(payload)) {
         if (payload[k] === "" || payload[k] === undefined) delete payload[k];
@@ -156,6 +165,38 @@ function HotelTab() {
             value={form.checkOutTime ?? "11:00"}
             onChange={(e) => set("checkOutTime", e.target.value)}
           />
+        </Field>
+        <Field label="GST Pricing Mode">
+          <select
+            className="input"
+            value={form.gstMode ?? "inclusive"}
+            onChange={(e) => set("gstMode", e.target.value as "exclusive" | "inclusive")}
+          >
+            <option value="inclusive">Inclusive — rate already contains GST</option>
+            <option value="exclusive">Exclusive — GST is added on top of rate</option>
+          </select>
+          <div className="text-[11px] text-textSecondary mt-1 leading-snug">
+            {form.gstMode === "inclusive" ? (
+              <>
+                Staff types <span className="font-mono">₹1000</span>, the guest pays{" "}
+                <span className="font-mono">₹1000</span>. GST = 5% of ₹1000 =
+                <span className="font-mono"> ₹50</span> (CGST{" "}
+                <span className="font-mono">₹25</span> + SGST{" "}
+                <span className="font-mono">₹25</span>); net room =
+                <span className="font-mono"> ₹950</span>.
+              </>
+            ) : (
+              <>
+                Staff types <span className="font-mono">₹1000</span>, the guest pays{" "}
+                <span className="font-mono">₹1050</span> (₹1000 + 5% GST).
+              </>
+            )}
+            <br />
+            <span className="text-textSecondary/80">
+              Changing this only affects new bookings; existing reservations
+              keep their original math.
+            </span>
+          </div>
         </Field>
       </div>
       <Field label="Address">
@@ -225,583 +266,10 @@ function HotelTab() {
   );
 }
 
-interface DocSettings {
-  hotelName: string;
-  hotelAddress: string;
-  hotelGstin: string;
-  hotelLogoUrl: string | null;
-  currencySymbol: string;
-  docPrimaryColor: string;
-  docAccentColor: string;
-  docInvoiceTitle: string;
-  docReceiptTitle: string;
-  docFooterText: string;
-  docTermsText: string | null;
-  docSignatoryLabel: string;
-  docInvoicePageSize: "A4" | "A5" | "Letter";
-  docReceiptPageSize: "A4" | "A5" | "A6" | "Letter";
-  docShowLogo: boolean;
-  docShowGstin: boolean;
-  docShowTerms: boolean;
-  docShowSignature: boolean;
-}
-
-const DOC_DEFAULTS: DocSettings = {
-  hotelName: "",
-  hotelAddress: "",
-  hotelGstin: "",
-  hotelLogoUrl: null,
-  currencySymbol: "₹",
-  docPrimaryColor: "#0F3D2E",
-  docAccentColor: "#B08A4A",
-  docInvoiceTitle: "Tax Invoice",
-  docReceiptTitle: "Payment Receipt",
-  docFooterText: "Thank you for staying with us.",
-  docTermsText: "",
-  docSignatoryLabel: "Authorised Signatory",
-  docInvoicePageSize: "A4",
-  docReceiptPageSize: "A5",
-  docShowLogo: true,
-  docShowGstin: true,
-  docShowTerms: false,
-  docShowSignature: true,
-};
-
-function DocumentsTab() {
-  const qc = useQueryClient();
-  const { data } = useQuery({
-    queryKey: ["settings"],
-    queryFn: () => api.get<{ settings: DocSettings | null }>("/settings"),
-  });
-  const [form, setForm] = useState<DocSettings | null>(null);
-  const [msg, setMsg] = useState<string | null>(null);
-  const [previewKind, setPreviewKind] = useState<"invoice" | "receipt">("invoice");
-
-  useEffect(() => {
-    if (data?.settings && !form) {
-      setForm({ ...DOC_DEFAULTS, ...data.settings });
-    }
-  }, [data, form]);
-
-  const save = useMutation({
-    mutationFn: (f: DocSettings) =>
-      api.put("/settings", {
-        docPrimaryColor: f.docPrimaryColor,
-        docAccentColor: f.docAccentColor,
-        docInvoiceTitle: f.docInvoiceTitle,
-        docReceiptTitle: f.docReceiptTitle,
-        docFooterText: f.docFooterText,
-        docTermsText: f.docTermsText && f.docTermsText.trim() !== "" ? f.docTermsText : null,
-        docSignatoryLabel: f.docSignatoryLabel,
-        docInvoicePageSize: f.docInvoicePageSize,
-        docReceiptPageSize: f.docReceiptPageSize,
-        docShowLogo: f.docShowLogo,
-        docShowGstin: f.docShowGstin,
-        docShowTerms: f.docShowTerms,
-        docShowSignature: f.docShowSignature,
-      }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["settings"] });
-      setMsg("Saved");
-      setTimeout(() => setMsg(null), 2000);
-    },
-    onError: (e: Error) => setMsg(e.message),
-  });
-
-  if (!form) return <Loader />;
-
-  const set = <K extends keyof DocSettings>(k: K, v: DocSettings[K]) => setForm({ ...form, [k]: v });
-
-  return (
-    <div className="grid lg:grid-cols-[1fr_1.2fr] gap-4 items-start">
-      <div className="card space-y-4">
-        <section className="space-y-3">
-          <h3 className="font-semibold text-brand-dark">Branding</h3>
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Primary color">
-              <div className="flex items-center gap-2">
-                <input
-                  type="color"
-                  className="h-10 w-12 border border-borderc rounded-sm"
-                  value={form.docPrimaryColor}
-                  onChange={(e) => set("docPrimaryColor", e.target.value)}
-                />
-                <input
-                  className="input font-mono uppercase"
-                  value={form.docPrimaryColor}
-                  onChange={(e) => set("docPrimaryColor", e.target.value)}
-                  maxLength={7}
-                />
-              </div>
-            </Field>
-            <Field label="Accent color">
-              <div className="flex items-center gap-2">
-                <input
-                  type="color"
-                  className="h-10 w-12 border border-borderc rounded-sm"
-                  value={form.docAccentColor}
-                  onChange={(e) => set("docAccentColor", e.target.value)}
-                />
-                <input
-                  className="input font-mono uppercase"
-                  value={form.docAccentColor}
-                  onChange={(e) => set("docAccentColor", e.target.value)}
-                  maxLength={7}
-                />
-              </div>
-            </Field>
-          </div>
-          <Field label="Logo URL (leave blank to hide)">
-            <input
-              className="input"
-              placeholder="https://..."
-              value={form.hotelLogoUrl ?? ""}
-              onChange={(e) => set("hotelLogoUrl", e.target.value || null)}
-              disabled
-              title="Set the logo URL from Hotel Profile"
-            />
-          </Field>
-        </section>
-
-        <section className="space-y-3">
-          <h3 className="font-semibold text-brand-dark">Titles</h3>
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Invoice title">
-              <input className="input" value={form.docInvoiceTitle} onChange={(e) => set("docInvoiceTitle", e.target.value)} />
-            </Field>
-            <Field label="Receipt title">
-              <input className="input" value={form.docReceiptTitle} onChange={(e) => set("docReceiptTitle", e.target.value)} />
-            </Field>
-            <Field label="Invoice page size">
-              <select
-                className="input"
-                value={form.docInvoicePageSize}
-                onChange={(e) => set("docInvoicePageSize", e.target.value as DocSettings["docInvoicePageSize"])}
-              >
-                <option>A4</option>
-                <option>A5</option>
-                <option>Letter</option>
-              </select>
-            </Field>
-            <Field label="Receipt page size">
-              <select
-                className="input"
-                value={form.docReceiptPageSize}
-                onChange={(e) => set("docReceiptPageSize", e.target.value as DocSettings["docReceiptPageSize"])}
-              >
-                <option>A4</option>
-                <option>A5</option>
-                <option>A6</option>
-                <option>Letter</option>
-              </select>
-            </Field>
-          </div>
-        </section>
-
-        <section className="space-y-3">
-          <h3 className="font-semibold text-brand-dark">Footer &amp; Signature</h3>
-          <Field label="Footer text">
-            <input className="input" value={form.docFooterText} onChange={(e) => set("docFooterText", e.target.value)} />
-          </Field>
-          <Field label="Signatory label">
-            <input className="input" value={form.docSignatoryLabel} onChange={(e) => set("docSignatoryLabel", e.target.value)} />
-          </Field>
-          <Field label="Terms &amp; conditions (shown when enabled)">
-            <textarea
-              className="input min-h-[88px]"
-              value={form.docTermsText ?? ""}
-              onChange={(e) => set("docTermsText", e.target.value)}
-              placeholder="e.g. Check-in 12:00, check-out 11:00. GST as applicable…"
-            />
-          </Field>
-        </section>
-
-        <section className="space-y-2">
-          <h3 className="font-semibold text-brand-dark">Toggles</h3>
-          <div className="grid grid-cols-2 gap-2">
-            <Toggle label="Show logo" value={form.docShowLogo} onChange={(v) => set("docShowLogo", v)} />
-            <Toggle label="Show GSTIN" value={form.docShowGstin} onChange={(v) => set("docShowGstin", v)} />
-            <Toggle label="Show signature line" value={form.docShowSignature} onChange={(v) => set("docShowSignature", v)} />
-            <Toggle label="Show terms block" value={form.docShowTerms} onChange={(v) => set("docShowTerms", v)} />
-          </div>
-        </section>
-
-        <div className="flex justify-end gap-2 items-center pt-2 border-t border-borderc">
-          {msg && <span className="text-xs text-success">{msg}</span>}
-          <button className="btn-primary" onClick={() => save.mutate(form)} disabled={save.isPending}>
-            {save.isPending ? "Saving…" : "Save"}
-          </button>
-        </div>
-      </div>
-
-      <div className="space-y-2">
-        <div className="flex items-center justify-between">
-          <h3 className="font-semibold text-brand-dark">Live Preview</h3>
-          <div className="inline-flex rounded-sm border border-borderc overflow-hidden text-xs">
-            <button
-              type="button"
-              onClick={() => setPreviewKind("invoice")}
-              className={`px-3 py-1.5 ${previewKind === "invoice" ? "bg-brand text-cream" : "bg-bg text-textSecondary"}`}
-            >
-              Invoice
-            </button>
-            <button
-              type="button"
-              onClick={() => setPreviewKind("receipt")}
-              className={`px-3 py-1.5 ${previewKind === "receipt" ? "bg-brand text-cream" : "bg-bg text-textSecondary"}`}
-            >
-              Receipt
-            </button>
-          </div>
-        </div>
-        <DocPreview kind={previewKind} doc={form} />
-      </div>
-    </div>
-  );
-}
-
-function Toggle({ label, value, onChange }: { label: string; value: boolean; onChange: (v: boolean) => void }) {
-  return (
-    <label className="flex items-center gap-2 px-3 py-2 border border-borderc rounded-sm bg-surface cursor-pointer hover:bg-bg select-none">
-      <input
-        type="checkbox"
-        checked={value}
-        onChange={(e) => onChange(e.target.checked)}
-        className="w-4 h-4 accent-brand"
-      />
-      <span className="text-sm">{label}</span>
-    </label>
-  );
-}
-
-function DocPreview({ kind, doc }: { kind: "invoice" | "receipt"; doc: DocSettings }) {
-  const isInvoice = kind === "invoice";
-  const title = isInvoice ? doc.docInvoiceTitle : doc.docReceiptTitle;
-  const number = isInvoice ? "INV-202605-0042" : "RCP-202605-0078";
-  const date = "03 May 2026";
-  const grandTotal = "8,260.00";
-  const paid = "5,000.00";
-  const balance = "3,260.00";
-  return (
-    <div className="border border-borderc rounded-md bg-white shadow-sm overflow-hidden">
-      <div className="p-6 text-[12px] text-[#1a1a1a] font-sans" style={{ fontFamily: "system-ui" }}>
-        <div className="flex justify-between items-start gap-4 pb-3 border-b-2" style={{ borderColor: doc.docPrimaryColor }}>
-          <div className="flex gap-3 items-start max-w-[60%]">
-            {doc.docShowLogo && doc.hotelLogoUrl && (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img src={doc.hotelLogoUrl} alt="logo" className="w-14 h-14 object-contain rounded border border-borderc p-0.5" />
-            )}
-            <div>
-              <div className="text-[20px] font-bold leading-tight" style={{ color: doc.docPrimaryColor }}>
-                {doc.hotelName || "Your Hotel Name"}
-              </div>
-              <div className="text-[#444] mt-1">{doc.hotelAddress || "Hotel address line"}</div>
-              {doc.docShowGstin && doc.hotelGstin && (
-                <div className="font-mono text-[11px] text-[#555] mt-0.5">GSTIN: {doc.hotelGstin}</div>
-              )}
-            </div>
-          </div>
-          <div className="text-right">
-            <div className="text-[11px] uppercase tracking-widest font-bold" style={{ color: doc.docAccentColor }}>
-              {title}
-            </div>
-            <div className="text-[14px] font-bold font-mono" style={{ color: doc.docPrimaryColor }}>
-              {number}
-            </div>
-            <div className="mt-1 text-[#666]">Date: {date}</div>
-          </div>
-        </div>
-
-        <div className="my-4 p-3 bg-[#FAF7F0] border border-[#EDE7D6] rounded-sm flex justify-between gap-4">
-          <div>
-            <div className="text-[10px] uppercase tracking-wide text-[#666]">{isInvoice ? "Billed To" : "Received From"}</div>
-            <div className="font-semibold mt-0.5">Sample Guest</div>
-            <div className="font-mono text-[#444]">+91 90000 00000</div>
-          </div>
-          <div className="text-right">
-            <div className="text-[10px] uppercase tracking-wide text-[#666]">Reservation</div>
-            <div className="font-mono font-semibold mt-0.5">RES-202605-0119</div>
-          </div>
-        </div>
-
-        {isInvoice ? (
-          <>
-            <div className="text-[11px] uppercase tracking-wide font-semibold mt-3 mb-1" style={{ color: doc.docPrimaryColor }}>
-              Line Items
-            </div>
-            <table className="w-full text-[11px]">
-              <thead>
-                <tr className="bg-[#F5F2EA]" style={{ color: doc.docPrimaryColor }}>
-                  <th className="text-left p-1.5 border-b" style={{ borderColor: doc.docPrimaryColor }}>Description</th>
-                  <th className="text-left p-1.5 border-b" style={{ borderColor: doc.docPrimaryColor }}>SAC</th>
-                  <th className="text-right p-1.5 border-b" style={{ borderColor: doc.docPrimaryColor }}>Qty</th>
-                  <th className="text-right p-1.5 border-b" style={{ borderColor: doc.docPrimaryColor }}>Rate</th>
-                  <th className="text-right p-1.5 border-b" style={{ borderColor: doc.docPrimaryColor }}>Amount</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr>
-                  <td className="p-1.5 border-b border-borderc">Room 101 (2 nights)</td>
-                  <td className="p-1.5 border-b border-borderc font-mono">996311</td>
-                  <td className="p-1.5 border-b border-borderc text-right">2</td>
-                  <td className="p-1.5 border-b border-borderc text-right font-mono">{doc.currencySymbol}3,500.00</td>
-                  <td className="p-1.5 border-b border-borderc text-right font-mono">{doc.currencySymbol}7,000.00</td>
-                </tr>
-              </tbody>
-            </table>
-            <table className="ml-auto w-1/2 mt-3 text-[11px]">
-              <tbody>
-                <tr><td className="p-1">Subtotal</td><td className="p-1 text-right font-mono">{doc.currencySymbol}7,000.00</td></tr>
-                <tr><td className="p-1">CGST @ 9%</td><td className="p-1 text-right font-mono">{doc.currencySymbol}630.00</td></tr>
-                <tr><td className="p-1">SGST @ 9%</td><td className="p-1 text-right font-mono">{doc.currencySymbol}630.00</td></tr>
-                <tr style={{ borderTop: `2px solid ${doc.docPrimaryColor}` }}>
-                  <td className="p-1 pt-2 font-bold text-[13px]" style={{ color: doc.docPrimaryColor }}>Grand Total</td>
-                  <td className="p-1 pt-2 text-right font-mono font-bold text-[13px]" style={{ color: doc.docPrimaryColor }}>
-                    {doc.currencySymbol}{grandTotal}
-                  </td>
-                </tr>
-                <tr><td className="p-1">Total Paid</td><td className="p-1 text-right font-mono">{doc.currencySymbol}{paid}</td></tr>
-                <tr><td className="p-1 font-semibold">Balance Due</td><td className="p-1 text-right font-mono font-bold text-[#B23A2E]">{doc.currencySymbol}{balance}</td></tr>
-              </tbody>
-            </table>
-          </>
-        ) : (
-          <div className="my-4 p-4 rounded-md text-white text-center" style={{ background: doc.docPrimaryColor }}>
-            <div className="text-[10px] uppercase tracking-widest opacity-80">Amount Received</div>
-            <div className="text-[28px] font-bold font-mono mt-1">{doc.currencySymbol}{paid}</div>
-            <div className="text-[11px] mt-1 capitalize opacity-90">via cash</div>
-          </div>
-        )}
-
-        {doc.docShowTerms && doc.docTermsText && (
-          <div
-            className="mt-4 p-2.5 text-[11px] text-[#5D4037] whitespace-pre-wrap rounded-sm"
-            style={{ background: "#FFFBF1", borderLeft: `3px solid ${doc.docAccentColor}` }}
-          >
-            {doc.docTermsText}
-          </div>
-        )}
-
-        <div className="mt-6 pt-3 border-t border-borderc flex justify-between gap-4 text-[10px] text-[#666]">
-          <div>{doc.docFooterText}</div>
-          {doc.docShowSignature && (
-            <div className="text-right">
-              <div className="mt-7 inline-block min-w-[160px] pt-1 border-t border-[#999]">{doc.docSignatoryLabel}</div>
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-interface TemplateRow {
-  key: string;
-  group: string;
+interface ShortStayBand {
   label: string;
-  channel: "sms" | "email";
-  recipient: "guest" | "owner";
-  subject: string | null;
-  body: string;
-  enabled: boolean;
-  defaults: { subject?: string; body: string };
-  availableVars: string[];
-}
-
-function MessagesTab() {
-  const qc = useQueryClient();
-  const { data } = useQuery({
-    queryKey: ["templates"],
-    queryFn: () => api.get<{ items: TemplateRow[] }>("/settings/templates"),
-  });
-
-  if (!data) return <Loader />;
-  // Email channel is disabled in this deployment — show SMS templates only.
-  const smsOnly = data.items.filter((t) => t.channel === "sms");
-  const groups = new Map<string, TemplateRow[]>();
-  for (const t of smsOnly) {
-    if (!groups.has(t.group)) groups.set(t.group, []);
-    groups.get(t.group)!.push(t);
-  }
-
-  return (
-    <div className="space-y-5">
-      <div className="card text-sm text-textSecondary">
-        Edit the WhatsApp templates sent to guests and the owner via Twilio. Use{" "}
-        <code className="bg-bg px-1 rounded font-mono text-xs">{"{variable}"}</code> placeholders —
-        click an available variable to insert it. Disable a template to stop sending it without
-        deleting the wording.
-      </div>
-      {Array.from(groups.entries()).map(([groupName, items]) => (
-        <section key={groupName} className="space-y-3">
-          <h3 className="font-semibold text-brand-dark text-base">{groupName}</h3>
-          <div className="space-y-3">
-            {items.map((t) => (
-              <TemplateCard
-                key={t.key}
-                row={t}
-                onSaved={() => qc.invalidateQueries({ queryKey: ["templates"] })}
-              />
-            ))}
-          </div>
-        </section>
-      ))}
-    </div>
-  );
-}
-
-function TemplateCard({ row, onSaved }: { row: TemplateRow; onSaved: () => void }) {
-  const [subject, setSubject] = useState(row.subject ?? "");
-  const [body, setBody] = useState(row.body);
-  const [enabled, setEnabled] = useState(row.enabled);
-  const [msg, setMsg] = useState<string | null>(null);
-  const bodyRef = useRef<HTMLTextAreaElement>(null);
-  const subjectRef = useRef<HTMLInputElement>(null);
-  const lastFocused = useRef<"body" | "subject">("body");
-
-  const save = useMutation({
-    mutationFn: () =>
-      api.put(`/settings/templates/${row.key}`, {
-        subject: row.channel === "email" ? (subject.trim() === "" ? null : subject) : null,
-        body,
-        enabled,
-      }),
-    onSuccess: () => {
-      setMsg("Saved");
-      setTimeout(() => setMsg(null), 1500);
-      onSaved();
-    },
-    onError: (e: Error) => setMsg(e.message),
-  });
-
-  const reset = useMutation({
-    mutationFn: () => api.post(`/settings/templates/${row.key}/reset`),
-    onSuccess: () => {
-      setSubject(row.defaults.subject ?? "");
-      setBody(row.defaults.body);
-      setEnabled(true);
-      setMsg("Reset to default");
-      setTimeout(() => setMsg(null), 1500);
-      onSaved();
-    },
-  });
-
-  function insertVar(name: string) {
-    const tag = `{${name}}`;
-    if (lastFocused.current === "subject" && subjectRef.current) {
-      const el = subjectRef.current;
-      const start = el.selectionStart ?? subject.length;
-      const end = el.selectionEnd ?? subject.length;
-      const next = subject.slice(0, start) + tag + subject.slice(end);
-      setSubject(next);
-      setTimeout(() => {
-        el.focus();
-        el.setSelectionRange(start + tag.length, start + tag.length);
-      }, 0);
-    } else if (bodyRef.current) {
-      const el = bodyRef.current;
-      const start = el.selectionStart ?? body.length;
-      const end = el.selectionEnd ?? body.length;
-      const next = body.slice(0, start) + tag + body.slice(end);
-      setBody(next);
-      setTimeout(() => {
-        el.focus();
-        el.setSelectionRange(start + tag.length, start + tag.length);
-      }, 0);
-    }
-  }
-
-  const dirty = subject !== (row.subject ?? "") || body !== row.body || enabled !== row.enabled;
-
-  return (
-    <div className="card space-y-3">
-      <div className="flex items-center justify-between gap-3">
-        <div className="flex items-center gap-2">
-          <span className="font-semibold text-textPrimary">{row.label}</span>
-          <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded font-semibold bg-success/10 text-success">
-            WhatsApp
-          </span>
-          {!enabled && (
-            <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded font-semibold bg-warning/15 text-warning">
-              Disabled
-            </span>
-          )}
-        </div>
-        <label className="flex items-center gap-2 text-xs text-textSecondary cursor-pointer">
-          <input
-            type="checkbox"
-            checked={enabled}
-            onChange={(e) => setEnabled(e.target.checked)}
-            className="w-3.5 h-3.5 accent-brand"
-          />
-          Enabled
-        </label>
-      </div>
-
-      {row.channel === "email" && (
-        <Field label="Subject">
-          <input
-            ref={subjectRef}
-            className="input"
-            value={subject}
-            onFocus={() => (lastFocused.current = "subject")}
-            onChange={(e) => setSubject(e.target.value)}
-          />
-        </Field>
-      )}
-
-      <Field label={row.channel === "email" ? "Body" : "Message"}>
-        <textarea
-          ref={bodyRef}
-          className="input min-h-[120px] py-2 font-mono text-[12px]"
-          value={body}
-          onFocus={() => (lastFocused.current = "body")}
-          onChange={(e) => setBody(e.target.value)}
-        />
-      </Field>
-
-      <div>
-        <div className="text-[10px] uppercase tracking-wider text-textSecondary font-semibold mb-1.5">
-          Available variables
-        </div>
-        <div className="flex flex-wrap gap-1.5">
-          {row.availableVars.map((v) => (
-            <button
-              key={v}
-              type="button"
-              onClick={() => insertVar(v)}
-              className="px-2 py-1 text-[11px] font-mono rounded border border-borderc bg-bg hover:bg-brand-soft hover:border-brand text-textPrimary"
-              title={`Insert {${v}}`}
-            >
-              {`{${v}}`}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      <div className="flex justify-between items-center gap-2 pt-2 border-t border-borderc">
-        <button
-          type="button"
-          onClick={() => reset.mutate()}
-          disabled={reset.isPending}
-          className="text-xs text-textSecondary hover:text-danger hover:underline"
-        >
-          Reset to default
-        </button>
-        <div className="flex items-center gap-2">
-          {msg && <span className="text-xs text-success">{msg}</span>}
-          <button
-            type="button"
-            onClick={() => save.mutate()}
-            disabled={save.isPending || !dirty}
-            className="btn-primary !h-9 text-xs"
-          >
-            {save.isPending ? "Saving…" : "Save"}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
+  hours: number;
+  rate: number;
 }
 
 interface RoomTypeRow {
@@ -812,6 +280,10 @@ interface RoomTypeRow {
   maxOccupancy: string;
   description: string | null;
   isActive: boolean;
+  // Day-use price bands shown on the reservation form when stay_type is
+  // 'short_stay'. Empty array when the property hasn't configured any
+  // (the booking form then pro-rates the overnight default rate).
+  shortStayBands?: ShortStayBand[];
 }
 
 function RoomTypesTab() {
@@ -949,6 +421,7 @@ function RoomTypeModal({ row, onClose }: { row: RoomTypeRow | null; onClose: () 
     maxOccupancy: row ? Number(row.maxOccupancy) : 2,
     description: row?.description ?? "",
     isActive: row?.isActive ?? true,
+    shortStayBands: (row?.shortStayBands ?? []) as ShortStayBand[],
   });
   const [slugDirty, setSlugDirty] = useState(isEdit);
   const [err, setErr] = useState<string | null>(null);
@@ -962,6 +435,12 @@ function RoomTypeModal({ row, onClose }: { row: RoomTypeRow | null; onClose: () 
         maxOccupancy: form.maxOccupancy,
         description: form.description || null,
         isActive: form.isActive,
+        // Filter out blank/zero rows so an empty trailing input doesn't
+        // get persisted as a useless band. The server clamps hours and
+        // rates again with Zod.
+        shortStayBands: form.shortStayBands.filter(
+          (b) => b.label.trim() && b.hours > 0 && b.rate >= 0,
+        ),
       };
       return isEdit
         ? api.put(`/settings/room-types/${row!.id}`, body)
@@ -1050,6 +529,106 @@ function RoomTypeModal({ row, onClose }: { row: RoomTypeRow | null; onClose: () 
           />
           Active (available in new-room forms)
         </label>
+
+        <div className="pt-3 border-t border-borderc/40">
+          <div className="flex items-center justify-between mb-2">
+            <div>
+              <div className="text-sm font-semibold text-navy">Day-use price bands</div>
+              <div className="text-[11px] text-textSecondary">
+                Hourly tiers shown when staff picks "Day use" on a booking. Leave
+                empty to pro-rate from the nightly default rate.
+              </div>
+            </div>
+            <button
+              type="button"
+              className="text-xs text-accentBlue hover:underline"
+              onClick={() =>
+                setForm({
+                  ...form,
+                  shortStayBands: [
+                    ...form.shortStayBands,
+                    { label: "", hours: 0, rate: 0 },
+                  ],
+                })
+              }
+            >
+              + Add band
+            </button>
+          </div>
+          {form.shortStayBands.length > 0 && (
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="text-left text-textSecondary">
+                  <th className="py-1 font-medium">Label</th>
+                  <th className="py-1 font-medium w-20">Hours</th>
+                  <th className="py-1 font-medium w-24">Rate (₹)</th>
+                  <th className="w-8"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {form.shortStayBands.map((b, i) => (
+                  <tr key={i}>
+                    <td className="py-1 pr-1">
+                      <input
+                        className="input !h-8 text-xs"
+                        value={b.label}
+                        placeholder="e.g. 6 hrs"
+                        onChange={(e) => {
+                          const next = [...form.shortStayBands];
+                          next[i] = { ...next[i]!, label: e.target.value };
+                          setForm({ ...form, shortStayBands: next });
+                        }}
+                      />
+                    </td>
+                    <td className="py-1 pr-1">
+                      <input
+                        className="input !h-8 text-xs"
+                        type="number"
+                        min={1}
+                        max={23.5}
+                        step={0.5}
+                        value={b.hours || ""}
+                        onChange={(e) => {
+                          const next = [...form.shortStayBands];
+                          next[i] = { ...next[i]!, hours: Number(e.target.value) };
+                          setForm({ ...form, shortStayBands: next });
+                        }}
+                      />
+                    </td>
+                    <td className="py-1 pr-1">
+                      <input
+                        className="input !h-8 text-xs"
+                        type="number"
+                        min={0}
+                        value={b.rate || ""}
+                        onChange={(e) => {
+                          const next = [...form.shortStayBands];
+                          next[i] = { ...next[i]!, rate: Number(e.target.value) };
+                          setForm({ ...form, shortStayBands: next });
+                        }}
+                      />
+                    </td>
+                    <td className="py-1 text-right">
+                      <button
+                        type="button"
+                        className="text-danger text-xs hover:underline"
+                        onClick={() =>
+                          setForm({
+                            ...form,
+                            shortStayBands: form.shortStayBands.filter((_, j) => j !== i),
+                          })
+                        }
+                      >
+                        ×
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+
         {err && <div className="text-danger text-sm">{err}</div>}
         <div className="flex justify-end gap-2 pt-2">
           <button className="btn-secondary" onClick={onClose}>Cancel</button>
@@ -1920,6 +1499,119 @@ function RoleEditor({
             {save.isPending ? "Saving…" : role ? "Save changes" : "Create role"}
           </button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// Audit Log tab — admin-only CSV export of activity_log
+// ============================================================
+
+function AuditTab() {
+  const { toast } = useToast();
+  const today = new Date().toISOString().slice(0, 10);
+  const firstOfMonth = `${today.slice(0, 8)}01`;
+  const [dateFrom, setDateFrom] = useState(firstOfMonth);
+  const [dateTo, setDateTo] = useState(today);
+  const [limit, setLimit] = useState(10000);
+  const [downloading, setDownloading] = useState(false);
+
+  async function download() {
+    if (!dateFrom || !dateTo) {
+      toast("Pick a date range", "error");
+      return;
+    }
+    if (dateFrom > dateTo) {
+      toast("From date must be on or before To date", "error");
+      return;
+    }
+    setDownloading(true);
+    try {
+      const { data } = await supabase.auth.getSession();
+      const token = data.session?.access_token;
+      if (!token) throw new Error("Not signed in");
+      const base = (import.meta.env.VITE_API_URL as string).replace(/\/+$/, "");
+      const url = new URL(`${base}/audit/activity.csv`);
+      url.searchParams.set("date_from", dateFrom);
+      url.searchParams.set("date_to", dateTo);
+      url.searchParams.set("limit", String(limit));
+      const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(text || `Download failed (HTTP ${res.status})`);
+      }
+      const blob = await res.blob();
+      const objUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = objUrl;
+      a.download = `activity_${dateFrom.replace(/-/g, "")}_${dateTo.replace(/-/g, "")}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(objUrl);
+      toast("Audit log downloaded", "success");
+    } catch (e) {
+      toast(e instanceof Error ? e.message : "Download failed", "error");
+    } finally {
+      setDownloading(false);
+    }
+  }
+
+  return (
+    <div className="card space-y-4">
+      <div>
+        <h3 className="font-semibold text-brand-dark">Export activity log</h3>
+        <p className="text-xs text-textSecondary mt-1">
+          Downloads every staff action — logins, check-ins, payments, voids, settings changes — as
+          CSV for the chosen range. Use this for periodic compliance reviews.
+        </p>
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <Field label="From">
+          <input
+            className="input"
+            type="date"
+            value={dateFrom}
+            max={dateTo || undefined}
+            onChange={(e) => setDateFrom(e.target.value)}
+          />
+        </Field>
+        <Field label="To">
+          <input
+            className="input"
+            type="date"
+            value={dateTo}
+            min={dateFrom || undefined}
+            max={today}
+            onChange={(e) => setDateTo(e.target.value)}
+          />
+        </Field>
+        <Field label="Row limit (max 50,000)">
+          <input
+            className="input"
+            type="number"
+            min={1}
+            max={50000}
+            step={1000}
+            value={limit}
+            onChange={(e) => setLimit(Math.max(1, Math.min(50000, Number(e.target.value) || 0)))}
+          />
+        </Field>
+      </div>
+      <div className="flex justify-end">
+        <button
+          className="btn-primary inline-flex items-center gap-2"
+          onClick={download}
+          disabled={downloading}
+        >
+          <Download className="w-4 h-4" />
+          {downloading ? "Downloading…" : "Download CSV"}
+        </button>
+      </div>
+      <div className="text-[11px] text-textSecondary border-t border-borderc pt-3">
+        Note: each export is itself recorded in the audit log under the action{" "}
+        <code className="font-mono">audit_export</code>.
       </div>
     </div>
   );

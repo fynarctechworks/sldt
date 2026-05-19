@@ -1,11 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { format } from "date-fns";
-import { Bell, CalendarPlus, CheckCircle2, ExternalLink, FileImage, Pencil, Plus, ShieldCheck, Tag as TagIcon, Trash2, Upload, X } from "lucide-react";
+import { Bell, CalendarPlus, CheckCircle2, ExternalLink, FileImage, Pencil, Plus, ShieldCheck, Tag as TagIcon, Trash2, Upload, Wallet, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { KycModal } from "@/components/KycModal";
 import { Loader } from "@/components/Loader";
 import { api } from "@/lib/api";
+import { invalidateReservationData } from "@/lib/invalidate";
 import { inr } from "@/lib/utils";
 import { GUEST_TAGS } from "@hoteldesk/shared";
 
@@ -13,9 +14,11 @@ interface GuestStats {
   totalStays: number;
   completedStays: number;
   upcomingStays: number;
+  inHouseStays: number;
   cancelledStays: number;
   firstStay: string | null;
   lastStay: string | null;
+  firstBooking: string | null;
   totalSpent: number;
   balanceDue: number;
 }
@@ -39,6 +42,8 @@ interface Guest {
   notes: string | null;
   tags: string[];
   createdAt: string;
+  photoUrl: string | null;
+  walletBalance: number;
   stats?: GuestStats;
 }
 
@@ -90,7 +95,15 @@ export default function GuestProfile() {
   return (
     <div className="space-y-5 max-w-4xl">
       <div className="flex items-start justify-between gap-4 flex-wrap">
-        <div>
+        <div className="flex items-start gap-4">
+          {data.photoUrl && (
+            <img
+              src={data.photoUrl}
+              alt={data.fullName}
+              className="w-20 h-24 object-cover rounded-md border border-borderc shrink-0"
+            />
+          )}
+          <div>
           <h1 className="text-2xl font-bold text-brand-dark">{data.fullName}</h1>
           <div className="text-sm text-textSecondary font-mono mt-0.5">{data.phone}</div>
           <div className="mt-2 flex flex-wrap items-center gap-2">
@@ -100,7 +113,14 @@ export default function GuestProfile() {
                 Outstanding {inr(outstanding)}
               </span>
             )}
+            {data.walletBalance > 0 && (
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-sm bg-success/10 text-success text-xs font-semibold">
+                <span className="w-1.5 h-1.5 rounded-full bg-success" />
+                Wallet credit {inr(data.walletBalance)}
+              </span>
+            )}
             <TagsEditor guestId={data.id} tags={data.tags ?? []} />
+          </div>
           </div>
         </div>
         <div className="flex gap-2 shrink-0">
@@ -332,16 +352,30 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 }
 
 function StatsRow({ stats }: { stats: GuestStats }) {
+  // Build a compact human description of what those total-stays are made up of.
+  const parts: string[] = [];
+  if (stats.inHouseStays > 0) parts.push(`${stats.inHouseStays} in-house`);
+  if (stats.upcomingStays > 0) parts.push(`${stats.upcomingStays} upcoming`);
+  if (stats.completedStays > 0) parts.push(`${stats.completedStays} completed`);
+  if (stats.cancelledStays > 0) parts.push(`${stats.cancelledStays} cancelled`);
+  const totalSub = parts.length > 0 ? parts.join(" · ") : "—";
+
+  // For "Last stay", only say "Since X" if there's at least one completed stay.
+  // For brand-new guests with only future bookings, surface that instead so we
+  // don't show contradictory "Never · Since May 2026" copy.
+  const lastValue = stats.lastStay
+    ? format(new Date(stats.lastStay), "dd MMM yyyy")
+    : "Never";
+  const lastSub = stats.lastStay
+    ? `Since ${format(new Date(stats.firstStay ?? stats.lastStay), "MMM yyyy")}`
+    : stats.firstBooking
+      ? `First booking ${format(new Date(stats.firstBooking), "dd MMM yyyy")}`
+      : "No bookings yet";
+
   return (
     <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-      <Stat label="Total stays" value={String(stats.totalStays)} sub={
-        stats.upcomingStays > 0 ? `${stats.upcomingStays} upcoming` : stats.completedStays > 0 ? `${stats.completedStays} completed` : "—"
-      } />
-      <Stat
-        label="Last stay"
-        value={stats.lastStay ? format(new Date(stats.lastStay), "dd MMM yyyy") : "Never"}
-        sub={stats.firstStay ? `Since ${format(new Date(stats.firstStay), "MMM yyyy")}` : "—"}
-      />
+      <Stat label="Total stays" value={String(stats.totalStays)} sub={totalSub} />
+      <Stat label="Last stay" value={lastValue} sub={lastSub} />
       <Stat label="Total paid" value={inr(stats.totalSpent)} sub="across all invoices" mono />
       <Stat
         label="Balance due"
@@ -400,6 +434,7 @@ function ProfileTab({ g }: { g: Guest }) {
   return (
     <div className="space-y-4">
       <KycSection guestId={g.id} idProofType={g.idProofType} />
+      <WalletSection guestId={g.id} />
 
       <Section title="Contact">
         <Row label="Full Name" value={g.fullName} />
@@ -452,6 +487,7 @@ interface KycStatus {
   kycVerifiedAt: string | null;
   frontUrl: string | null;
   backUrl: string | null;
+  photoUrl: string | null;
 }
 
 function KycSection({ guestId, idProofType }: { guestId: string; idProofType: string }) {
@@ -501,7 +537,15 @@ function KycSection({ guestId, idProofType }: { guestId: string; idProofType: st
           </div>
         </div>
       ) : (
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <KycThumb
+            label="Customer Photo"
+            url={data.photoUrl}
+            onPreview={() =>
+              data.photoUrl && setPreview({ url: data.photoUrl, label: "Customer Photo" })
+            }
+            onReplace={() => setShowUpload(true)}
+          />
           <KycThumb
             label={`${proofLabel} · Front`}
             url={data.frontUrl}
@@ -712,6 +756,136 @@ function ImagePreview({
           />
         </div>
       </div>
+    </div>
+  );
+}
+
+interface LedgerEntry {
+  id: string;
+  entryType: "credit_issued" | "credit_used" | "cashout" | "adjustment";
+  amount: string;
+  reservationId: string | null;
+  note: string | null;
+  createdAt: string;
+}
+
+function WalletSection({ guestId }: { guestId: string }) {
+  const qc = useQueryClient();
+  const [showCashout, setShowCashout] = useState(false);
+  const [amount, setAmount] = useState("");
+  const [note, setNote] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+
+  const { data } = useQuery({
+    queryKey: ["ledger", guestId],
+    queryFn: () => api.get<{ balance: number; entries: LedgerEntry[] }>(`/guests/${guestId}/ledger`),
+  });
+
+  const cashout = useMutation({
+    mutationFn: () =>
+      api.post(`/guests/${guestId}/ledger/cashout`, {
+        amount: Number(amount),
+        note: note || undefined,
+      }),
+    onSuccess: () => {
+      setShowCashout(false);
+      setAmount("");
+      setNote("");
+      // Cashout affects guest wallet balance (used in ledger view), the
+      // guest's running totals, and any aggregated views downstream.
+      invalidateReservationData(qc, { guestId });
+    },
+    onError: (e: Error) => setErr(e.message),
+  });
+
+  const balance = data?.balance ?? 0;
+
+  return (
+    <div className="card">
+      <div className="flex items-center justify-between mb-3 pb-2 border-b border-borderc">
+        <div className="flex items-center gap-2">
+          <Wallet className="w-4 h-4 text-brand" />
+          <div className="text-[10px] uppercase tracking-[0.18em] text-brand font-bold">
+            Wallet Credit
+          </div>
+        </div>
+        {balance > 0 && (
+          <button
+            className="text-xs font-semibold inline-flex items-center gap-1 px-2.5 py-1 rounded-sm border border-borderc text-textSecondary hover:border-brand-dark hover:text-brand-dark transition-colors"
+            onClick={() => setShowCashout(true)}
+          >
+            Cash out
+          </button>
+        )}
+      </div>
+
+      <div className="text-2xl font-bold text-brand-dark">{inr(balance)}</div>
+      <div className="text-xs text-textSecondary mt-0.5">Available for future bookings — no expiry</div>
+
+      {data?.entries && data.entries.length > 0 && (
+        <div className="mt-4">
+          <div className="text-[10px] uppercase tracking-wider text-textSecondary font-semibold mb-2">
+            History
+          </div>
+          <div className="space-y-1.5 max-h-60 overflow-y-auto">
+            {data.entries.map((e) => {
+              const signed = e.entryType === "credit_issued" || e.entryType === "adjustment";
+              return (
+                <div key={e.id} className="flex items-center justify-between text-xs py-1.5 border-b border-borderc/40 last:border-0">
+                  <div className="min-w-0">
+                    <div className="font-medium capitalize text-textPrimary">
+                      {e.entryType.replace("_", " ")}
+                    </div>
+                    {e.note && <div className="text-textSecondary truncate">{e.note}</div>}
+                    <div className="text-textSecondary">{format(new Date(e.createdAt), "dd MMM yyyy · HH:mm")}</div>
+                  </div>
+                  <div className={`font-mono font-semibold shrink-0 ml-3 ${signed ? "text-success" : "text-danger"}`}>
+                    {signed ? "+" : "−"}{inr(Number(e.amount))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {showCashout && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={() => setShowCashout(false)}>
+          <div className="bg-surface rounded-md w-full max-w-md p-5" onClick={(e) => e.stopPropagation()}>
+            <h3 className="text-lg font-semibold text-navy mb-3">Cash out wallet credit</h3>
+            <div className="text-sm text-textSecondary mb-3">Available: <strong>{inr(balance)}</strong></div>
+            <div className="space-y-3">
+              <div>
+                <label className="label block mb-1">Amount</label>
+                <input
+                  className="input"
+                  type="number"
+                  min={0}
+                  max={balance}
+                  step="0.01"
+                  value={amount}
+                  onChange={(e) => setAmount(e.target.value)}
+                />
+              </div>
+              <div>
+                <label className="label block mb-1">Note (optional)</label>
+                <input className="input" value={note} onChange={(e) => setNote(e.target.value)} placeholder="Cash refund handed at front desk" />
+              </div>
+              {err && <div className="text-danger text-sm">{err}</div>}
+              <div className="flex justify-end gap-2">
+                <button className="btn-secondary" onClick={() => setShowCashout(false)}>Cancel</button>
+                <button
+                  className="btn-primary"
+                  disabled={!amount || Number(amount) <= 0 || Number(amount) > balance + 0.009 || cashout.isPending}
+                  onClick={() => cashout.mutate()}
+                >
+                  {cashout.isPending ? "Processing…" : "Confirm cash out"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
-import { Navigate, useLocation } from "react-router-dom";
+import { Lock } from "lucide-react";
+import { Navigate, useLocation, useNavigate } from "react-router-dom";
 import type { Role } from "@hoteldesk/shared";
 import { Loader } from "@/components/Loader";
 import { useAuth } from "./AuthContext";
@@ -49,10 +50,27 @@ export function PermissionGuard({
 }
 
 function Forbidden({ detail }: { detail: string }) {
+  const navigate = useNavigate();
   return (
-    <div className="p-8 max-w-md">
-      <h1 className="text-xl font-semibold text-brand-dark">403 Forbidden</h1>
-      <p className="text-textSecondary mt-2 text-sm">{detail}</p>
+    <div className="flex items-center justify-center py-20 px-4">
+      <div className="card max-w-md w-full text-center !p-8">
+        <div className="w-14 h-14 rounded-full bg-danger/10 grid place-items-center mx-auto">
+          <Lock className="w-7 h-7 text-danger" />
+        </div>
+        <h1 className="text-xl font-bold text-brand-dark mt-4">Access restricted</h1>
+        <p className="text-textSecondary mt-2 text-sm">{detail}</p>
+        <p className="text-textSecondary mt-1 text-xs">
+          If you think you should have access, ask an administrator to update your role.
+        </p>
+        <div className="flex justify-center gap-2 mt-5">
+          <button className="btn-secondary" onClick={() => navigate(-1)}>
+            Go back
+          </button>
+          <button className="btn-primary" onClick={() => navigate("/")}>
+            Back to Dashboard
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

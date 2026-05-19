@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Snowflake, Tv, Wifi } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { Loader } from "@/components/Loader";
@@ -104,6 +105,30 @@ export default function RoomDetail() {
         </Field>
       </div>
 
+      <div className="card">
+        <div className="label mb-2">Amenities</div>
+        <div className="flex flex-wrap gap-2">
+          <AmenityToggle
+            icon={<Snowflake className="w-4 h-4" />}
+            label="AC"
+            active={!!form.hasAc}
+            onClick={() => setForm({ ...form, hasAc: !form.hasAc })}
+          />
+          <AmenityToggle
+            icon={<Tv className="w-4 h-4" />}
+            label="TV"
+            active={!!form.hasTv}
+            onClick={() => setForm({ ...form, hasTv: !form.hasTv })}
+          />
+          <AmenityToggle
+            icon={<Wifi className="w-4 h-4" />}
+            label="Wi-Fi"
+            active={!!form.hasWifi}
+            onClick={() => setForm({ ...form, hasWifi: !form.hasWifi })}
+          />
+        </div>
+      </div>
+
       <div className="flex justify-end gap-2">
         <button className="btn-secondary" onClick={() => navigate("/rooms")}>
           Cancel
@@ -122,5 +147,33 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
       <label className="label block mb-1">{label}</label>
       {children}
     </div>
+  );
+}
+
+function AmenityToggle({
+  icon,
+  label,
+  active,
+  onClick,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={`inline-flex items-center gap-2 px-3 py-2 rounded-sm border-2 text-sm font-medium transition ${
+        active
+          ? "bg-accentBlue text-white border-accentBlue shadow-sm"
+          : "bg-bg text-textSecondary border-borderc hover:border-accentBlue/60 hover:text-navy"
+      }`}
+    >
+      {icon}
+      {label}
+    </button>
   );
 }

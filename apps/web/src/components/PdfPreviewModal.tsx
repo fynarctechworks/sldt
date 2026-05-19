@@ -1,4 +1,4 @@
-import { Download, ExternalLink, Loader2, X } from "lucide-react";
+import { Download, ExternalLink, Loader2, Printer, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { supabase } from "@/lib/supabase";
 
@@ -15,6 +15,7 @@ export function PdfPreviewModal({ open, url, title, filename, onClose }: Props) 
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const lastUrl = useRef<string | null>(null);
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
 
   useEffect(() => {
     if (!open || !url) return;
@@ -86,6 +87,23 @@ export function PdfPreviewModal({ open, url, title, filename, onClose }: Props) 
     window.open(blobUrl, "_blank", "noopener,noreferrer");
   }
 
+  function print() {
+    if (!blobUrl) return;
+    // Drive the iframe's print dialog directly — no new tab. The iframe
+    // is already loaded with the same blob: PDF the user is looking at,
+    // so contentWindow.print() opens the system print dialog with that
+    // PDF as the target. focus() first because Chrome ignores print()
+    // when the iframe doesn't have focus.
+    const win = iframeRef.current?.contentWindow;
+    if (!win) return;
+    try {
+      win.focus();
+      win.print();
+    } catch {
+      /* swallow — Ctrl+P in the modal still works */
+    }
+  }
+
   return (
     <div
       className="fixed inset-0 z-[150] grid place-items-center bg-brand-dark/50 p-4"
@@ -104,6 +122,14 @@ export function PdfPreviewModal({ open, url, title, filename, onClose }: Props) 
               title="Open in new tab"
             >
               <ExternalLink className="w-3.5 h-3.5" /> New tab
+            </button>
+            <button
+              onClick={print}
+              disabled={!blobUrl}
+              className="text-xs font-semibold inline-flex items-center gap-1.5 px-2.5 h-8 rounded-sm border-2 border-borderc text-textSecondary hover:border-brand-dark hover:text-brand-dark transition-colors disabled:opacity-40"
+              title="Print"
+            >
+              <Printer className="w-3.5 h-3.5" /> Print
             </button>
             <button
               onClick={download}
@@ -137,6 +163,7 @@ export function PdfPreviewModal({ open, url, title, filename, onClose }: Props) 
           )}
           {blobUrl && !error && (
             <iframe
+              ref={iframeRef}
               key={blobUrl}
               src={blobUrl}
               title={title}

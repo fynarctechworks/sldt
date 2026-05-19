@@ -1,11 +1,9 @@
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { asc, eq } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 import { db } from "../db/client.js";
 import { profiles } from "../db/schema/profiles.js";
 import {
-  PERMISSION_ALL,
-  permissions,
   rolePermissions,
   roles,
   userPermissionOverrides,
@@ -14,7 +12,7 @@ import {
 import { logActivity } from "../lib/activity.js";
 import { PERMISSION_CATALOG } from "../lib/permissions.js";
 import { fail, ok } from "../lib/response.js";
-import { requireAdmin, requireAuth, requirePermission } from "../middleware/auth.js";
+import { requireAuth, requirePermission } from "../middleware/auth.js";
 import { validate } from "../middleware/validate.js";
 
 const router = Router();
@@ -244,14 +242,20 @@ router.put(
         set: { roleId, assignedAt: new Date(), assignedBy: req.user!.id },
       });
 
-    // Keep legacy profiles.role in sync for system roles. For custom roles it stays
-    // at whatever it was (legacy text column) — only RBAC is consulted from here on.
-    if (r[0]!.key === "admin" || r[0]!.key === "frontdesk" || r[0]!.key === "housekeeping") {
-      await db
-        .update(profiles)
-        .set({ role: r[0]!.key as "admin" | "frontdesk" | "housekeeping", updatedAt: new Date() })
-        .where(eq(profiles.id, userId));
-    }
+    // Keep legacy profiles.role in sync. System role keys map 1:1; for custom
+    // roles we fall back to 'frontdesk' so the legacy column never claims
+    // 'admin' for a non-admin user. The RBAC tables remain the source of truth
+    // for permissions; profiles.role is now purely for legacy display/UI.
+    const legacyRole: "admin" | "frontdesk" | "housekeeping" =
+      r[0]!.key === "admin"
+        ? "admin"
+        : r[0]!.key === "housekeeping"
+          ? "housekeeping"
+          : "frontdesk";
+    await db
+      .update(profiles)
+      .set({ role: legacyRole, updatedAt: new Date() })
+      .where(eq(profiles.id, userId));
 
     await logActivity({
       action: "user_role_assigned",
@@ -346,11 +350,5 @@ router.get(
     });
   },
 );
-
-// Suppress unused-import warning for things used in commented sections.
-void requireAdmin;
-void inArray;
-void and;
-void PERMISSION_ALL;
 
 export default router;

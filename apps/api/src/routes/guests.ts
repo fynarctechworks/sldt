@@ -14,7 +14,7 @@ import multer from "multer";
 import { db } from "../db/client.js";
 import { guestFollowUps, guestNotes, guests } from "../db/schema/guests.js";
 import { reservations } from "../db/schema/reservations.js";
-import { invoices } from "../db/schema/invoices.js";
+import { invoices, payments } from "../db/schema/invoices.js";
 import { logActivity } from "../lib/activity.js";
 import { encrypt, last4 } from "../lib/crypto.js";
 import { fail, list, ok } from "../lib/response.js";
@@ -22,14 +22,29 @@ import { signedKycUrl, uploadKycPhoto, validateKycFile } from "../lib/storage.js
 import { requireAuth, requirePermission } from "../middleware/auth.js";
 import { validate } from "../middleware/validate.js";
 
+// Multer config for KYC uploads. We reject anything that isn't an image at
+// the multipart layer so junk (executables, archives, SVG, PDF) never even
+// hits the disk buffer. Real validation happens server-side in
+// storage.ts via Sharp re-encoding — this is just the cheap first filter.
+const ALLOWED_UPLOAD_MIMES = new Set(["image/jpeg", "image/png", "image/webp"]);
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 8 * 1024 * 1024, files: 2 },
+  limits: { fileSize: 8 * 1024 * 1024, files: 3, fields: 5 },
+  fileFilter: (_req, file, cb) => {
+    if (!ALLOWED_UPLOAD_MIMES.has(file.mimetype)) {
+      cb(new Error("Only JPEG, PNG, or WEBP images are accepted"));
+      return;
+    }
+    cb(null, true);
+  },
 });
 
 const router = Router();
 
-const maskId = (encrypted: string, l4: string) => `••••${l4}`;
+// Mask the ID proof for non-admin views. Only the last 4 digits leak out
+// so staff can still verify a guest at the desk without seeing the full
+// number. Admins get the unmasked row.
+const maskId = (l4: string) => `••••${l4}`;
 
 function maskGuest<T extends { idProofNumberEncrypted: string; idProofLast4: string }>(
   guest: T,
@@ -37,7 +52,8 @@ function maskGuest<T extends { idProofNumberEncrypted: string; idProofLast4: str
 ) {
   if (role === "admin") return guest;
   const { idProofNumberEncrypted: _e, ...rest } = guest;
-  return { ...rest, idProofMasked: maskId(_e, guest.idProofLast4) };
+  void _e; // intentionally dropped from the response
+  return { ...rest, idProofMasked: maskId(guest.idProofLast4) };
 }
 
 router.get(
@@ -116,6 +132,157 @@ router.get(
   },
 );
 
+// Outstanding balance owed by this guest across all their previous bookings.
+// Combines:
+//   (a) unpaid/partial invoices (issued, not voided, balance_due > 0)
+//   (b) confirmed/checked-in reservations with a non-zero balance that
+//       haven't had an invoice issued yet (e.g. advance paid but stay
+//       still in progress)
+// Returns a small summary so the New Reservation form can show a banner
+// without making a second round-trip. `mostRecent` is for the "previous
+// booking" deep-link.
+router.get(
+  "/:id/outstanding",
+  requireAuth,
+  requirePermission("view_guests"),
+  async (req, res) => {
+    const id = req.params.id!;
+    const exists = await db.select({ id: guests.id }).from(guests).where(eq(guests.id, id)).limit(1);
+    if (!exists.length) return fail(res, 404, "NOT_FOUND", "Guest not found");
+
+    // Complimentary reservations don't appear as "owed" anywhere — they
+    // were comped, so there is no debt to chase. Filter in all three
+    // sub-queries that feed the outstanding banner.
+    const [invoiceRows, preInvoiceRows, pendingPayments] = await Promise.all([
+      db
+        .select({
+          invoiceId: invoices.id,
+          invoiceNumber: invoices.invoiceNumber,
+          reservationId: invoices.reservationId,
+          reservationNumber: reservations.reservationNumber,
+          balanceDue: invoices.balanceDue,
+          issuedAt: invoices.createdAt,
+        })
+        .from(invoices)
+        .innerJoin(reservations, eq(reservations.id, invoices.reservationId))
+        .where(
+          and(
+            eq(invoices.guestId, id),
+            sql`${invoices.status} NOT IN ('voided','paid')`,
+            sql`${invoices.balanceDue}::numeric > 0.009`,
+            sql`${reservations.bookingSource} <> 'complimentary'`,
+          ),
+        )
+        .orderBy(desc(invoices.createdAt)),
+      // Reservations the guest is on that have a non-zero balance but no
+      // invoice yet. We exclude cancelled/no_show so we don't nag about
+      // bookings that were never going to be paid for.
+      db
+        .select({
+          reservationId: reservations.id,
+          reservationNumber: reservations.reservationNumber,
+          balanceDue: reservations.balanceDue,
+          createdAt: reservations.createdAt,
+          status: reservations.status,
+        })
+        .from(reservations)
+        .leftJoin(invoices, eq(invoices.reservationId, reservations.id))
+        .where(
+          and(
+            eq(reservations.guestId, id),
+            inArray(reservations.status, ["confirmed", "checked_in"]),
+            sql`${invoices.id} IS NULL`,
+            sql`${reservations.balanceDue}::numeric > 0.009`,
+            sql`${reservations.bookingSource} <> 'complimentary'`,
+          ),
+        )
+        .orderBy(desc(reservations.createdAt)),
+      // Pending payment promises ("guest will pay in cash later"). These
+      // attach to a reservation but might double-count what the invoice
+      // already says, so we surface them as a separate count for context
+      // but DON'T add their amount to the total.
+      db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(payments)
+        .innerJoin(reservations, eq(reservations.id, payments.reservationId))
+        .where(
+          and(
+            eq(reservations.guestId, id),
+            eq(payments.status, "pending"),
+            eq(payments.voided, false),
+            sql`${reservations.bookingSource} <> 'complimentary'`,
+          ),
+        ),
+    ]);
+
+    const totalFromInvoices = invoiceRows.reduce((s, r) => s + Number(r.balanceDue), 0);
+    const totalFromPreInvoice = preInvoiceRows.reduce((s, r) => s + Number(r.balanceDue), 0);
+    const total = +(totalFromInvoices + totalFromPreInvoice).toFixed(2);
+
+    // Most-recent unpaid item — used by the UI for the "Open previous
+    // reservation" deep-link in the banner.
+    let mostRecent:
+      | {
+          reservationId: string;
+          reservationNumber: string;
+          invoiceNumber: string | null;
+          balanceDue: number;
+          date: string;
+        }
+      | null = null;
+    if (invoiceRows.length) {
+      const r = invoiceRows[0]!;
+      mostRecent = {
+        reservationId: r.reservationId,
+        reservationNumber: r.reservationNumber,
+        invoiceNumber: r.invoiceNumber,
+        balanceDue: Number(r.balanceDue),
+        date: r.issuedAt.toISOString(),
+      };
+    } else if (preInvoiceRows.length) {
+      const r = preInvoiceRows[0]!;
+      mostRecent = {
+        reservationId: r.reservationId,
+        reservationNumber: r.reservationNumber,
+        invoiceNumber: null,
+        balanceDue: Number(r.balanceDue),
+        date: r.createdAt.toISOString(),
+      };
+    }
+
+    return ok(res, {
+      total,
+      count: invoiceRows.length + preInvoiceRows.length,
+      pendingPromiseCount: pendingPayments[0]?.count ?? 0,
+      mostRecent,
+      // Per-invoice breakdown used by checkout flow to collect previous
+      // unpaid balances in FIFO order (oldest issued first).
+      invoices: invoiceRows
+        .map((r) => ({
+          invoiceId: r.invoiceId,
+          invoiceNumber: r.invoiceNumber,
+          reservationId: r.reservationId,
+          reservationNumber: r.reservationNumber,
+          balanceDue: Number(r.balanceDue),
+          issuedAt: r.issuedAt.toISOString(),
+        }))
+        .sort((a, b) => a.issuedAt.localeCompare(b.issuedAt)),
+      // Reservations that have a balance but haven't been invoiced yet
+      // (still checked_in or confirmed). The checkout modal lets staff
+      // collect these via POST /reservations/:id/payments (records an
+      // advance).
+      preInvoiceReservations: preInvoiceRows
+        .map((r) => ({
+          reservationId: r.reservationId,
+          reservationNumber: r.reservationNumber,
+          balanceDue: Number(r.balanceDue),
+          createdAt: r.createdAt.toISOString(),
+        }))
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
+    });
+  },
+);
+
 router.get(
   "/:id",
   requireAuth,
@@ -128,35 +295,102 @@ router.get(
     const [resStats, paidStats] = await Promise.all([
       db
         .select({
+          // total = anything ever booked (incl. cancelled). The UI groups it
+          // semantically using the other sub-counts.
           total: sql<number>`count(*)::int`,
           completed: sql<number>`count(*) filter (where ${reservations.status} = 'checked_out')::int`,
-          upcoming: sql<number>`count(*) filter (where ${reservations.status} in ('confirmed','checked_in'))::int`,
+          // upcoming = future-dated confirmed bookings the guest hasn't arrived
+          // for yet. Currently-checked-in stays are tracked separately as
+          // inHouse so the UI doesn't conflate "future" with "now".
+          upcoming: sql<number>`count(*) filter (where ${reservations.status} = 'confirmed')::int`,
+          inHouse: sql<number>`count(*) filter (where ${reservations.status} = 'checked_in')::int`,
           cancelled: sql<number>`count(*) filter (where ${reservations.status} = 'cancelled')::int`,
-          firstStay: sql<string | null>`min(${reservations.checkInDate})`,
+          // firstStay = earliest *completed* check-in. Null until the guest
+          // has stayed at least once so "Since May 2026" doesn't appear next
+          // to "Last stay: Never" for a brand-new guest with only future
+          // bookings.
+          firstStay: sql<string | null>`min(${reservations.checkInDate}) filter (where ${reservations.status} = 'checked_out')`,
           lastStay: sql<string | null>`max(${reservations.checkOutDate}) filter (where ${reservations.status} = 'checked_out')`,
+          // First-ever booking date (any status). Used by the UI to show
+          // "First booking: …" when the guest has no completed stays yet.
+          firstBooking: sql<string | null>`min(${reservations.checkInDate})`,
         })
         .from(reservations)
         .where(eq(reservations.guestId, id)),
-      db
-        .select({
-          totalSpent: sql<number>`coalesce(sum(${invoices.totalPaid}::numeric), 0)::float`,
-          balanceDue: sql<number>`coalesce(sum(${invoices.balanceDue}::numeric) filter (where ${invoices.status} != 'voided'), 0)::float`,
-        })
-        .from(invoices)
-        .where(eq(invoices.guestId, id)),
+      // Total paid + balance due across the whole guest history.
+      //
+      // Total paid: sum of every non-voided, "received" payment on any of
+      // this guest's reservations. This catches advances taken at booking
+      // (before any invoice exists) AND post-invoice payments.
+      //
+      // Balance due: for each non-cancelled reservation, take the invoice's
+      // balance if an invoice has been issued (and is not voided); otherwise
+      // take the reservation's running balance_due. This avoids double-
+      // counting when an invoice exists and prevents under-counting when the
+      // guest has paid an advance but hasn't checked out yet (no invoice
+      // yet).
+      // Complimentary reservations are excluded from "Total paid" and
+      // "Balance due" on the guest profile. They count as stays (handled
+      // by resStats above) but their money is tracked in the
+      // Complimentary report, not the guest's lifetime spend.
+      db.execute<{ total_paid: string; balance_due: string }>(sql`
+        WITH guest_reservations AS (
+          SELECT r.id, r.status, r.balance_due, r.booking_source
+          FROM ${reservations} r
+          WHERE r.guest_id = ${id}
+            AND r.booking_source <> 'complimentary'
+        ),
+        paid AS (
+          SELECT COALESCE(SUM(p.amount::numeric), 0) AS total
+          FROM ${payments} p
+          INNER JOIN guest_reservations gr ON gr.id = p.reservation_id
+          WHERE p.voided = false AND p.status = 'received'
+        ),
+        balances AS (
+          SELECT COALESCE(SUM(
+            CASE
+              WHEN gr.status = 'cancelled' THEN 0
+              ELSE COALESCE(
+                (SELECT i.balance_due::numeric
+                 FROM ${invoices} i
+                 WHERE i.reservation_id = gr.id AND i.status != 'voided'
+                 ORDER BY i.created_at DESC
+                 LIMIT 1),
+                gr.balance_due::numeric
+              )
+            END
+          ), 0) AS total
+          FROM guest_reservations gr
+        )
+        SELECT
+          (SELECT total FROM paid)::text AS total_paid,
+          (SELECT total FROM balances)::text AS balance_due
+      `),
     ]);
+
+    const photoUrl = found[0]!.guestPhoto ? await signedKycUrl(found[0]!.guestPhoto) : null;
+    const { getGuestBalance } = await import("../lib/ledger.js");
+    const walletBalance = await getGuestBalance(id);
 
     return ok(res, {
       ...maskGuest(found[0]!, req.user!.role),
+      photoUrl,
+      walletBalance,
       stats: {
         totalStays: resStats[0]?.total ?? 0,
         completedStays: resStats[0]?.completed ?? 0,
         upcomingStays: resStats[0]?.upcoming ?? 0,
+        inHouseStays: resStats[0]?.inHouse ?? 0,
         cancelledStays: resStats[0]?.cancelled ?? 0,
         firstStay: resStats[0]?.firstStay ?? null,
         lastStay: resStats[0]?.lastStay ?? null,
-        totalSpent: paidStats[0]?.totalSpent ?? 0,
-        balanceDue: paidStats[0]?.balanceDue ?? 0,
+        firstBooking: resStats[0]?.firstBooking ?? null,
+        totalSpent: Number(
+          (paidStats as unknown as { total_paid: string }[])[0]?.total_paid ?? 0,
+        ),
+        balanceDue: Number(
+          (paidStats as unknown as { balance_due: string }[])[0]?.balance_due ?? 0,
+        ),
       },
     });
   },
@@ -248,6 +482,7 @@ router.post(
   upload.fields([
     { name: "front", maxCount: 1 },
     { name: "back", maxCount: 1 },
+    { name: "photo", maxCount: 1 },
   ]),
   async (req, res) => {
     const id = req.params.id!;
@@ -257,23 +492,40 @@ router.post(
     const files = req.files as Record<string, Express.Multer.File[]> | undefined;
     const front = files?.front?.[0];
     const back = files?.back?.[0];
-    if (!front) return fail(res, 400, "FRONT_REQUIRED", "Front of ID proof is required");
+    const photo = files?.photo?.[0];
+    if (!front && !existing[0]!.idProofPhotoFront) {
+      return fail(res, 400, "FRONT_REQUIRED", "Front of ID proof is required");
+    }
+    if (!photo && !existing[0]!.guestPhoto) {
+      return fail(res, 400, "PHOTO_REQUIRED", "Customer photo is required");
+    }
+    if (!front && !back && !photo) {
+      return fail(res, 400, "NO_FILE", "No file provided");
+    }
 
-    const frontErr = validateKycFile(front);
-    if (frontErr) return fail(res, 400, "INVALID_FILE", frontErr);
+    if (front) {
+      const frontErr = validateKycFile(front);
+      if (frontErr) return fail(res, 400, "INVALID_FILE", frontErr);
+    }
     if (back) {
       const backErr = validateKycFile(back);
       if (backErr) return fail(res, 400, "INVALID_FILE", backErr);
     }
+    if (photo) {
+      const photoErr = validateKycFile(photo);
+      if (photoErr) return fail(res, 400, "INVALID_FILE", photoErr);
+    }
 
-    const frontPath = await uploadKycPhoto(id, "front", front);
+    const frontPath = front ? await uploadKycPhoto(id, "front", front) : null;
     const backPath = back ? await uploadKycPhoto(id, "back", back) : null;
+    const photoPath = photo ? await uploadKycPhoto(id, "photo", photo) : null;
 
     const [updated] = await db
       .update(guests)
       .set({
-        idProofPhotoFront: frontPath,
+        idProofPhotoFront: frontPath ?? existing[0]!.idProofPhotoFront,
         idProofPhotoBack: backPath ?? existing[0]!.idProofPhotoBack,
+        guestPhoto: photoPath ?? existing[0]!.guestPhoto,
         kycVerifiedAt: new Date(),
         kycVerifiedBy: req.user!.id,
         updatedAt: new Date(),
@@ -294,6 +546,7 @@ router.post(
       kycVerifiedAt: updated!.kycVerifiedAt,
       idProofPhotoFront: updated!.idProofPhotoFront,
       idProofPhotoBack: updated!.idProofPhotoBack,
+      guestPhoto: updated!.guestPhoto,
     });
   },
 );
@@ -307,15 +560,17 @@ router.get(
     const found = await db.select().from(guests).where(eq(guests.id, id)).limit(1);
     if (!found.length) return fail(res, 404, "NOT_FOUND", "Guest not found");
     const g = found[0]!;
-    const [frontUrl, backUrl] = await Promise.all([
+    const [frontUrl, backUrl, photoUrl] = await Promise.all([
       g.idProofPhotoFront ? signedKycUrl(g.idProofPhotoFront) : null,
       g.idProofPhotoBack ? signedKycUrl(g.idProofPhotoBack) : null,
+      g.guestPhoto ? signedKycUrl(g.guestPhoto) : null,
     ]);
     return ok(res, {
-      verified: g.kycVerifiedAt !== null,
+      verified: g.kycVerifiedAt !== null && !!g.guestPhoto,
       kycVerifiedAt: g.kycVerifiedAt,
       frontUrl,
       backUrl,
+      photoUrl,
     });
   },
 );

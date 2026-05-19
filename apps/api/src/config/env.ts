@@ -1,5 +1,61 @@
-import "dotenv/config";
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import dotenv from "dotenv";
 import { z } from "zod";
+
+// Env-file resolution. dotenv has no built-in "mode" concept, so we layer
+// it ourselves to mirror Vite's behaviour on the web side:
+//
+//   1. .env.<NODE_ENV>.local  — machine-specific overrides (gitignored)
+//   2. .env.<NODE_ENV>        — the per-environment file (gitignored)
+//   3. .env                   — shared fallback / legacy single file
+//
+// Earlier files win because dotenv never overwrites an already-set key.
+// Real process env (set by the hosting platform) always wins over all of
+// them — so production secrets injected by the host are never clobbered
+// by a stray committed file.
+//
+// NODE_ENV is read straight from process.env here (it's set before the
+// app boots, e.g. `NODE_ENV=production node dist/index.js`). Defaults to
+// 'development' for local `npm run dev`.
+const nodeEnv = process.env.NODE_ENV ?? "development";
+
+// Resolve apps/api root regardless of how the app is launched. tsx
+// transpiles to CommonJS (no import.meta.dirname), the compiled build
+// runs as ESM, and the cwd differs between `npm run dev` (apps/api) and
+// the Docker CMD (/app). So instead of trusting one anchor, we walk up
+// from the cwd looking for the directory that owns the API package.json.
+function findApiRoot(): string {
+  let dir = process.cwd();
+  for (let i = 0; i < 6; i++) {
+    // The compiled API lives in apps/api/dist; dev runs from apps/api.
+    // Either way, apps/api/package.json is the marker we want.
+    if (existsSync(resolve(dir, "package.json"))) {
+      try {
+        const pkg = JSON.parse(
+          readFileSync(resolve(dir, "package.json"), "utf8"),
+        ) as { name?: string };
+        if (pkg.name === "@hoteldesk/api") return dir;
+      } catch {
+        // ignore unreadable package.json, keep walking
+      }
+    }
+    const parent = resolve(dir, "..");
+    if (parent === dir) break;
+    dir = parent;
+  }
+  // Fallbacks: cwd itself, then cwd/apps/api (monorepo-root launch).
+  if (existsSync(resolve(process.cwd(), "apps", "api"))) {
+    return resolve(process.cwd(), "apps", "api");
+  }
+  return process.cwd();
+}
+
+const apiRoot = findApiRoot();
+for (const file of [`.env.${nodeEnv}.local`, `.env.${nodeEnv}`, ".env"]) {
+  const path = resolve(apiRoot, file);
+  if (existsSync(path)) dotenv.config({ path });
+}
 
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
