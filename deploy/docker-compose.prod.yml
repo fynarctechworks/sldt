@@ -3,7 +3,7 @@
 # Postgres and Redis are NOT here: production uses managed Supabase
 # (Postgres + Auth) and Upstash (Redis). The web front-end is on Vercel.
 # So the only thing this VPS runs is the API container, fronted by
-# nginx (see deploy/nginx/) which terminates HTTPS for api.sldtstayinn.com.
+# nginx (see deploy/nginx/) which terminates HTTPS for api.sldt.infynarc.com.
 #
 # Usage on the VPS (run from the repo root):
 #   docker compose -f deploy/docker-compose.prod.yml up -d --build
