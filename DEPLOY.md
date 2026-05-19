@@ -165,18 +165,51 @@ It prints which migrations applied. Safe to re-run — already-applied ones skip
 
 ### 3g. nginx reverse proxy
 This adds ONE more site file — it does not touch the other apps' configs.
+First back up the existing nginx config (rollback safety net):
+```bash
+tar czf ~/nginx-backup-$(date +%F).tar.gz /etc/nginx
+```
+
+Install the site file. **Important — port 80 only at first.** nginx will
+not pass `nginx -t` with an `ssl` listener that has no certificate yet, so
+we install a port-80-only config and let certbot add the HTTPS block in 3h.
 ```bash
 sudo mkdir -p /var/www/certbot
-sudo cp deploy/nginx/api.sldt.infynarc.com.conf \
-        /etc/nginx/sites-available/api.sldt.infynarc.com.conf
+sudo tee /etc/nginx/sites-available/api.sldt.infynarc.com.conf >/dev/null <<'NGINXEOF'
+server {
+    listen 80;
+    listen [::]:80;
+    server_name api.sldt.infynarc.com;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:3010;   # match HOTELDESK_HOST_PORT
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        client_max_body_size 15m;
+        proxy_connect_timeout 10s;
+        proxy_send_timeout    60s;
+        proxy_read_timeout    60s;
+        proxy_buffering off;
+    }
+}
+NGINXEOF
 sudo ln -s /etc/nginx/sites-available/api.sldt.infynarc.com.conf \
            /etc/nginx/sites-enabled/
 ```
-**If you chose a host port other than 3010**, edit the `proxy_pass` line in
-`/etc/nginx/sites-available/api.sldt.infynarc.com.conf` to match. Then:
+**If you chose a host port other than 3010**, change the `proxy_pass` line
+above to match. Then test + reload (reload is graceful — the other apps on
+this nginx keep serving):
 ```bash
 sudo nginx -t          # must say "syntax is ok" / "test is successful"
 sudo systemctl reload nginx
+curl -s http://api.sldt.infynarc.com/health    # {"status":"ok",...}
 ```
 
 ### 3h. HTTPS via Let's Encrypt
@@ -184,8 +217,9 @@ DNS for `api.sldt.infynarc.com` already points at the VPS (step 2):
 ```bash
 sudo certbot --nginx -d api.sldt.infynarc.com
 ```
-Certbot fills the `ssl_certificate*` lines into the nginx config and reloads.
-Renewal is automatic (a systemd timer). Verify:
+certbot issues the cert AND rewrites the nginx site with a full HTTPS
+server block (real `ssl_certificate` paths) + an HTTP→HTTPS redirect,
+then reloads. Renewal is automatic (a systemd timer). Verify:
 ```bash
 curl -s https://api.sldt.infynarc.com/health    # {"status":"ok",...} over HTTPS
 ```
