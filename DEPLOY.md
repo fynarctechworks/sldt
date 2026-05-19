@@ -4,19 +4,24 @@ Production architecture:
 
 ```
   sldt.infynarc.com       ──▶  Vercel Pro          ──▶  web (Vite static build)
-  api.sldt.infynarc.com   ──▶  Hostinger VPS       ──▶  nginx (HTTPS) ──▶ Docker container :3000  ──▶ API
+  api.sldt.infynarc.com   ──▶  Hostinger VPS       ──▶  nginx (HTTPS) ──▶ Docker container  ──▶ API
                                                                   │
                                           Supabase (Postgres + Auth)  +  Upstash (Redis)
 ```
 
 - **Web** → Vercel Pro (static SPA) at `sldt.infynarc.com`.
-- **API** → Hostinger VPS at `api.sldt.infynarc.com`, running as a Docker
-  container, fronted by nginx which terminates HTTPS.
+- **API** → Hostinger VPS (`187.127.129.90`) at `api.sldt.infynarc.com`,
+  running as a Docker container, fronted by nginx which terminates HTTPS.
 - **Database / Auth** → the existing Supabase project (reused for production).
 - **Redis** → the existing Upstash instance (reused for production).
-- **DNS** → the `infynarc.com` zone is managed by **Vercel DNS** (nameservers
-  `ns1.vercel-dns.com` / `ns2.vercel-dns.com`). All records — web *and* API —
-  are added inside the Vercel DNS panel.
+- **DNS** → the `infynarc.com` zone is already managed by **Vercel DNS**.
+  The records for this app **already exist** (see step 2) — no DNS work needed.
+
+> **Shared VPS.** `187.127.129.90` already hosts other apps' APIs
+> (`api.infynarc.com`, `bmsapi.infynarc.com`). nginx routes them by
+> hostname, so the Hoteldesk API just becomes one more nginx site + one
+> more Docker container. The only thing to get right is the **port** —
+> see step 3d.
 
 Only the **API** and the **web bundle** are deployed by you. The data layer is
 already cloud-hosted.
@@ -25,10 +30,10 @@ already cloud-hosted.
 
 ## 0. One-time prerequisites
 
-- The `infynarc.com` domain, with its nameservers pointed at Vercel.
-- Hostinger VPS with SSH access and a public IP (call it `VPS_IP`).
-- Vercel Pro account, GitHub repo connected.
+- SSH access to the Hostinger VPS `187.127.129.90`.
+- Vercel Pro account — the `sldt` project is already connected to the repo.
 - The two production env files filled in (see step 1).
+- DNS is already done (step 2 is just verification).
 
 ---
 
@@ -61,49 +66,43 @@ Already set: `VITE_API_URL=https://api.sldt.infynarc.com/api/v1`, Supabase URL
 
 ---
 
-## 2. DNS records (in the Vercel DNS panel)
+## 2. DNS — already configured (just verify)
 
-Because `infynarc.com`'s nameservers point at Vercel, all DNS records live in
-Vercel. Go to the Vercel team → **Domains → infynarc.com** (or the project's
-Domains tab) and add:
+`infynarc.com` DNS is managed in Vercel and the records this app needs
+**already exist**:
 
-| Type  | Name        | Value                  | Purpose                |
-|-------|-------------|------------------------|------------------------|
-| CNAME | `sldt`      | `cname.vercel-dns.com` | web → Vercel           |
-| A     | `api.sldt`  | `VPS_IP`               | API → Hostinger VPS    |
+| Record               | Type  | Points to            | Purpose       |
+|----------------------|-------|----------------------|---------------|
+| `sldt.infynarc.com`  | —     | Vercel `sldt` project| web           |
+| `api.sldt.infynarc.com` | A  | `187.127.129.90`     | API → the VPS |
 
-Notes:
-- The `sldt` CNAME is what makes `sldt.infynarc.com` resolve to your Vercel
-  project. (Vercel may add this automatically when you attach the domain to
-  the project in step 4c — check before adding a duplicate.)
-- The `api.sldt` A-record points the API subdomain straight at the VPS.
-  Vercel only proxies the records it serves for projects; a plain A-record is
-  passed through to your VPS as-is.
-
-Wait for `api.sldt.infynarc.com` to resolve to `VPS_IP` before the SSL step.
-Check from the VPS or locally:
+Confirm `api.sldt` resolves before the SSL step:
 ```bash
-dig +short api.sldt.infynarc.com      # should print VPS_IP
+dig +short api.sldt.infynarc.com      # should print 187.127.129.90
 ```
+
+If it does, skip ahead — there is no DNS to add.
 
 ---
 
 ## 3. Deploy the API to the Hostinger VPS
 
-SSH in as a sudo-capable user.
+SSH in as a sudo-capable user. This VPS already runs other apps, so most
+tooling is likely installed — the steps below are safe to run regardless
+(they no-op if a package is already present).
 
-### 3a. Install Docker + nginx + certbot
+### 3a. Ensure Docker + nginx + certbot are present
 ```bash
-# Docker (official convenience script)
-curl -fsSL https://get.docker.com | sh
-sudo usermod -aG docker $USER          # re-login after this for non-sudo docker
+# Docker — skip if `docker --version` already works.
+command -v docker >/dev/null || curl -fsSL https://get.docker.com | sh
 
-# nginx + certbot
+# nginx + certbot + git — apt install is a no-op if already installed.
 sudo apt-get update
 sudo apt-get install -y nginx certbot python3-certbot-nginx git
 ```
 
 ### 3b. Get the code onto the VPS
+Put it in its own directory so it never collides with the other apps:
 ```bash
 cd /opt
 sudo git clone <YOUR_REPO_URL> hoteldesk
@@ -116,7 +115,7 @@ cd hoteldesk
 from your machine, or create it on the VPS:
 ```bash
 # from your local machine:
-scp apps/api/.env.production  user@VPS_IP:/opt/hoteldesk/apps/api/.env.production
+scp apps/api/.env.production  user@187.127.129.90:/opt/hoteldesk/apps/api/.env.production
 ```
 Or `nano apps/api/.env.production` on the VPS and paste the filled contents.
 Lock it down:
@@ -124,19 +123,35 @@ Lock it down:
 chmod 600 apps/api/.env.production
 ```
 
-### 3d. Build & start the API container
+### 3d. Pick a free host port (IMPORTANT — shared VPS)
+The other apps on this VPS may already use port 3000. List what's listening:
+```bash
+sudo ss -tlnp | grep LISTEN
+docker ps --format 'table {{.Names}}\t{{.Ports}}'
+```
+Choose a port that does NOT appear in that output. The Hoteldesk compose
+file defaults to **3010** — if 3010 is free, you're done, do nothing.
+If 3010 is taken, export your chosen port before the next step:
+```bash
+export HOTELDESK_HOST_PORT=3011        # example — use any free port
+```
+> Whatever port you settle on, it must match the `proxy_pass` line in the
+> nginx config (step 3f). The default in both files is 3010.
+
+### 3e. Build & start the API container
 ```bash
 cd /opt/hoteldesk
 docker compose -f deploy/docker-compose.prod.yml up -d --build
 ```
-First build takes a few minutes (it installs Chromium + fonts). Check it:
+First build takes a few minutes (it installs Chromium + fonts). Check it —
+substitute your chosen port for `3010`:
 ```bash
-docker compose -f deploy/docker-compose.prod.yml ps          # State should be "healthy"
-docker compose -f deploy/docker-compose.prod.yml logs -f api # watch the boot log
-curl -s http://127.0.0.1:3000/health                         # {"status":"ok",...}
+docker compose -f deploy/docker-compose.prod.yml ps           # State "healthy"
+docker compose -f deploy/docker-compose.prod.yml logs -f api  # watch the boot log
+curl -s http://127.0.0.1:3010/health                          # {"status":"ok",...}
 ```
 
-### 3e. Apply database migrations
+### 3f. Apply database migrations
 The Supabase DB needs the latest schema. Run the migration script once,
 from inside the container (it has the script + `DATABASE_URL`):
 ```bash
@@ -148,19 +163,24 @@ It prints which migrations applied. Safe to re-run — already-applied ones skip
 > Since production reuses the dev Supabase project, the schema is likely
 > already up to date. The script will just report "already applied".
 
-### 3f. nginx reverse proxy
+### 3g. nginx reverse proxy
+This adds ONE more site file — it does not touch the other apps' configs.
 ```bash
 sudo mkdir -p /var/www/certbot
 sudo cp deploy/nginx/api.sldt.infynarc.com.conf \
         /etc/nginx/sites-available/api.sldt.infynarc.com.conf
 sudo ln -s /etc/nginx/sites-available/api.sldt.infynarc.com.conf \
            /etc/nginx/sites-enabled/
+```
+**If you chose a host port other than 3010**, edit the `proxy_pass` line in
+`/etc/nginx/sites-available/api.sldt.infynarc.com.conf` to match. Then:
+```bash
 sudo nginx -t          # must say "syntax is ok" / "test is successful"
 sudo systemctl reload nginx
 ```
 
-### 3g. HTTPS via Let's Encrypt
-With DNS for `api.sldt.infynarc.com` already pointing at the VPS:
+### 3h. HTTPS via Let's Encrypt
+DNS for `api.sldt.infynarc.com` already points at the VPS (step 2):
 ```bash
 sudo certbot --nginx -d api.sldt.infynarc.com
 ```
@@ -170,14 +190,15 @@ Renewal is automatic (a systemd timer). Verify:
 curl -s https://api.sldt.infynarc.com/health    # {"status":"ok",...} over HTTPS
 ```
 
-### 3h. Firewall (if using ufw)
+### 3i. Firewall
+The other apps already serve over HTTPS, so 80/443 are almost certainly
+open already. If ufw is in use, these are no-ops if the rules exist:
 ```bash
 sudo ufw allow OpenSSH
 sudo ufw allow 'Nginx Full'    # opens 80 + 443
-sudo ufw enable
 ```
-Port 3000 is **not** opened — the container binds to `127.0.0.1` only, nginx
-is the public door.
+The Hoteldesk container's host port is **not** opened — it binds to
+`127.0.0.1` only, and nginx is the public door.
 
 ---
 
@@ -263,8 +284,9 @@ near-zero downtime. The old container is stopped only after the new one is up.
 |---|---|
 | Web loads but every API call fails (CORS) | `FRONTEND_URL` in `apps/api/.env.production` must exactly equal `https://sldt.infynarc.com` (no trailing slash, right scheme). Restart the container after editing. |
 | Container shows `unhealthy` | `docker compose -f deploy/docker-compose.prod.yml logs api` — usually a bad env value (DB unreachable, malformed `ENCRYPTION_KEY`). The env schema prints exactly which key failed. |
-| `502 Bad Gateway` from nginx | API container isn't up, or not on `127.0.0.1:3000`. Check `docker ps` and `curl http://127.0.0.1:3000/health` on the VPS. |
+| `502 Bad Gateway` from nginx | API container isn't up, or the nginx `proxy_pass` port doesn't match the container's host port. Check `docker ps` and `curl http://127.0.0.1:<HOST_PORT>/health` on the VPS — the port in the nginx config must equal `HOTELDESK_HOST_PORT` (default 3010). |
 | Vercel domain stuck on "Invalid Configuration" | The `sldt` CNAME hasn't propagated, or a conflicting record exists in the Vercel DNS panel. Re-check the record and hit Refresh. |
 | PDF preview hangs / errors | Chromium issue in the container — `docker compose ... logs api` around the request. The image bundles Chromium + fonts; a clean rebuild usually fixes a corrupted layer. |
 | Login redirects to localhost | Supabase Auth URL Configuration not updated — see step 5. |
-| certbot fails | DNS for `api.sldt.infynarc.com` not yet pointing at `VPS_IP` (the `api.sldt` A-record), or port 80 blocked by the firewall. |
+| certbot fails | DNS for `api.sldt.infynarc.com` not resolving to `187.127.129.90` yet, or port 80 blocked. Other apps on this VPS already use 80/443, so this is unlikely — check `dig +short api.sldt.infynarc.com`. |
+| Port collision on `up` ("address already in use") | Another app on the VPS holds the chosen host port. Pick a free one (`sudo ss -tlnp`), `export HOTELDESK_HOST_PORT=<free>`, re-run `up`, and update the nginx `proxy_pass` to match. |
