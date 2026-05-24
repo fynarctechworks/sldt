@@ -22,6 +22,11 @@ import { db } from "../db/client.js";
 import { additionalCharges, invoiceLineItems, invoices, payments } from "../db/schema/invoices.js";
 import { reservationRooms, reservations } from "../db/schema/reservations.js";
 import { rooms } from "../db/schema/rooms.js";
+import {
+  DEFAULT_TASK_STEPS,
+  housekeepingTaskSteps,
+  housekeepingTasks,
+} from "../db/schema/housekeepingTasks.js";
 import { roomTypes } from "../db/schema/settings.js";
 import { combinedRoomTypeLabel, type RoomTypeLabelMap } from "../lib/roomTypeLabel.js";
 import { logActivity } from "../lib/activity.js";
@@ -34,7 +39,11 @@ import {
   nextInvoiceSequence,
 } from "../lib/availability.js";
 import { getGuestBalance } from "../lib/ledger.js";
+import { resolveCurrentPropertyId } from "../lib/currentProperty.js";
+import { resolveAverageRate } from "../lib/ratePlanResolve.js";
 import { calcGstBreakdown, getGstRate } from "../lib/gst.js";
+import { ratePlans } from "../db/schema/ratePlans.js";
+import { companies } from "../db/schema/companies.js";
 import { invoiceNumber, reservationNumber } from "../lib/numbers.js";
 import { hashOtp } from "../lib/otp.js";
 import { renderInvoicePdf, renderReceiptPdf } from "../lib/pdf.js";
@@ -70,17 +79,29 @@ router.get(
   requirePermission("view_reservations"),
   validate(reservationListQuerySchema, "query"),
   async (req, res) => {
-    const { status, date, q, date_from, date_to, include_complimentary, page, per_page } =
-      req.query as unknown as {
-        status?: string;
-        date?: string;
-        q?: string;
-        date_from?: string;
-        date_to?: string;
-        include_complimentary?: boolean;
-        page: number;
-        per_page: number;
-      };
+    const {
+      status,
+      date,
+      q,
+      date_from,
+      date_to,
+      room_id,
+      floor,
+      include_complimentary,
+      page,
+      per_page,
+    } = req.query as unknown as {
+      status?: string;
+      date?: string;
+      q?: string;
+      date_from?: string;
+      date_to?: string;
+      room_id?: string;
+      floor?: number;
+      include_complimentary?: boolean;
+      page: number;
+      per_page: number;
+    };
     const conditions = [];
     if (status) conditions.push(eq(reservations.status, status as never));
     if (date) {
@@ -93,6 +114,29 @@ router.get(
       const like = `%${q}%`;
       conditions.push(
         sql`(${reservations.reservationNumber} ILIKE ${like} OR ${guests.fullName} ILIKE ${like} OR ${guests.phone} ILIKE ${like})`,
+      );
+    }
+    // Room / floor filters. EXISTS subqueries against reservation_rooms +
+    // rooms so multi-room reservations match when ANY of their rooms
+    // satisfies the filter. We don't add a JOIN to the main query
+    // because that would force DISTINCT on every other path.
+    if (room_id) {
+      conditions.push(
+        sql`EXISTS (
+          SELECT 1 FROM ${reservationRooms} rr
+          WHERE rr.reservation_id = ${reservations.id}
+            AND rr.room_id = ${room_id}::uuid
+        )`,
+      );
+    }
+    if (floor !== undefined) {
+      conditions.push(
+        sql`EXISTS (
+          SELECT 1 FROM ${reservationRooms} rr
+          JOIN ${rooms} rm ON rm.id = rr.room_id
+          WHERE rr.reservation_id = ${reservations.id}
+            AND rm.floor = ${floor}
+        )`,
       );
     }
     // Hide complimentary bookings from the main list by default — they
@@ -252,7 +296,34 @@ router.post(
       return fail(res, 400, "OTP_REQUIRED", "OTP verification required before booking");
     }
 
+    // Blacklist guard. Reject before any availability / pricing work
+    // so a blacklisted guest can't even probe inventory. Returns 403
+    // with the audit reason so the desk staff knows what to tell them.
+    const [guestRow] = await db
+      .select({
+        isBlacklisted: guests.isBlacklisted,
+        blacklistReason: guests.blacklistReason,
+      })
+      .from(guests)
+      .where(eq(guests.id, input.guestId))
+      .limit(1);
+    if (!guestRow) {
+      return fail(res, 404, "GUEST_NOT_FOUND", "Guest not found");
+    }
+    if (guestRow.isBlacklisted) {
+      return fail(
+        res,
+        403,
+        "GUEST_BLACKLISTED",
+        `This guest is blacklisted${guestRow.blacklistReason ? ` (${guestRow.blacklistReason})` : ""}. An admin must clear the blacklist before booking.`,
+      );
+    }
+
     const roomIds = input.rooms.map((r) => r.roomId);
+
+    // Phase 2: every new reservation + its payments are scoped to the
+    // current property. Resolved once and threaded through the tx.
+    const propertyId = await resolveCurrentPropertyId(req);
 
     const settings = await getSettings();
     const stayType = input.stayType ?? "overnight";
@@ -286,6 +357,72 @@ router.post(
       if (nights < 1) {
         return fail(res, 400, "INVALID_DATES", "Check-out must be at least 1 day after check-in");
       }
+    }
+
+    // Phase 2: if the caller supplied a ratePlanId, look up its code
+    // (snapshotted onto the reservation) and recompute each room's
+    // per-night rate from the rate calendar. Overnight stays only —
+    // day-use carries its own flat-price band system and is not
+    // touched. Short-stay's input rate is left as the source of truth.
+    let ratePlanCode: string | null = null;
+    if (input.ratePlanId && !isShortStay) {
+      const [plan] = await db
+        .select({ code: ratePlans.code, propertyId: ratePlans.propertyId, isActive: ratePlans.isActive })
+        .from(ratePlans)
+        .where(eq(ratePlans.id, input.ratePlanId))
+        .limit(1);
+      if (!plan) {
+        return fail(res, 404, "RATE_PLAN_NOT_FOUND", "Rate plan not found");
+      }
+      if (!plan.isActive) {
+        return fail(res, 409, "RATE_PLAN_INACTIVE", "Rate plan is inactive");
+      }
+      if (plan.propertyId !== propertyId) {
+        return fail(res, 403, "CROSS_PROPERTY", "Rate plan belongs to a different property");
+      }
+      ratePlanCode = plan.code;
+      // Override each room's ratePerNight in-place via the resolver.
+      // resolveAverageRate handles the "stay straddles a weekend
+      // surcharge" case correctly by averaging across nights, AND
+      // applies Phase 3 pricing rules on top (occupancy, LOS, etc.).
+      for (const r of input.rooms) {
+        const [roomRow] = await db
+          .select({ roomType: rooms.roomType })
+          .from(rooms)
+          .where(eq(rooms.id, r.roomId))
+          .limit(1);
+        if (!roomRow) continue;
+        const avg = await resolveAverageRate({
+          propertyId,
+          ratePlanId: input.ratePlanId,
+          roomId: r.roomId,
+          roomType: roomRow.roomType,
+          checkInDate: input.checkInDate,
+          checkOutDate: input.checkOutDate,
+        });
+        r.ratePerNight = avg;
+      }
+    }
+
+    // Phase 2: optional company snapshot. Same property scoping check
+    // as the rate plan above.
+    let companyCode: string | null = null;
+    if (input.companyId) {
+      const [cmp] = await db
+        .select({
+          code: companies.code,
+          propertyId: companies.propertyId,
+          isActive: companies.isActive,
+        })
+        .from(companies)
+        .where(eq(companies.id, input.companyId))
+        .limit(1);
+      if (!cmp) return fail(res, 404, "COMPANY_NOT_FOUND", "Company not found");
+      if (!cmp.isActive) return fail(res, 409, "COMPANY_ARCHIVED", "Company is archived");
+      if (cmp.propertyId !== propertyId) {
+        return fail(res, 403, "CROSS_PROPERTY", "Company belongs to a different property");
+      }
+      companyCode = cmp.code;
     }
 
     // The user-typed rate is the grand-total amount per room when the
@@ -395,6 +532,7 @@ router.post(
           .insert(reservations)
           .values({
             reservationNumber: resNumber,
+            propertyId,
             guestId: input.guestId,
             checkInDate: input.checkInDate,
             checkOutDate: input.checkOutDate,
@@ -418,6 +556,12 @@ router.post(
             bookingSource: input.bookingSource ?? "walkin",
             creditNotes: input.creditNotes ?? null,
             specialRequests: composedSpecial,
+            // Phase 2 — rate plan / company / group attribution.
+            ratePlanId: input.ratePlanId ?? null,
+            ratePlanCode,
+            companyId: input.companyId ?? null,
+            companyCode,
+            groupBlockId: input.groupBlockId ?? null,
             createdBy: req.user!.id,
           })
           .returning();
@@ -449,16 +593,28 @@ router.post(
           .set({ status: "reserved", updatedAt: new Date() })
           .where(inArray(rooms.id, roomIds));
 
-        if (input.advancePaid > 0 && input.advancePaymentMethod) {
+        // Always issue a receipt at booking, even when no advance is
+        // collected. ₹0 receipts use 'cash' as a placeholder method and
+        // carry a different note so reports can distinguish them. The
+        // receipt-number sequence is shared with paid receipts.
+        {
           const rcpNum = await generateReceiptNumber(tx);
+          const amount = input.advancePaid > 0 ? input.advancePaid : 0;
+          const method =
+            input.advancePaid > 0 && input.advancePaymentMethod
+              ? input.advancePaymentMethod
+              : "cash";
+          const notes =
+            input.advancePaid > 0 ? "Advance at booking" : "Booking — no advance collected";
           await tx.insert(payments).values({
             receiptNumber: rcpNum,
+            propertyId,
             invoiceId: null,
             reservationId: r!.id,
-            amount: String(input.advancePaid),
-            paymentMethod: input.advancePaymentMethod,
+            amount: String(amount),
+            paymentMethod: method,
             receivedBy: req.user!.id,
-            notes: "Advance at booking",
+            notes,
           });
         }
 
@@ -516,18 +672,24 @@ router.post(
           .limit(1);
 
         // Always dispatch the in-app notification.
+        const bookedRooms = await getReservationRoomNumbers(createdReservation.id);
+        const roomSuffix = bookedRooms ? ` · Room ${bookedRooms}` : "";
         await dispatchNotification({
           type: "reservation_created",
           title: "New booking",
-          body: `${createdReservation.reservationNumber} for ${g?.fullName ?? "guest"} (${createdReservation.checkInDate} to ${createdReservation.checkOutDate})`,
+          body: `${createdReservation.reservationNumber} for ${g?.fullName ?? "guest"}${roomSuffix} (${createdReservation.checkInDate} to ${createdReservation.checkOutDate})`,
           href: `/reservations/${createdReservation.id}`,
           payload: { reservationId: createdReservation.id },
           recipientRoles: ["admin", "frontdesk"],
         });
 
-        // If an advance was collected at booking, render its receipt PDF, upload
-        // it, and send the receipt link to the guest (and the owner notification).
-        if (input.advancePaid > 0 && input.advancePaymentMethod) {
+        // Always render the booking receipt — paid or not. ₹0 advances
+        // produce a receipt that says "Amount Received ₹0.00, Balance Due
+        // <grand total>". The existing booking_advance_* templates are
+        // reused; their copy already reads naturally for the ₹0 case
+        // since they reference advance_paid + balance, both of which are
+        // accurate in either path.
+        {
           let receiptLink = "";
           try {
             const [latestPayment] = await db
@@ -554,7 +716,7 @@ router.post(
           } catch (err) {
             logger.warn(
               { err, reservationId: createdReservation.id },
-              "booking-advance receipt PDF render/upload failed",
+              "booking receipt PDF render/upload failed",
             );
           }
 
@@ -952,16 +1114,24 @@ router.post(
         .set({ status: "occupied", updatedAt: new Date() })
         .where(inArray(rooms.id, roomIds));
 
-      if ((input.advancePayment ?? 0) > 0 && input.paymentMethod) {
+      // Always issue a check-in receipt — paid or not. ₹0 advances at
+      // check-in get a receipt with method='cash' so staff have a printable
+      // acknowledgement for the guest even when no payment is collected.
+      {
         const rcpNum = await generateReceiptNumber(tx);
+        const advance = input.advancePayment ?? 0;
+        const amount = advance > 0 ? advance : 0;
+        const method = advance > 0 && input.paymentMethod ? input.paymentMethod : "cash";
+        const notes = advance > 0 ? "Advance at check-in" : "Check-in — no advance collected";
         await tx.insert(payments).values({
           receiptNumber: rcpNum,
+          propertyId: r[0]!.propertyId,
           invoiceId: null,
           reservationId: id,
-          amount: String(input.advancePayment),
-          paymentMethod: input.paymentMethod,
+          amount: String(amount),
+          paymentMethod: method,
           receivedBy: req.user!.id,
-          notes: "Advance at check-in",
+          notes,
         });
       }
     });
@@ -997,33 +1167,33 @@ router.post(
 
         const settings = await getSettings();
 
-        // If an advance payment was just recorded, render & upload its receipt PDF
+        // Always render the check-in receipt PDF — paid or not. The
+        // payment row was inserted above regardless of advance amount, so
+        // there's always exactly one fresh row to render.
         let receiptLink = "";
-        if ((input.advancePayment ?? 0) > 0) {
-          try {
-            const [latestPayment] = await db
-              .select()
-              .from(payments)
-              .where(eq(payments.reservationId, id))
-              .orderBy(desc(payments.createdAt))
-              .limit(1);
-            if (latestPayment) {
-              const pdf = await renderReceiptPdf({
-                payment: latestPayment,
-                reservation: r[0]!,
-                guest: g!,
-                invoice: null,
-                settings,
-              });
-              const url = await uploadPublicPdf(
-                `receipts/${latestPayment.receiptNumber ?? latestPayment.id}.pdf`,
-                pdf,
-              );
-              if (url) receiptLink = url;
-            }
-          } catch (err) {
-            logger.warn({ err, reservationId: id }, "check-in receipt PDF render/upload failed");
+        try {
+          const [latestPayment] = await db
+            .select()
+            .from(payments)
+            .where(eq(payments.reservationId, id))
+            .orderBy(desc(payments.createdAt))
+            .limit(1);
+          if (latestPayment) {
+            const pdf = await renderReceiptPdf({
+              payment: latestPayment,
+              reservation: r[0]!,
+              guest: g!,
+              invoice: null,
+              settings,
+            });
+            const url = await uploadPublicPdf(
+              `receipts/${latestPayment.receiptNumber ?? latestPayment.id}.pdf`,
+              pdf,
+            );
+            if (url) receiptLink = url;
           }
+        } catch (err) {
+          logger.warn({ err, reservationId: id }, "check-in receipt PDF render/upload failed");
         }
 
         const wifiBlock =
@@ -1054,7 +1224,7 @@ router.post(
         await dispatchNotification({
           type: "guest_checked_in",
           title: "Guest checked in",
-          body: `${g?.fullName ?? "Guest"} checked in (${r[0]!.reservationNumber})`,
+          body: `${g?.fullName ?? "Guest"} checked in (${r[0]!.reservationNumber}${roomNumbers ? ` · Room ${roomNumbers}` : ""})`,
           href: `/reservations/${id}`,
           payload: { reservationId: id },
           recipientRoles: ["admin", "frontdesk", "housekeeping"],
@@ -1252,6 +1422,7 @@ router.post(
         .insert(invoices)
         .values({
           invoiceNumber: invNumber,
+          propertyId: r[0]!.propertyId,
           reservationId: id,
           guestId: r[0]!.guestId,
           hotelName: settings.hotelName,
@@ -1287,6 +1458,7 @@ router.post(
         const rcpNum = await generateReceiptNumber(tx);
         await tx.insert(payments).values({
           receiptNumber: rcpNum,
+          propertyId: r[0]!.propertyId,
           invoiceId: inv!.id,
           reservationId: id,
           amount: String(finalPayment),
@@ -1322,11 +1494,39 @@ router.post(
         })
         .where(eq(reservations.id, id));
 
-      const roomIds = resRooms.map((x) => x.room.id);
+      const checkoutRoomIds = resRooms.map((x) => x.room.id);
       await tx
         .update(rooms)
         .set({ status: "dirty", updatedAt: new Date() })
-        .where(inArray(rooms.id, roomIds));
+        .where(inArray(rooms.id, checkoutRoomIds));
+
+      // Phase 2: auto-create a checkout-clean housekeeping task per
+      // vacated room with the default checklist. Inside the same tx so
+      // the task only exists if checkout actually committed. Idempotent
+      // per (reservation, room) — a re-run won't duplicate.
+      for (const roomId of checkoutRoomIds) {
+        const [hkTask] = await tx
+          .insert(housekeepingTasks)
+          .values({
+            propertyId: r[0]!.propertyId,
+            roomId,
+            reservationId: id,
+            taskType: "checkout_clean",
+            status: "pending",
+            priority: 70,
+            createdBy: req.user!.id,
+          })
+          .returning({ id: housekeepingTasks.id });
+        if (hkTask) {
+          await tx.insert(housekeepingTaskSteps).values(
+            DEFAULT_TASK_STEPS.checkout_clean.map((label, i) => ({
+              taskId: hkTask.id,
+              label,
+              sortOrder: (i + 1) * 10,
+            })),
+          );
+        }
+      }
 
       return inv!;
     });
@@ -1386,10 +1586,12 @@ router.post(
           total: r[0]!.grandTotal,
         };
 
+        const checkedOutRooms = await getReservationRoomNumbers(id);
+        const coRoomSuffix = checkedOutRooms ? ` · Room ${checkedOutRooms}` : "";
         await dispatchNotification({
           type: "guest_checked_out",
           title: "Guest checked out",
-          body: `${g?.fullName ?? "Guest"} (${r[0]!.reservationNumber}). Invoice ${invNumber}.`,
+          body: `${g?.fullName ?? "Guest"} (${r[0]!.reservationNumber}${coRoomSuffix}). Invoice ${invNumber}.`,
           href: `/reservations/${id}`,
           payload: { reservationId: id, invoiceNumber: invNumber, invoiceLink },
           recipientRoles: ["admin", "frontdesk", "housekeeping"],
@@ -1400,6 +1602,38 @@ router.post(
         }
         const ownerT = await renderTemplate("checkout_owner_sms", baseVars);
         if (ownerT.enabled) await notifyOwner(ownerT.body);
+
+        // Phase 5 — review automation. We schedule a follow-up review
+        // prompt 4 hours after checkout (long enough for the guest to
+        // have gotten home + settled in, short enough to be on the same
+        // day they remember the stay). The link points to GOOGLE_REVIEW_URL
+        // if set; otherwise we send the bare prompt.
+        //
+        // NOTE: this uses setTimeout, which is in-process and lost on
+        // restart. For a busier property, swap for a job queue.
+        if (g?.phone) {
+          const reviewLink = (env.GOOGLE_REVIEW_URL ?? "").trim();
+          const reviewVars = {
+            ...baseVars,
+            review_link: reviewLink,
+          };
+          const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
+          setTimeout(() => {
+            void (async () => {
+              try {
+                const t = await renderTemplate("review_prompt_guest_sms", reviewVars);
+                if (t.enabled && g.phone) {
+                  await notifyGuestSms({ to: g.phone, text: t.body });
+                }
+              } catch (e) {
+                logger.warn(
+                  { err: e, reservationId: id },
+                  "review-prompt send failed",
+                );
+              }
+            })();
+          }, FOUR_HOURS_MS).unref();
+        }
       } catch (err) {
         logger.warn({ err, reservationId: id }, "post-check-out notification failed");
       }
@@ -1791,23 +2025,98 @@ router.post(
       }
     }
 
-    const perRoomRate = input.ratePerNight ?? Number(current.ratePerNight);
+    // Number of NEW nights being added (the extension window only).
+    const extraNights = differenceInCalendarDays(
+      new Date(input.newCheckOutDate),
+      new Date(current.checkOutDate),
+    );
 
+    // Pricing model for the extension:
+    //   - The existing nights keep their rate. We do NOT touch
+    //     reservation_rooms.ratePerNight, so recalcReservation continues
+    //     to bill the room at its original rate for ALL nights (including
+    //     the new ones at the original rate).
+    //   - If the staff agreed a DIFFERENT rate for the new night(s), we
+    //     don't re-rate the whole stay. Instead we add a single
+    //     "Stay extension" additional_charge for the DELTA only:
+    //         extraNights × (newRate − roomRate) × roomCount
+    //     Added to the room line (original rate × all nights), this
+    //     yields exactly: oldNights×oldRate + newNights×newRate.
+    //   - If no rate (or the same rate) is given, the new nights simply
+    //     bill at the existing room rate and no extra charge is created.
+    //
+    // The delta charge is taxed at the same GST slab as the room so the
+    // extra night is treated consistently with the rest of the stay.
+    //
+    // GST MODE: the extension must honour the reservation's GST mode so
+    // it matches the rest of the bill.
+    //   - exclusive: the agreed per-night rate is NET. The delta is net
+    //     and we store it as-is; recalcReservation adds GST on top.
+    //   - inclusive: the agreed per-night rate is GROSS (all-in). The
+    //     guest expects ₹2,000/night to mean ₹2,000 including tax, same
+    //     as the room nights. But recalcReservation always treats a
+    //     charge's stored `amount` as NET and re-adds GST on top. So we
+    //     extract the NET portion from the gross delta here, store that;
+    //     recalc then adds the GST back → the line totals to the gross
+    //     the guest agreed to. Net result: identical tax treatment to
+    //     the inclusive-mode room nights.
+    const settings = await getSettings();
+    const reservationGstMode = current.gstMode ?? "exclusive";
+    let extensionChargeId: string | null = null;
+    if (input.ratePerNight && assigned.length > 0) {
+      // Per-room delta vs each room's own rate (rooms can differ). This
+      // delta is in the SAME mode as the rates (gross if inclusive, net
+      // if exclusive) because both sides of the subtraction are in that
+      // mode.
+      let deltaAmount = 0;
+      for (const rm of assigned) {
+        const delta = (input.ratePerNight - Number(rm.ratePerNight)) * extraNights;
+        deltaAmount += delta;
+      }
+      deltaAmount = +deltaAmount.toFixed(2);
+
+      // Only create a charge if the agreed rate actually differs. A zero
+      // or negative-rounding delta means "same rate" → nothing to add.
+      if (Math.abs(deltaAmount) > 0.009) {
+        const gstRate = getGstRate(input.ratePerNight, {
+          exemptBelow: Number(settings.gstSlabExemptBelow),
+          lowRate: Number(settings.gstSlabLowRate),
+          lowMax: Number(settings.gstSlabLowMax),
+          highRate: Number(settings.gstSlabHighRate),
+        });
+        // In inclusive mode, convert the gross delta to its net portion
+        // so recalc's add-GST-on-top yields the original gross. In
+        // exclusive mode the delta is already net — store as-is.
+        const storedAmount =
+          reservationGstMode === "inclusive"
+            ? calcGstBreakdown(deltaAmount, gstRate, "inclusive").subtotal
+            : deltaAmount;
+        const nightWord = extraNights === 1 ? "night" : "nights";
+        const [charge] = await db
+          .insert(additionalCharges)
+          .values({
+            reservationId: id,
+            description: `Stay extension — ${extraNights} ${nightWord} @ ₹${input.ratePerNight.toFixed(2)}/night${reservationGstMode === "inclusive" ? " (incl. GST)" : ""}`,
+            quantity: 1,
+            rate: String(storedAmount.toFixed(2)),
+            amount: String(storedAmount.toFixed(2)),
+            gstRate: String(gstRate),
+            addedBy: req.user!.id,
+          })
+          .returning();
+        extensionChargeId = charge?.id ?? null;
+      }
+    }
+
+    // Extend the dates only. The room rate is intentionally left as-is so
+    // existing nights aren't re-priced.
     await db
       .update(reservations)
       .set({
         checkOutDate: input.newCheckOutDate,
-        ratePerNight: String(perRoomRate.toFixed(2)),
         updatedAt: new Date(),
       })
       .where(eq(reservations.id, id));
-
-    if (input.ratePerNight) {
-      await db
-        .update(reservationRooms)
-        .set({ ratePerNight: String(input.ratePerNight) })
-        .where(eq(reservationRooms.reservationId, id));
-    }
 
     await recalcReservation(id);
     const [updated] = await db
@@ -1820,10 +2129,18 @@ router.post(
       action: "reservation_extended",
       entityType: "reservation",
       entityId: id,
-      description: `${current.reservationNumber} extended to ${input.newCheckOutDate}`,
+      description: input.ratePerNight
+        ? `${current.reservationNumber} extended to ${input.newCheckOutDate} (+${extraNights} night${extraNights === 1 ? "" : "s"} @ ₹${input.ratePerNight.toFixed(2)})`
+        : `${current.reservationNumber} extended to ${input.newCheckOutDate} (+${extraNights} night${extraNights === 1 ? "" : "s"} at existing rate)`,
       performedBy: req.user!.id,
       ipAddress: req.ip,
-      metadata: { oldCheckOut: current.checkOutDate, newCheckOut: input.newCheckOutDate },
+      metadata: {
+        oldCheckOut: current.checkOutDate,
+        newCheckOut: input.newCheckOutDate,
+        extraNights,
+        extensionRate: input.ratePerNight ?? null,
+        extensionChargeId,
+      },
     });
     await invalidateDashboard();
     return ok(res, updated);
@@ -2021,6 +2338,16 @@ router.post(
     return ok(res, { success: true, addedSubtotal: addedRoomAmount, newGrandTotal: grandTotal }, 201);
   },
 );
+
+async function getReservationRoomNumbers(reservationId: string): Promise<string> {
+  const rows = await db
+    .select({ roomNumber: rooms.roomNumber })
+    .from(reservationRooms)
+    .innerJoin(rooms, eq(rooms.id, reservationRooms.roomId))
+    .where(eq(reservationRooms.reservationId, reservationId))
+    .orderBy(rooms.roomNumber);
+  return rows.map((r) => r.roomNumber).join(", ");
+}
 
 async function recalcReservation(id: string) {
   const r = await db.select().from(reservations).where(eq(reservations.id, id)).limit(1);
@@ -2496,6 +2823,7 @@ router.post(
         .insert(payments)
         .values({
           receiptNumber: rcpNum,
+          propertyId: r[0]!.propertyId,
           invoiceId: existingInvoice[0]?.id ?? null,
           reservationId: id,
           amount: String(input.amount),

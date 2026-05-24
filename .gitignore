@@ -14,3 +14,5 @@ coverage
 .vite
 *.tsbuildinfo
 .claude/
+# Claude Code MCP server config — machine-local tooling, not for the repo.
+.mcp.json

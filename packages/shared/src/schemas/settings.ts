@@ -4,6 +4,14 @@ import { ROLES } from "../enums.js";
 export const settingsUpdateSchema = z.object({
   hotelName: z.string().min(1).optional(),
   hotelAddress: z.string().min(1).optional(),
+  // Optional GPS pin. Stored as DECIMAL on the DB so we accept numbers or
+  // numeric strings. Empty string from a cleared form → null.
+  hotelLatitude: z
+    .union([z.coerce.number().min(-90).max(90), z.literal("").transform(() => null), z.null()])
+    .optional(),
+  hotelLongitude: z
+    .union([z.coerce.number().min(-180).max(180), z.literal("").transform(() => null), z.null()])
+    .optional(),
   hotelPhone: z.string().min(1).optional(),
   hotelEmail: z.string().email().optional().nullable(),
   ownerPhone: z.string().optional().nullable().transform((v) => (v === "" ? null : v)),

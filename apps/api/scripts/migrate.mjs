@@ -1,11 +1,26 @@
-import "dotenv/config";
-import { readdirSync, readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
+// Match the runtime's layered env loader (see apps/api/src/config/env.ts):
+//   1. .env.<NODE_ENV>.local  — machine-specific overrides
+//   2. .env.<NODE_ENV>        — per-environment file
+//   3. .env                   — legacy fallback
+// Earlier wins; real process env always wins over all of them.
+// Without this, `node scripts/migrate.mjs` from apps/api fails with
+// "DATABASE_URL is required" because the repo uses .env.development
+// rather than a plain .env.
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import dotenv from "dotenv";
 import postgres from "postgres";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const MIGRATIONS_DIR = join(__dirname, "..", "migrations");
+const API_ROOT = resolve(__dirname, "..");
+const MIGRATIONS_DIR = join(API_ROOT, "migrations");
+
+const nodeEnv = process.env.NODE_ENV ?? "development";
+for (const file of [`.env.${nodeEnv}.local`, `.env.${nodeEnv}`, ".env"]) {
+  const path = resolve(API_ROOT, file);
+  if (existsSync(path)) dotenv.config({ path });
+}
 
 if (!process.env.DATABASE_URL) {
   console.error("DATABASE_URL is required");

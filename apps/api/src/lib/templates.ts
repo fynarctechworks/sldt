@@ -39,6 +39,10 @@ export const TEMPLATE_DEFAULTS: Record<TemplateKey, TemplateDefault> = {
     body:
       "New booking: {guest_name} ({guest_phone}), {reservation_number}. {check_in_date} → {check_out_date}. Advance ₹{advance_paid}. Total ₹{total}.",
   },
+  review_prompt_guest_sms: {
+    body:
+      "🙏 Hi {guest_name}, thank you for staying with {hotel}!\n\nWe'd love to hear about your experience. If you have 30 seconds, would you mind leaving us a review?\n\n{review_link}\n\nThank you,\n— {hotel}",
+  },
 };
 
 export const TEMPLATE_VARS: Record<TemplateKey, readonly string[]> = {
@@ -50,6 +54,7 @@ export const TEMPLATE_VARS: Record<TemplateKey, readonly string[]> = {
   payment_reminder_guest_sms: ["hotel", "hotel_phone", "guest_name", "guest_phone", "balance"],
   booking_advance_guest_sms: ["hotel", "hotel_phone", "guest_name", "guest_phone", "reservation_number", "check_in_date", "check_out_date", "advance_paid", "balance", "total", "receipt_link", "receipt_block"],
   booking_advance_owner_sms: ["hotel", "guest_name", "guest_phone", "reservation_number", "check_in_date", "check_out_date", "advance_paid", "total"],
+  review_prompt_guest_sms: ["hotel", "guest_name", "reservation_number", "review_link"],
 };
 
 export const TEMPLATE_LABELS: Record<TemplateKey, { group: string; label: string; channel: "sms" | "email"; recipient: "guest" | "owner" }> = {
@@ -61,6 +66,7 @@ export const TEMPLATE_LABELS: Record<TemplateKey, { group: string; label: string
   payment_reminder_guest_sms: { group: "Payment reminder", label: "WhatsApp to guest", channel: "sms", recipient: "guest" },
   booking_advance_guest_sms: { group: "Pre-booking advance", label: "WhatsApp to guest", channel: "sms", recipient: "guest" },
   booking_advance_owner_sms: { group: "Pre-booking advance", label: "WhatsApp to owner", channel: "sms", recipient: "owner" },
+  review_prompt_guest_sms: { group: "Review prompt", label: "WhatsApp to guest (post-stay)", channel: "sms", recipient: "guest" },
 };
 
 const cache = new Map<TemplateKey, { subject?: string | null; body: string; enabled: boolean }>();

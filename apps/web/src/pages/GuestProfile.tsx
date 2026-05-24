@@ -233,8 +233,12 @@ function EditGuestModal({ guest, onClose }: { guest: Guest; onClose: () => void 
             <Field label="Phone">
               <input
                 className="input font-mono"
+                type="tel"
+                inputMode="numeric"
+                maxLength={10}
+                placeholder="9876543210"
                 value={form.phone}
-                onChange={(e) => set("phone", e.target.value)}
+                onChange={(e) => set("phone", e.target.value.replace(/\D/g, "").slice(0, 10))}
               />
             </Field>
             <Field label="Email">

@@ -21,9 +21,23 @@ interface UpcomingCheckout {
   effectiveCheckoutAt: string; // ISO
 }
 
+// A multi-day overdue stay: a guest still checked_in whose check_out_date
+// is in the PAST. Distinct from upcoming_checkouts (which only covers
+// reservations due to leave *today*). Surfaced here so the warning
+// follows staff to every page until the guest is checked out.
+interface OverdueStay {
+  id: string;
+  reservationNumber: string;
+  guestName: string;
+  status: string;
+  checkOutDate: string;
+  daysOverdue: number;
+}
+
 // We piggyback on the dashboard endpoint so we don't add another poll.
 interface DashboardData {
   upcoming_checkouts?: UpcomingCheckout[];
+  overdue?: { count: number; reservations: OverdueStay[] };
 }
 
 type AlertLevel = "approaching" | "imminent" | "overdue";
@@ -174,7 +188,14 @@ export function CheckoutAlerts() {
     if (mutated) saveChimedSet(chimedRef.current);
   }, [decorated]);
 
-  if (onLogin || decorated.length === 0) return null;
+  // Multi-day overdue stays (checked-in past their check_out_date).
+  // These show on every page until resolved, regardless of whether
+  // there are any same-day checkout alerts.
+  const overdueStays = data?.overdue?.reservations ?? [];
+
+  // Bail only when there's genuinely nothing to show — neither a
+  // same-day alert window nor a multi-day overdue stay.
+  if (onLogin || (decorated.length === 0 && overdueStays.length === 0)) return null;
 
   const overdueRows = decorated.filter((d) => d.level === "overdue");
   const imminentRows = decorated.filter((d) => d.level === "imminent");
@@ -201,7 +222,14 @@ export function CheckoutAlerts() {
   // staff see the full load at a glance ("1 overdue · 2 imminent · 1
   // approaching"). When everything is in one state, fall back to a simpler
   // single-state phrasing that includes the worst-case countdown.
+  //
+  // Guarded: this whole block is only meaningful when there's at least
+  // one same-day alert row. If `decorated` is empty (e.g. there are
+  // only multi-day overdue stays, which render in a separate block),
+  // we return an empty string and never index into the empty arrays —
+  // that was the crash: imminentRows[0]!.minutesLeft on undefined.
   const headline = (() => {
+    if (decorated.length === 0) return "";
     const parts: string[] = [];
     if (overdueRows.length) parts.push(`${overdueRows.length} overdue`);
     if (imminentRows.length) parts.push(`${imminentRows.length} imminent`);
@@ -225,7 +253,9 @@ export function CheckoutAlerts() {
       return `Approaching check-out · ${approachingRows.length} room${approachingRows.length === 1 ? "" : "s"}`;
     }
     // Mixed: tally per level + suffix with the most-urgent countdown so the
-    // headline still tells you the immediate pressure.
+    // headline still tells you the immediate pressure. Both arms are
+    // safe here because reaching this point means parts.length >= 2,
+    // so at least one of overdue/imminent is non-empty.
     const tail = overdueRows.length
       ? `worst ${Math.abs(overdueRows[0]!.minutesLeft)} min late`
       : `next in ${imminentRows[0]!.minutesLeft} min`;
@@ -236,10 +266,70 @@ export function CheckoutAlerts() {
 
   return (
     <>
-      {/* Sticky alert bar — sits at the top of the main content area, every
-          page. The body itself doesn't pulse; only the time-late pills + the
-          floating chip do, so staff sitting at the desk all day aren't
-          assaulted by a pulsing wall. */}
+      {/* Multi-day overdue stays. Highest priority — guests who never
+          checked out on their scheduled date. Sticky at the very top so
+          it follows staff to every page until resolved. Blinks (via the
+          animate-overdue-pulse class) so it's impossible to ignore. */}
+      {overdueStays.length > 0 && (
+        <div className="sticky top-0 z-40 border-b-2 border-danger bg-danger text-cream animate-overdue-pulse">
+          <div className="px-4 py-2.5">
+            <div className="flex items-center gap-2 mb-2">
+              <AlertTriangle className="w-4 h-4 shrink-0" />
+              <div className="font-bold text-[12px] uppercase tracking-[0.14em] leading-tight">
+                {overdueStays.length} overdue check-out
+                {overdueStays.length === 1 ? "" : "s"} · guest stayed past scheduled date
+              </div>
+            </div>
+            <ul className="space-y-1.5">
+              {overdueStays.map((o) => (
+                <li
+                  key={o.id}
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => navigate(`/reservations/${o.id}`)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      navigate(`/reservations/${o.id}`);
+                    }
+                  }}
+                  className="flex items-center gap-3 px-3 py-2 rounded-md bg-cream/10 border border-cream/30 cursor-pointer hover:bg-cream/20 transition-colors focus:outline-none focus:ring-2 focus:ring-cream/60"
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-mono text-[11px] text-cream/90">
+                        {o.reservationNumber}
+                      </span>
+                      <span className="font-semibold text-[14px] truncate">{o.guestName}</span>
+                    </div>
+                    <div className="text-[11px] text-cream/80 mt-0.5">
+                      Scheduled out {o.checkOutDate} · {o.daysOverdue} day
+                      {o.daysOverdue === 1 ? "" : "s"} late
+                    </div>
+                  </div>
+                  <button
+                    onClick={(e) => {
+                      // Stop the row's onClick from also firing — both go
+                      // to the same place, but avoiding the double-nav keeps
+                      // history clean.
+                      e.stopPropagation();
+                      navigate(`/reservations/${o.id}`);
+                    }}
+                    className="inline-flex items-center px-3 h-8 text-xs font-bold rounded-sm bg-cream text-danger hover:opacity-90 transition-colors shrink-0"
+                  >
+                    Open →
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
+
+      {/* Same-day checkout window bar (approaching / imminent / overdue
+          by *time today*). Only render when there's a same-day alert —
+          a pure multi-day-overdue situation shows just the block above. */}
+      {decorated.length > 0 && (
       <div className={`sticky top-0 z-40 border-b-2 ${toneClasses[worst]}`}>
         <div className="px-4 py-2.5">
           {/* Headline */}
@@ -266,6 +356,7 @@ export function CheckoutAlerts() {
           </ul>
         </div>
       </div>
+      )}
 
       {/* Floating bottom-right chip — bigger + higher contrast than before so
           staff can spot it from across the room. Pulses for overdue to draw

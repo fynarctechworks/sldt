@@ -524,4 +524,116 @@ router.get("/guests", requireAuth, requirePermission("view_reports"), async (req
   return ok(res, rows);
 });
 
+// ----------------------------------------------------------------------
+// Phase 2 — Pace report
+// ----------------------------------------------------------------------
+// For each stay date in the requested window, how many room-nights were
+// on the books as of N days before that stay-date? Plotting these
+// curves over time tells revenue managers whether the property is
+// pacing ahead or behind a comparable past period.
+//
+// We compute "on the books at lead-time D for stay-date S" as: count of
+// reservation_rooms rows where the parent reservation was CREATED on or
+// before (S - D days) AND the stay range contains S AND the reservation
+// status was an active one.
+//
+// Output:
+//   { stay_dates: ["2026-06-01", ...],
+//     curves: { "0": [12,13,...], "7": [...], "14": [...], "30": [...] } }
+router.get("/pace", requireAuth, requirePermission("view_reports"), async (req, res) => {
+  const { from, to } = rangeDefaults(req as never);
+  const leads = [0, 7, 14, 30];
+
+  const rows = await db.execute<{ stay_date: string; lead: number; nights: number }>(sql`
+    WITH stay_days AS (
+      SELECT generate_series(${format(from, "yyyy-MM-dd")}::date, ${format(to, "yyyy-MM-dd")}::date, interval '1 day')::date AS d
+    ),
+    leads(l) AS (VALUES (0), (7), (14), (30))
+    SELECT
+      to_char(sd.d, 'YYYY-MM-DD') AS stay_date,
+      l.l AS lead,
+      COALESCE((
+        SELECT COUNT(*)::int
+        FROM reservation_rooms rr
+        JOIN reservations r ON r.id = rr.reservation_id
+        WHERE r.status IN ('confirmed','checked_in','checked_out','hold','pending_payment')
+          AND r.booking_source <> 'complimentary'
+          AND r.created_at::date <= (sd.d - (l.l || ' days')::interval)::date
+          AND daterange(r.check_in_date, GREATEST(r.check_out_date, r.check_in_date + 1), '[)') @> sd.d
+      ), 0) AS nights
+    FROM stay_days sd CROSS JOIN leads l
+    ORDER BY sd.d, l.l
+  `);
+
+  const stayDates: string[] = [];
+  const curves: Record<string, number[]> = {};
+  for (const l of leads) curves[String(l)] = [];
+  // Reconstruct from the flat list.
+  const seen = new Set<string>();
+  for (const r of rows as unknown as { stay_date: string; lead: number; nights: number }[]) {
+    if (!seen.has(r.stay_date)) {
+      stayDates.push(r.stay_date);
+      seen.add(r.stay_date);
+    }
+    curves[String(r.lead)]!.push(Number(r.nights));
+  }
+  return ok(res, { stay_dates: stayDates, curves });
+});
+
+// ----------------------------------------------------------------------
+// Phase 2 — Pickup report
+// ----------------------------------------------------------------------
+// Day-over-day change in room-nights on the books for each stay-date.
+// Differs from pace in that this is about RECENT booking velocity, not
+// historical comparison. For each day in the window, how many net
+// room-nights (added minus cancelled) hit the books during the previous
+// N days?
+//
+// Output:
+//   { window_days: 7,
+//     rows: [{ stay_date, picked_up_last_7d, picked_up_last_30d }, ...] }
+router.get("/pickup", requireAuth, requirePermission("view_reports"), async (req, res) => {
+  const { from, to } = rangeDefaults(req as never);
+
+  const rows = await db.execute<{ stay_date: string; pu7: number; pu30: number }>(sql`
+    WITH stay_days AS (
+      SELECT generate_series(${format(from, "yyyy-MM-dd")}::date, ${format(to, "yyyy-MM-dd")}::date, interval '1 day')::date AS d
+    )
+    SELECT
+      to_char(sd.d, 'YYYY-MM-DD') AS stay_date,
+      COALESCE((
+        SELECT COUNT(*)::int
+        FROM reservation_rooms rr
+        JOIN reservations r ON r.id = rr.reservation_id
+        WHERE r.status IN ('confirmed','checked_in','checked_out','hold','pending_payment')
+          AND r.booking_source <> 'complimentary'
+          AND r.created_at >= (sd.d - interval '7 days')
+          AND r.created_at < sd.d
+          AND daterange(r.check_in_date, GREATEST(r.check_out_date, r.check_in_date + 1), '[)') @> sd.d
+      ), 0) AS pu7,
+      COALESCE((
+        SELECT COUNT(*)::int
+        FROM reservation_rooms rr
+        JOIN reservations r ON r.id = rr.reservation_id
+        WHERE r.status IN ('confirmed','checked_in','checked_out','hold','pending_payment')
+          AND r.booking_source <> 'complimentary'
+          AND r.created_at >= (sd.d - interval '30 days')
+          AND r.created_at < sd.d
+          AND daterange(r.check_in_date, GREATEST(r.check_out_date, r.check_in_date + 1), '[)') @> sd.d
+      ), 0) AS pu30
+    FROM stay_days sd
+    ORDER BY sd.d
+  `);
+
+  return ok(res, {
+    rows: (rows as unknown as { stay_date: string; pu7: number; pu30: number }[]).map(
+      (r) => ({
+        stay_date: r.stay_date,
+        picked_up_last_7d: Number(r.pu7),
+        picked_up_last_30d: Number(r.pu30),
+      }),
+    ),
+  });
+});
+
 export default router;

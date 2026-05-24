@@ -7,7 +7,6 @@ import {
   DoorOpen,
   Search,
   UserPlus,
-  Users,
 } from "lucide-react";
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
@@ -77,15 +76,45 @@ export default function Reservations() {
   const [q, setQ] = useState("");
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
+  // floor + roomId filters. Empty string = "all". roomId is a UUID we
+  // ship to the API; floor is a number coerced server-side from the
+  // query string.
+  const [floor, setFloor] = useState("");
+  const [roomId, setRoomId] = useState("");
+
+  // Rooms list for the picker. Cheap — small property — and the
+  // dropdown options need both id (for the API filter) + number/floor
+  // (for the label). We compute the floor list off this same response
+  // so we don't keep two queries in sync.
+  const roomsQ = useQuery({
+    queryKey: ["rooms-min"],
+    queryFn: () =>
+      api.get<{ id: string; roomNumber: string; floor: number }[]>("/rooms"),
+    staleTime: 5 * 60_000,
+  });
+  const allRooms = roomsQ.data ?? [];
+  const floors = Array.from(new Set(allRooms.map((r) => r.floor))).sort(
+    (a, b) => a - b,
+  );
+  // When a floor is selected, narrow the room picker to that floor so
+  // the two filters are visibly consistent (and the user doesn't pick
+  // a room that contradicts the floor).
+  const roomOptions = floor
+    ? allRooms.filter((r) => String(r.floor) === floor)
+    : allRooms;
 
   const { data = [], isLoading } = useQuery({
-    queryKey: ["reservations", { status, q, dateFrom, dateTo }],
+    queryKey: ["reservations", { status, q, dateFrom, dateTo, floor, roomId }],
     queryFn: () =>
       api.get<Reservation[]>("/reservations", {
         status: status || undefined,
         q: q || undefined,
         date_from: dateFrom || undefined,
         date_to: dateTo || undefined,
+        // floor is a number on the server; pass it as string and let
+        // zod's z.coerce handle the conversion.
+        floor: floor || undefined,
+        room_id: roomId || undefined,
       }),
   });
 
@@ -125,22 +154,24 @@ export default function Reservations() {
       </div>
 
       <div className="card flex flex-wrap gap-3 items-end">
-        <div className="flex-1 min-w-[200px]">
-          <label className="label block mb-1">Search (Res # / Guest)</label>
+        {/* Search input takes a full row on phones for clarity, then
+            flexes back into the wrap-row on sm+. */}
+        <div className="w-full sm:flex-1 sm:min-w-[200px]">
+          <label className="label block mb-1">Search</label>
           <div className="relative">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-textSecondary" />
             <input
               className="input pl-9"
               value={q}
               onChange={(e) => setQ(e.target.value)}
-              placeholder="RES-… or name"
+              placeholder="Search by name, phone number or RES-…"
             />
           </div>
         </div>
-        <div>
+        <div className="flex-1 min-w-[120px] sm:flex-none">
           <label className="label block mb-1">Status</label>
           <select
-            className="input w-40"
+            className="input sm:w-40"
             value={status}
             onChange={(e) => setStatus(e.target.value)}
           >
@@ -152,24 +183,79 @@ export default function Reservations() {
             ))}
           </select>
         </div>
-        <div>
+        <div className="flex-1 min-w-[80px] sm:flex-none">
+          <label className="label block mb-1">Floor</label>
+          <select
+            className="input sm:w-28"
+            value={floor}
+            onChange={(e) => {
+              const next = e.target.value;
+              setFloor(next);
+              // If the currently picked room isn't on the new floor,
+              // clear it so the two filters don't contradict.
+              if (next && roomId) {
+                const ok = allRooms.find((r) => r.id === roomId && String(r.floor) === next);
+                if (!ok) setRoomId("");
+              }
+            }}
+          >
+            <option value="">All</option>
+            {floors.map((f) => (
+              <option key={f} value={f}>
+                F{f}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="flex-1 min-w-[120px] sm:flex-none">
+          <label className="label block mb-1">Room</label>
+          <select
+            className="input sm:w-32"
+            value={roomId}
+            onChange={(e) => setRoomId(e.target.value)}
+          >
+            <option value="">All</option>
+            {roomOptions.map((r) => (
+              <option key={r.id} value={r.id}>
+                {r.roomNumber}
+                {!floor ? ` · F${r.floor}` : ""}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="flex-1 min-w-[140px] sm:flex-none">
           <label className="label block mb-1">Check-in From</label>
           <input
-            className="input w-40"
+            className="input sm:w-40"
             type="date"
             value={dateFrom}
             onChange={(e) => setDateFrom(e.target.value)}
           />
         </div>
-        <div>
+        <div className="flex-1 min-w-[140px] sm:flex-none">
           <label className="label block mb-1">Check-in To</label>
           <input
-            className="input w-40"
+            className="input sm:w-40"
             type="date"
             value={dateTo}
             onChange={(e) => setDateTo(e.target.value)}
           />
         </div>
+        {(status || q || dateFrom || dateTo || floor || roomId) && (
+          <button
+            onClick={() => {
+              setStatus("");
+              setQ("");
+              setDateFrom("");
+              setDateTo("");
+              setFloor("");
+              setRoomId("");
+            }}
+            className="text-xs text-accentBlue hover:underline self-end pb-2"
+          >
+            Clear all
+          </button>
+        )}
       </div>
 
       {isLoading ? (
@@ -179,16 +265,35 @@ export default function Reservations() {
           No reservations match these filters.
         </div>
       ) : (
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
-          {data.map((r) => (
-            <ReservationCard
-              key={r.id}
-              r={r}
-              hotelCheckInTime={hotelCheckInTime}
-              hotelCheckOutTime={hotelCheckOutTime}
-              onOpen={() => navigate(`/reservations/${r.id}`)}
-            />
-          ))}
+        // Single-column dense list. One row per reservation; all the
+        // info reads left-to-right at a glance. Hover shows the right-
+        // chevron so the row clearly behaves as a link.
+        <div className="card !p-0 overflow-hidden">
+          {/* Column header (desktop only). Keeps the row layout legible
+              at scale without the per-row "Check-in / Check-out / Nights"
+              labels that bloated the old grid. */}
+          <div className="hidden md:grid grid-cols-[40px_minmax(180px,1fr)_140px_140px_60px_minmax(120px,1fr)_120px_120px_28px] gap-3 px-3 py-2 text-[10px] font-semibold uppercase tracking-wider text-textSecondary bg-bg/60 border-b border-borderc">
+            <div />
+            <div>Guest</div>
+            <div>Check-in</div>
+            <div>Check-out</div>
+            <div className="text-center">Nights</div>
+            <div>Rooms</div>
+            <div className="text-right">Total</div>
+            <div className="text-right">Balance</div>
+            <div />
+          </div>
+          <ul className="divide-y divide-borderc">
+            {data.map((r) => (
+              <ReservationRow
+                key={r.id}
+                r={r}
+                hotelCheckInTime={hotelCheckInTime}
+                hotelCheckOutTime={hotelCheckOutTime}
+                onOpen={() => navigate(`/reservations/${r.id}`)}
+              />
+            ))}
+          </ul>
         </div>
       )}
     </div>
@@ -219,7 +324,11 @@ function avatarTone(seed: string): string {
   return tones[h % tones.length]!;
 }
 
-function ReservationCard({
+// Dense single-row layout. Desktop renders an 8-column grid that
+// matches the header strip; mobile falls back to a stacked card with
+// the same data. One row reads at a glance — guest + dates + rooms +
+// balance — and clicking anywhere on the row opens the reservation.
+function ReservationRow({
   r,
   hotelCheckInTime,
   hotelCheckOutTime,
@@ -236,18 +345,11 @@ function ReservationCard({
   const hasBalance = bal > 0.009;
   const rooms = r.roomNumbers ? r.roomNumbers.split(",").filter(Boolean) : [];
 
-  // Check-in time: real checkedInAt when the guest has arrived; otherwise the
-  // hotel's policy time. We render only the time string here since the date
-  // sits right above it on the card.
+  // Check-in time: real checkedInAt when guest has arrived; else hotel policy.
   const checkInTimeLabel = r.checkedInAt
     ? format(new Date(r.checkedInAt), "h:mm a")
     : formatHotelTime(hotelCheckInTime);
-
-  // Check-out time:
-  //   - already checked out → use checkedOutAt
-  //   - short_stay, checked in → checkedInAt + durationHours
-  //   - overnight, checked in → hotel checkOutTime + lateCheckoutHours grant
-  //   - confirmed only → policy time (with grant if any)
+  // Check-out time, accounting for short_stay duration + late-checkout grant.
   const checkOutTimeLabel = (() => {
     if (r.checkedOutAt) return format(new Date(r.checkedOutAt), "h:mm a");
     if (isShort && r.checkedInAt && dur > 0) {
@@ -258,7 +360,6 @@ function ReservationCard({
     }
     const grantHours = Number(r.lateCheckoutHours ?? 0);
     if (grantHours <= 0) return formatHotelTime(hotelCheckOutTime);
-    // Build a Date for the policy time on checkOutDate, add grant hours, render.
     const [hh, mm] = hotelCheckOutTime.split(":");
     const base = new Date(
       `${r.checkOutDate}T${(hh ?? "11").padStart(2, "0")}:${(mm ?? "00").padStart(2, "0")}:00`,
@@ -267,7 +368,7 @@ function ReservationCard({
   })();
 
   return (
-    <div
+    <li
       role="button"
       tabIndex={0}
       onClick={onOpen}
@@ -277,119 +378,141 @@ function ReservationCard({
           onOpen();
         }
       }}
-      className="group card !p-4 cursor-pointer transition border border-borderc hover:border-brand/50 hover:shadow-sm focus:outline-none focus:ring-2 focus:ring-brand/40"
+      className="group cursor-pointer transition-colors hover:bg-brand-soft/30 focus:outline-none focus:bg-brand-soft/30"
     >
-      <div className="flex items-start gap-3">
+      {/* DESKTOP — 8-column grid that mirrors the header. Compact, scannable. */}
+      <div className="hidden md:grid grid-cols-[40px_minmax(180px,1fr)_140px_140px_60px_minmax(120px,1fr)_120px_120px_28px] gap-3 items-center px-3 py-2.5">
+        {/* Avatar */}
         {r.guestPhotoUrl ? (
           <img
             src={r.guestPhotoUrl}
-            alt={r.guestName}
-            className="w-10 h-10 rounded-full object-cover shrink-0 ring-1 ring-borderc bg-bg"
+            alt=""
+            className="w-9 h-9 rounded-full object-cover ring-1 ring-borderc bg-bg"
           />
         ) : (
           <div
-            className={`w-10 h-10 rounded-full grid place-items-center font-semibold text-sm shrink-0 ${avatarTone(r.guestName)}`}
+            className={`w-9 h-9 rounded-full grid place-items-center font-semibold text-xs ${avatarTone(r.guestName)}`}
+            aria-hidden="true"
+          >
+            {initialsOf(r.guestName)}
+          </div>
+        )}
+
+        {/* Guest + reservation # + status */}
+        <div className="min-w-0">
+          <div className="flex items-center gap-1.5">
+            <span className="font-semibold text-brand-dark text-sm truncate">{r.guestName}</span>
+            {isShort && (
+              <span
+                className="inline-flex items-center gap-0.5 px-1 rounded-sm text-[9px] font-semibold bg-brand/10 text-brand-dark border border-brand/30 shrink-0"
+                title={`Day use · ${dur}h`}
+              >
+                <Clock className="w-2.5 h-2.5" /> {dur}h
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-1.5 mt-0.5">
+            <span className="font-mono text-[10px] text-accentBlue">{r.reservationNumber}</span>
+            <StatusBadge status={r.status} />
+            {r.guestPhone && (
+              <span className="text-[10px] text-textSecondary font-mono truncate">{r.guestPhone}</span>
+            )}
+          </div>
+        </div>
+
+        {/* Check-in */}
+        <div className="text-xs">
+          <div className="text-brand-dark font-medium">{format(new Date(r.checkInDate), "dd MMM")}</div>
+          <div className="text-[10px] text-textSecondary font-mono">
+            {r.checkedInAt ? checkInTimeLabel : `from ${checkInTimeLabel}`}
+          </div>
+        </div>
+
+        {/* Check-out */}
+        <div className="text-xs">
+          <div className="text-brand-dark font-medium">{format(new Date(r.checkOutDate), "dd MMM")}</div>
+          <div className="text-[10px] text-textSecondary font-mono">
+            {r.checkedOutAt ? checkOutTimeLabel : `by ${checkOutTimeLabel}`}
+          </div>
+        </div>
+
+        {/* Nights / duration */}
+        <div className="text-center text-sm font-medium text-brand-dark">
+          {isShort ? `${dur}h` : r.numNights}
+        </div>
+
+        {/* Rooms */}
+        <div className="flex items-center gap-1 flex-wrap text-[11px]">
+          {rooms.length > 0 ? (
+            rooms.map((rm) => (
+              <span
+                key={rm}
+                className="font-mono font-semibold text-brand-dark bg-bg px-1.5 py-0.5 rounded border border-borderc"
+              >
+                {rm}
+              </span>
+            ))
+          ) : (
+            <span className="text-textSecondary/60 inline-flex items-center gap-1">
+              <DoorOpen className="w-3 h-3" /> —
+            </span>
+          )}
+        </div>
+
+        {/* Total */}
+        <div className="text-right text-sm font-mono font-semibold text-brand-dark">
+          {inr(r.grandTotal)}
+        </div>
+
+        {/* Balance */}
+        <div className="text-right">
+          <div
+            className={`text-sm font-mono font-semibold ${hasBalance ? "text-danger" : "text-success"}`}
+          >
+            {hasBalance ? inr(r.balanceDue) : "Paid"}
+          </div>
+        </div>
+
+        <ChevronRight className="w-4 h-4 text-textSecondary/40 group-hover:text-brand justify-self-end" />
+      </div>
+
+      {/* MOBILE — stacked card. Same data, two-line layout for phones. */}
+      <div className="md:hidden px-3 py-3 flex items-start gap-2">
+        {r.guestPhotoUrl ? (
+          <img
+            src={r.guestPhotoUrl}
+            alt=""
+            className="w-9 h-9 rounded-full object-cover ring-1 ring-borderc bg-bg shrink-0"
+          />
+        ) : (
+          <div
+            className={`w-9 h-9 rounded-full grid place-items-center font-semibold text-xs shrink-0 ${avatarTone(r.guestName)}`}
             aria-hidden="true"
           >
             {initialsOf(r.guestName)}
           </div>
         )}
         <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2 flex-wrap">
-            <span className="font-mono text-[12px] font-semibold text-accentBlue">
-              {r.reservationNumber}
-            </span>
-            <StatusBadge status={r.status} />
-            {isShort && (
-              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-sm text-[10px] font-semibold bg-brand/10 text-brand-dark border border-brand/30">
-                <Clock className="w-3 h-3" /> Day use · {dur}h
-              </span>
-            )}
-          </div>
-          <div className="mt-1 text-base font-semibold text-brand-dark truncate">
-            {r.guestName}
-          </div>
-          {r.guestPhone && (
-            <div className="text-xs text-textSecondary font-mono">{r.guestPhone}</div>
-          )}
-        </div>
-        <ChevronRight className="w-5 h-5 text-textSecondary/50 group-hover:text-brand shrink-0 mt-1" />
-      </div>
-
-      <div className="mt-3 grid grid-cols-3 gap-2 text-xs">
-        <div>
-          <div className="text-[10px] uppercase tracking-wider text-textSecondary font-semibold">
-            Check-in
-          </div>
-          <div className="text-brand-dark font-medium mt-0.5">
-            {format(new Date(r.checkInDate), "dd MMM")}
-          </div>
-          <div className="text-[11px] text-textSecondary font-mono mt-0.5">
-            {r.checkedInAt ? checkInTimeLabel : `from ${checkInTimeLabel}`}
-          </div>
-        </div>
-        <div>
-          <div className="text-[10px] uppercase tracking-wider text-textSecondary font-semibold">
-            Check-out
-          </div>
-          <div className="text-brand-dark font-medium mt-0.5">
-            {format(new Date(r.checkOutDate), "dd MMM")}
-          </div>
-          <div className="text-[11px] text-textSecondary font-mono mt-0.5">
-            {r.checkedOutAt ? checkOutTimeLabel : `by ${checkOutTimeLabel}`}
-          </div>
-        </div>
-        <div>
-          <div className="text-[10px] uppercase tracking-wider text-textSecondary font-semibold">
-            {isShort ? "Duration" : "Nights"}
-          </div>
-          <div className="text-brand-dark font-medium mt-0.5">
-            {isShort ? `${dur} hrs` : r.numNights}
-          </div>
-        </div>
-      </div>
-
-      <div className="mt-3 flex items-center justify-between gap-3 flex-wrap pt-3 border-t border-borderc">
-        <div className="flex items-center gap-2 text-xs text-textSecondary">
-          {rooms.length > 0 ? (
-            <div className="flex items-center gap-1.5 flex-wrap">
-              <DoorOpen className="w-3.5 h-3.5" />
-              {rooms.map((rm) => (
-                <span
-                  key={rm}
-                  className="font-mono font-semibold text-brand-dark bg-bg px-1.5 py-0.5 rounded border border-borderc"
-                >
-                  {rm}
-                </span>
-              ))}
-            </div>
-          ) : (
-            <span className="inline-flex items-center gap-1 text-textSecondary/70">
-              <Users className="w-3.5 h-3.5" /> No rooms
-            </span>
-          )}
-        </div>
-        <div className="flex items-baseline gap-3">
-          <div className="text-right">
-            <div className="text-[10px] uppercase tracking-wider text-textSecondary font-semibold">
-              Total
-            </div>
-            <div className="text-sm font-mono font-bold text-brand-dark">{inr(r.grandTotal)}</div>
-          </div>
-          <div className="text-right">
-            <div className="text-[10px] uppercase tracking-wider text-textSecondary font-semibold">
-              Balance
-            </div>
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-semibold text-brand-dark text-sm truncate">{r.guestName}</span>
             <div
-              className={`text-sm font-mono font-bold ${
-                hasBalance ? "text-danger" : "text-success"
-              }`}
+              className={`text-sm font-mono font-semibold shrink-0 ${hasBalance ? "text-danger" : "text-success"}`}
             >
               {hasBalance ? inr(r.balanceDue) : "Paid"}
             </div>
           </div>
+          <div className="flex items-center gap-1.5 mt-0.5">
+            <span className="font-mono text-[10px] text-accentBlue">{r.reservationNumber}</span>
+            <StatusBadge status={r.status} />
+          </div>
+          <div className="mt-1 text-[11px] text-textSecondary font-mono">
+            {format(new Date(r.checkInDate), "dd MMM")} → {format(new Date(r.checkOutDate), "dd MMM")}
+            {" · "}
+            {isShort ? `${dur}h day-use` : `${r.numNights}n`}
+            {rooms.length > 0 ? ` · Rm ${rooms.join(",")}` : ""}
+          </div>
         </div>
       </div>
-    </div>
+    </li>
   );
 }

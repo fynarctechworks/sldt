@@ -4,15 +4,28 @@ import {
   BadgeIndianRupee,
   BarChart3,
   Bell,
+  Briefcase,
   CalendarCheck,
+  CalendarDays,
+  ChevronLeft,
+  ChevronRight,
+  ClipboardList,
   DoorOpen,
+  Globe,
+  ListChecks,
+  ScrollText,
+  ShieldCheck,
+  TrendingUp,
   LayoutDashboard,
   LogOut,
   MessageSquare,
   Settings,
   Sparkles,
+  Tags,
   Users,
+  UsersRound,
   Wallet,
+  Wrench,
 } from "lucide-react";
 import { NavLink } from "react-router-dom";
 import { useAuth } from "@/auth/AuthContext";
@@ -31,9 +44,17 @@ interface NavItem {
 const NAV: NavItem[] = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, permission: "view_dashboard" },
   { to: "/rooms", label: "Rooms", icon: DoorOpen, permission: "view_rooms" },
+  { to: "/calendar", label: "Calendar", icon: CalendarDays, permission: "view_reservations" },
   { to: "/reservations", label: "Reservations", icon: CalendarCheck, permission: "view_reservations" },
   { to: "/guests", label: "Guests", icon: Users, permission: "view_guests" },
   { to: "/housekeeping", label: "Housekeeping", icon: Sparkles, permission: "view_housekeeping" },
+  { to: "/housekeeping-tasks", label: "HK Tasks", icon: ClipboardList, permission: "view_housekeeping_tasks" },
+  { to: "/maintenance", label: "Maintenance", icon: Wrench, permission: "view_maintenance" },
+  { to: "/rate-plans", label: "Rate Plans", icon: Tags, permission: "view_rate_plans" },
+  { to: "/pricing-rules", label: "Pricing Rules", icon: TrendingUp, permission: "view_pricing_rules" },
+  { to: "/companies", label: "Companies", icon: Briefcase, permission: "view_companies" },
+  { to: "/group-bookings", label: "Groups", icon: UsersRound, permission: "view_groups" },
+  { to: "/booking-engine", label: "Booking Engine", icon: Globe, permission: "configure_booking_engine" },
   { to: "/messages", label: "Messages", icon: MessageSquare, permission: "view_messages" },
   // Both pages surface aggregate financial totals — gate behind
   // `view_revenue` so only admin (god-mode) and explicitly-granted roles
@@ -44,10 +65,26 @@ const NAV: NavItem[] = [
   { to: "/notifications", label: "Notifications", icon: Bell, permission: "view_notifications" },
   { to: "/activity", label: "Activity", icon: Activity, permission: "view_activity" },
   { to: "/reports", label: "Reports", icon: BarChart3, permission: "view_reports" },
+  { to: "/operations", label: "Operations", icon: ListChecks, permission: "view_reports" },
+  { to: "/gst-returns", label: "GST Returns", icon: ScrollText, permission: "export_gstr" },
+  { to: "/dpdp", label: "DPDP", icon: ShieldCheck, permission: "view_dpdp" },
   { to: "/settings", label: "Settings", icon: Settings, permission: "manage_settings" },
 ];
 
-export function Sidebar() {
+export function Sidebar({
+  collapsed,
+  onToggle,
+  mobile = false,
+}: {
+  collapsed: boolean;
+  onToggle: () => void;
+  // When true, renders inside the AppShell's mobile drawer:
+  //   - no fixed-position absolute on the aside (the drawer wrapper
+  //     handles slide-in already)
+  //   - hide the desktop collapse/expand arrow button
+  //   - always expanded
+  mobile?: boolean;
+}) {
   const { profile, signOut, can } = useAuth();
   const dialog = useDialog();
 
@@ -99,16 +136,54 @@ export function Sidebar() {
   const visible = NAV.filter((i) => can(i.permission));
 
   return (
-    <aside className="w-60 bg-brand-dark text-cream flex flex-col fixed top-0 left-0 h-full">
-      <div className="px-5 py-5 border-b border-brass/15 flex items-center gap-3">
-        <img src="/logo.jpg" alt="SLDT Stay Inn" className="w-10 h-10 rounded-md bg-cream object-contain p-0.5 shrink-0 ring-1 ring-brass/30" />
-        <div className="min-w-0">
-          <div className="text-base font-semibold tracking-tight leading-tight truncate text-cream">SLDT Stay Inn</div>
-          <div className="text-[10px] text-brass tracking-[0.15em] mt-0.5">SABBAVARAM</div>
-        </div>
+    <aside
+      className={cn(
+        "bg-brand-dark text-cream flex flex-col h-full transition-[width] duration-200 ease-out",
+        // Desktop: fixed left rail with collapsible width. z-50 so the
+        // rail (and its collapse pill) sit above the sticky checkout
+        // alert bar (z-40) in the content column — otherwise the pill,
+        // which juts out over the content edge, gets covered by the bar.
+        mobile ? "w-72 relative" : "fixed top-0 left-0 z-50",
+        !mobile && (collapsed ? "w-16" : "w-60"),
+      )}
+    >
+      {/* Desktop collapse/expand pill. Hidden in the mobile drawer
+          because the drawer has its own backdrop+tap-to-close. */}
+      {!mobile && (
+        <button
+          onClick={onToggle}
+          aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+          title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+          className="absolute -right-4 top-7 z-50 grid place-items-center w-8 h-8 rounded-full bg-brand-dark text-cream ring-1 ring-brass/40 shadow-md hover:bg-brand-mid hover:text-brass transition-colors"
+        >
+          {collapsed ? (
+            <ChevronRight className="w-5 h-5" />
+          ) : (
+            <ChevronLeft className="w-5 h-5" />
+          )}
+        </button>
+      )}
+
+      <div
+        className={cn(
+          "py-5 border-b border-brass/15 flex items-center gap-3",
+          collapsed ? "px-3 justify-center" : "px-5",
+        )}
+      >
+        <img
+          src="/logo.jpg"
+          alt="SLDT Stay Inn"
+          className="w-10 h-10 rounded-md bg-cream object-contain p-0.5 shrink-0 ring-1 ring-brass/30"
+        />
+        {!collapsed && (
+          <div className="min-w-0">
+            <div className="text-base font-semibold tracking-tight leading-tight truncate text-cream">SLDT Stay Inn</div>
+            <div className="text-[10px] text-brass tracking-[0.15em] mt-0.5">SABBAVARAM</div>
+          </div>
+        )}
       </div>
 
-      <nav className="flex-1 py-3 overflow-y-auto">
+      <nav className="flex-1 py-3 overflow-y-auto overflow-x-hidden no-scrollbar">
         {visible.map((item) => {
           const Icon = item.icon;
           return (
@@ -116,32 +191,34 @@ export function Sidebar() {
               key={item.to}
               to={item.to}
               end={item.to === "/"}
+              title={collapsed ? item.label : undefined}
               className={({ isActive }) =>
                 cn(
-                  "flex items-center gap-3 px-5 py-2.5 text-sm transition-colors",
+                  "flex items-center gap-3 py-2.5 text-sm transition-colors",
+                  collapsed ? "px-0 justify-center" : "px-5",
                   isActive
                     ? "bg-brand-mid/30 text-cream border-l-2 border-brass"
                     : "text-cream/70 hover:bg-cream/5 hover:text-cream border-l-2 border-transparent",
                 )
               }
             >
-              <Icon className="w-4 h-4" />
-              <span className="flex-1">{item.label}</span>
-              {item.to === "/notifications" && unread > 0 && (
+              <Icon className="w-4 h-4 shrink-0" />
+              {!collapsed && <span className="flex-1">{item.label}</span>}
+              {!collapsed && item.to === "/notifications" && unread > 0 && (
                 <span
                   className="w-2 h-2 rounded-full bg-brass shrink-0"
                   aria-label={`${unread} unread`}
                   title={`${unread} unread`}
                 />
               )}
-              {item.to === "/messages" && unreadMessages > 0 && (
+              {!collapsed && item.to === "/messages" && unreadMessages > 0 && (
                 <span
                   className="w-2 h-2 rounded-full bg-brass shrink-0"
                   aria-label={`${unreadMessages} unread message${unreadMessages === 1 ? "" : "s"}`}
                   title={`${unreadMessages} unread message${unreadMessages === 1 ? "" : "s"}`}
                 />
               )}
-              {item.to === "/collections" && owingCount > 0 && (
+              {!collapsed && item.to === "/collections" && owingCount > 0 && (
                 <span
                   className="relative flex w-2 h-2 shrink-0"
                   aria-label={`${owingCount} guest(s) owing`}
@@ -156,19 +233,32 @@ export function Sidebar() {
         })}
       </nav>
 
-      <div className="px-5 py-4 border-t border-brass/15">
-        <div className="text-[10px] text-brass tracking-[0.15em]">SIGNED IN AS</div>
-        <div className="text-sm font-medium truncate text-cream mt-1">{profile.fullName}</div>
-        <div className="text-xs text-cream/50 capitalize">
-          {profile.rbacRoleKey ?? profile.role}
+      {!collapsed ? (
+        <div className="px-5 py-4 border-t border-brass/15">
+          <div className="text-[10px] text-brass tracking-[0.15em]">SIGNED IN AS</div>
+          <div className="text-sm font-medium truncate text-cream mt-1">{profile.fullName}</div>
+          <div className="text-xs text-cream/50 capitalize">
+            {profile.rbacRoleKey ?? profile.role}
+          </div>
+          <button
+            onClick={handleSignOut}
+            className="mt-3 flex items-center gap-2 text-xs text-cream/60 hover:text-brass transition-colors"
+          >
+            <LogOut className="w-3 h-3" /> Sign out
+          </button>
         </div>
-        <button
-          onClick={handleSignOut}
-          className="mt-3 flex items-center gap-2 text-xs text-cream/60 hover:text-brass transition-colors"
-        >
-          <LogOut className="w-3 h-3" /> Sign out
-        </button>
-      </div>
+      ) : (
+        <div className="py-4 border-t border-brass/15 flex justify-center">
+          <button
+            onClick={handleSignOut}
+            title="Sign out"
+            aria-label="Sign out"
+            className="grid place-items-center w-9 h-9 rounded-md text-cream/60 hover:text-brass hover:bg-cream/5 transition-colors"
+          >
+            <LogOut className="w-4 h-4" />
+          </button>
+        </div>
+      )}
     </aside>
   );
 }

@@ -11,12 +11,14 @@ import {
 import { and, asc, desc, eq, ilike, inArray, or, sql } from "drizzle-orm";
 import { Router } from "express";
 import multer from "multer";
+import { z } from "zod";
 import { db } from "../db/client.js";
 import { guestFollowUps, guestNotes, guests } from "../db/schema/guests.js";
 import { reservations } from "../db/schema/reservations.js";
 import { invoices, payments } from "../db/schema/invoices.js";
 import { logActivity } from "../lib/activity.js";
 import { encrypt, last4 } from "../lib/crypto.js";
+import { resolveCurrentPropertyId } from "../lib/currentProperty.js";
 import { fail, list, ok } from "../lib/response.js";
 import { signedKycUrl, uploadKycPhoto, validateKycFile } from "../lib/storage.js";
 import { requireAuth, requirePermission } from "../middleware/auth.js";
@@ -410,9 +412,11 @@ router.post(
       .limit(1);
     if (dup.length) return fail(res, 409, "DUPLICATE_PHONE", "Phone already registered");
 
+    const propertyId = await resolveCurrentPropertyId(req);
     const [created] = await db
       .insert(guests)
       .values({
+        propertyId,
         fullName: input.fullName,
         phone: input.phone,
         email: input.email || null,
@@ -600,6 +604,173 @@ router.patch(
       ipAddress: req.ip,
     });
     return ok(res, { tags: normalized });
+  },
+);
+
+// Toggle the VIP flag. VIP is a soft commercial label — it highlights
+// the guest row in reservations + sends an internal notification to
+// front-desk when the guest creates a new booking. No financial impact.
+const vipSchema = z.object({ isVip: z.boolean() });
+router.patch(
+  "/:id/vip",
+  requireAuth,
+  requirePermission("edit_guests"),
+  validate(vipSchema),
+  async (req, res) => {
+    const id = req.params.id!;
+    const { isVip } = req.body as z.infer<typeof vipSchema>;
+    const [updated] = await db
+      .update(guests)
+      .set({ isVip, updatedAt: new Date() })
+      .where(eq(guests.id, id))
+      .returning();
+    if (!updated) return fail(res, 404, "NOT_FOUND", "Guest not found");
+    await logActivity({
+      action: isVip ? "guest_vip_set" : "guest_vip_cleared",
+      entityType: "guest",
+      entityId: id,
+      description: `${updated.fullName} ${isVip ? "marked VIP" : "VIP cleared"}`,
+      performedBy: req.user!.id,
+      ipAddress: req.ip,
+    });
+    return ok(res, { isVip: updated.isVip });
+  },
+);
+
+// Blacklist a guest. Blocks all future reservation creates for them.
+// Requires manage_settings (admin/manager) — this is a heavy action that
+// will refuse business at the front desk. Reason is mandatory so the
+// audit log captures the why.
+const blacklistSchema = z.discriminatedUnion("isBlacklisted", [
+  z.object({ isBlacklisted: z.literal(true), reason: z.string().min(3).max(500) }),
+  z.object({ isBlacklisted: z.literal(false) }),
+]);
+router.patch(
+  "/:id/blacklist",
+  requireAuth,
+  requirePermission("manage_settings"),
+  validate(blacklistSchema),
+  async (req, res) => {
+    const id = req.params.id!;
+    const input = req.body as z.infer<typeof blacklistSchema>;
+    const patch: Record<string, unknown> = { updatedAt: new Date() };
+    if (input.isBlacklisted) {
+      patch.isBlacklisted = true;
+      patch.blacklistReason = input.reason;
+      patch.blacklistedAt = new Date();
+      patch.blacklistedBy = req.user!.id;
+    } else {
+      patch.isBlacklisted = false;
+      patch.blacklistReason = null;
+      patch.blacklistedAt = null;
+      patch.blacklistedBy = null;
+    }
+    const [updated] = await db
+      .update(guests)
+      .set(patch)
+      .where(eq(guests.id, id))
+      .returning();
+    if (!updated) return fail(res, 404, "NOT_FOUND", "Guest not found");
+    await logActivity({
+      action: input.isBlacklisted ? "guest_blacklisted" : "guest_unblacklisted",
+      entityType: "guest",
+      entityId: id,
+      description: input.isBlacklisted
+        ? `${updated.fullName} blacklisted: ${input.reason}`
+        : `${updated.fullName} removed from blacklist`,
+      performedBy: req.user!.id,
+      ipAddress: req.ip,
+    });
+    return ok(res, {
+      isBlacklisted: updated.isBlacklisted,
+      blacklistReason: updated.blacklistReason,
+    });
+  },
+);
+
+// Free-form preferences. We accept any jsonb but soft-validate the
+// known keys so the UI can render structured pickers. Unknown keys
+// pass through unchanged.
+const preferencesSchema = z.object({
+  preferences: z
+    .object({
+      smoking: z.boolean().optional(),
+      floor: z.enum(["low", "mid", "high"]).optional(),
+      pillow: z.enum(["soft", "firm"]).optional(),
+      wakeup_time: z
+        .string()
+        .regex(/^([01]?\d|2[0-3]):[0-5]\d$/)
+        .optional(),
+      dietary: z.array(z.string().min(1).max(40)).max(10).optional(),
+    })
+    .catchall(z.unknown()),
+});
+router.patch(
+  "/:id/preferences",
+  requireAuth,
+  requirePermission("edit_guests"),
+  validate(preferencesSchema),
+  async (req, res) => {
+    const id = req.params.id!;
+    const { preferences } = req.body as z.infer<typeof preferencesSchema>;
+    const [updated] = await db
+      .update(guests)
+      .set({ preferences, updatedAt: new Date() })
+      .where(eq(guests.id, id))
+      .returning();
+    if (!updated) return fail(res, 404, "NOT_FOUND", "Guest not found");
+    await logActivity({
+      action: "guest_preferences_updated",
+      entityType: "guest",
+      entityId: id,
+      description: `Preferences updated for ${updated.fullName}`,
+      performedBy: req.user!.id,
+      ipAddress: req.ip,
+      metadata: { preferences },
+    });
+    return ok(res, { preferences: updated.preferences });
+  },
+);
+
+// DPDP-aligned consent capture. Records WHEN consent was given and via
+// which channel. Setting `granted: false` revokes consent (clears the
+// timestamp) so marketing dispatch helpers stop sending.
+const consentSchema = z.object({
+  granted: z.boolean(),
+  channel: z.enum(["whatsapp", "sms", "email", "in_person"]).optional(),
+});
+router.patch(
+  "/:id/consent",
+  requireAuth,
+  requirePermission("edit_guests"),
+  validate(consentSchema),
+  async (req, res) => {
+    const id = req.params.id!;
+    const { granted, channel } = req.body as z.infer<typeof consentSchema>;
+    const [updated] = await db
+      .update(guests)
+      .set({
+        marketingConsentAt: granted ? new Date() : null,
+        marketingConsentChannel: granted ? channel ?? "in_person" : null,
+        updatedAt: new Date(),
+      })
+      .where(eq(guests.id, id))
+      .returning();
+    if (!updated) return fail(res, 404, "NOT_FOUND", "Guest not found");
+    await logActivity({
+      action: granted ? "guest_consent_granted" : "guest_consent_revoked",
+      entityType: "guest",
+      entityId: id,
+      description: granted
+        ? `Marketing consent granted via ${channel ?? "in_person"}`
+        : "Marketing consent revoked",
+      performedBy: req.user!.id,
+      ipAddress: req.ip,
+    });
+    return ok(res, {
+      marketingConsentAt: updated.marketingConsentAt,
+      marketingConsentChannel: updated.marketingConsentChannel,
+    });
   },
 );
 

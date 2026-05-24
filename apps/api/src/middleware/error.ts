@@ -55,6 +55,37 @@ export function errorHandler(
     logger.warn({ path: req.path }, "request body too large");
     return fail(res, 413, "PAYLOAD_TOO_LARGE", "Request body too large");
   }
+  // Postgres-driver errors. We translate the small set we care about
+  // into stable API codes; everything else falls through to 500.
+  // 23P01 = exclusion_violation (the reservation_rooms no-overlap
+  //         constraint added in migration 0011). Surfaces if two
+  //         concurrent creates race past the advisory lock — which
+  //         shouldn't happen, but the constraint is the truthful
+  //         bottom-line answer.
+  // 23505 = unique_violation (reservation_number, invoice_number,
+  //         receipt_number — produced if the sequence ever desyncs).
+  if (err && typeof err === "object" && "code" in err) {
+    const pgCode = (err as { code?: string }).code;
+    if (pgCode === "23P01") {
+      logger.warn({ path: req.path }, "reservation overlap rejected by exclusion constraint");
+      return fail(
+        res,
+        409,
+        "ROOM_UNAVAILABLE",
+        "Room was just booked by another session for overlapping dates",
+      );
+    }
+    if (pgCode === "23505") {
+      const constraint = (err as { constraint_name?: string }).constraint_name ?? "";
+      logger.warn({ path: req.path, constraint }, "unique violation");
+      return fail(
+        res,
+        409,
+        "DUPLICATE",
+        "Duplicate value — this record already exists",
+      );
+    }
+  }
   logger.error({ err, path: req.path, method: req.method }, "Unhandled error");
   return fail(res, 500, "INTERNAL_ERROR", "Something went wrong");
 }

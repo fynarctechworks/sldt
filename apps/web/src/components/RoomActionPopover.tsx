@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { ArrowRight, Loader2, Undo2, Wrench, X } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
@@ -33,13 +34,23 @@ function mutateRoomStatus(old: unknown, roomId: string, next: HkStatus): unknown
   return old;
 }
 
-const TRANSITIONS: Record<HkStatus, { to: HkStatus; label: string; direction: "forward" | "reverse" | "side" }[]> = {
+type TransitionOpt = {
+  to: HkStatus;
+  label: string;
+  direction: "forward" | "reverse" | "side";
+  // Skip the clean→inspected→available chain and make the room bookable now.
+  directReady?: boolean;
+};
+
+const TRANSITIONS: Record<HkStatus, TransitionOpt[]> = {
   dirty: [
-    { to: "clean", label: "Mark Clean", direction: "forward" },
+    { to: "available", label: "Mark Ready", direction: "forward", directReady: true },
+    { to: "clean", label: "Mark Clean", direction: "side" },
     { to: "maintenance", label: "Send to Maintenance", direction: "side" },
   ],
   clean: [
-    { to: "inspected", label: "Mark Inspected", direction: "forward" },
+    { to: "available", label: "Mark Ready", direction: "forward", directReady: true },
+    { to: "inspected", label: "Mark Inspected", direction: "side" },
     { to: "dirty", label: "Revert to Dirty", direction: "reverse" },
   ],
   inspected: [
@@ -65,15 +76,27 @@ interface Props {
   invalidateKeys?: string[][];
 }
 
+// Menu dimensions used for viewport-fit math. Width matches w-64 (16rem);
+// height is an estimate generous enough for the tallest 2-option menu.
+const MENU_WIDTH = 256;
+const MENU_MAX_HEIGHT = 220;
+const GAP = 8;
+
 export function RoomActionPopover({ roomId, roomNumber, status, trigger, onChanged, invalidateKeys }: Props) {
   const [open, setOpen] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  // Fixed-position coordinates for the portalled menu, computed from the
+  // trigger's viewport rect so the menu is never clipped by a scroll
+  // container or the page fold.
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
   const qc = useQueryClient();
   const { toast } = useToast();
 
   const update = useMutation({
-    mutationFn: (next: HkStatus) => api.patch(`/housekeeping/${roomId}`, { status: next }),
-    onMutate: async (next: HkStatus) => {
+    mutationFn: (v: { to: HkStatus; directReady?: boolean }) =>
+      api.patch(`/housekeeping/${roomId}`, { status: v.to, directReady: v.directReady }),
+    onMutate: async (v: { to: HkStatus; directReady?: boolean }) => {
       const keys = invalidateKeys ?? [["dashboard"], ["reservation"]];
       // Cancel any in-flight refetches so they don't overwrite our optimistic update
       await Promise.all(keys.map((k) => qc.cancelQueries({ queryKey: k })));
@@ -83,7 +106,7 @@ export function RoomActionPopover({ roomId, roomNumber, status, trigger, onChang
 
       // Optimistically rewrite the room's status everywhere it appears
       keys.forEach((k) => {
-        qc.setQueriesData({ queryKey: k }, (old: unknown) => mutateRoomStatus(old, roomId, next));
+        qc.setQueriesData({ queryKey: k }, (old: unknown) => mutateRoomStatus(old, roomId, v.to));
       });
 
       setOpen(false); // close instantly
@@ -114,10 +137,37 @@ export function RoomActionPopover({ roomId, roomNumber, status, trigger, onChang
     },
   });
 
+  // Measure the trigger and place the menu in viewport (fixed) coords.
+  // Prefer below-and-right-aligned; flip above when there isn't room below,
+  // and clamp horizontally so it never runs off either edge.
+  useLayoutEffect(() => {
+    if (!open || !wrapRef.current) return;
+    const place = () => {
+      const r = wrapRef.current!.getBoundingClientRect();
+      const spaceBelow = window.innerHeight - r.bottom;
+      const openUp = spaceBelow < MENU_MAX_HEIGHT + GAP && r.top > spaceBelow;
+      const top = openUp ? r.top - GAP - MENU_MAX_HEIGHT : r.bottom + GAP;
+      // Right-align the menu to the trigger, then clamp into the viewport.
+      let left = r.right - MENU_WIDTH;
+      left = Math.max(GAP, Math.min(left, window.innerWidth - MENU_WIDTH - GAP));
+      setPos({ top: Math.max(GAP, top), left });
+    };
+    place();
+    window.addEventListener("scroll", place, true);
+    window.addEventListener("resize", place);
+    return () => {
+      window.removeEventListener("scroll", place, true);
+      window.removeEventListener("resize", place);
+    };
+  }, [open]);
+
   useEffect(() => {
     if (!open) return;
     const onClick = (e: MouseEvent) => {
-      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
+      const t = e.target as Node;
+      // The menu lives in a portal outside wrapRef, so check both.
+      if (wrapRef.current?.contains(t) || menuRef.current?.contains(t)) return;
+      setOpen(false);
     };
     const onEsc = (e: KeyboardEvent) => {
       if (e.key === "Escape") setOpen(false);
@@ -151,51 +201,58 @@ export function RoomActionPopover({ roomId, roomNumber, status, trigger, onChang
         {trigger}
       </span>
 
-      {open && (
-        <div className="absolute z-30 mt-2 right-0 w-64 bg-surface border border-borderc rounded-md shadow-lg overflow-hidden">
-          <div className="px-3 py-2 border-b border-borderc bg-brand-soft/40 flex items-center justify-between">
-            <div className="text-xs">
-              <span className="font-mono font-semibold">{roomNumber}</span>
-              <span className="ml-2 text-textSecondary capitalize">· {status}</span>
+      {open &&
+        pos &&
+        createPortal(
+          <div
+            ref={menuRef}
+            style={{ position: "fixed", top: pos.top, left: pos.left, width: MENU_WIDTH }}
+            className="z-[100] bg-surface border border-borderc rounded-md shadow-lg overflow-hidden"
+          >
+            <div className="px-3 py-2 border-b border-borderc bg-brand-soft/40 flex items-center justify-between">
+              <div className="text-xs">
+                <span className="font-mono font-semibold">{roomNumber}</span>
+                <span className="ml-2 text-textSecondary capitalize">· {status}</span>
+              </div>
+              <button onClick={() => setOpen(false)} className="text-textSecondary hover:text-textPrimary">
+                <X className="w-3.5 h-3.5" />
+              </button>
             </div>
-            <button onClick={() => setOpen(false)} className="text-textSecondary hover:text-textPrimary">
-              <X className="w-3.5 h-3.5" />
-            </button>
-          </div>
 
-          <div className="p-1.5 flex flex-col gap-1">
-            {options.map((opt) => {
-              const Icon =
-                opt.direction === "forward"
-                  ? ArrowRight
-                  : opt.direction === "reverse"
-                    ? Undo2
-                    : Wrench;
-              const cls =
-                opt.direction === "forward"
-                  ? "bg-brand text-cream hover:bg-brand-dark"
-                  : opt.direction === "reverse"
-                    ? "bg-surface text-textPrimary border border-borderc hover:bg-bg"
-                    : "bg-surface text-warning border border-warning/40 hover:bg-warning/5";
-              return (
-                <button
-                  key={opt.to}
-                  onClick={() => update.mutate(opt.to)}
-                  disabled={update.isPending}
-                  className={`w-full flex items-center gap-2 px-3 py-2 text-sm rounded-sm text-left transition-colors disabled:opacity-50 ${cls}`}
-                >
-                  {update.isPending ? (
-                    <Loader2 className="w-4 h-4 animate-spin shrink-0" />
-                  ) : (
-                    <Icon className="w-4 h-4 shrink-0" />
-                  )}
-                  <span className="flex-1">{opt.label}</span>
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      )}
+            <div className="p-1.5 flex flex-col gap-1">
+              {options.map((opt) => {
+                const Icon =
+                  opt.direction === "forward"
+                    ? ArrowRight
+                    : opt.direction === "reverse"
+                      ? Undo2
+                      : Wrench;
+                const cls =
+                  opt.direction === "forward"
+                    ? "bg-brand text-cream hover:bg-brand-dark"
+                    : opt.direction === "reverse"
+                      ? "bg-surface text-textPrimary border border-borderc hover:bg-bg"
+                      : "bg-surface text-warning border border-warning/40 hover:bg-warning/5";
+                return (
+                  <button
+                    key={opt.to}
+                    onClick={() => update.mutate({ to: opt.to, directReady: opt.directReady })}
+                    disabled={update.isPending}
+                    className={`w-full flex items-center gap-2 px-3 py-2 text-sm rounded-sm text-left transition-colors disabled:opacity-50 ${cls}`}
+                  >
+                    {update.isPending ? (
+                      <Loader2 className="w-4 h-4 animate-spin shrink-0" />
+                    ) : (
+                      <Icon className="w-4 h-4 shrink-0" />
+                    )}
+                    <span className="flex-1">{opt.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>,
+          document.body,
+        )}
     </div>
   );
 }

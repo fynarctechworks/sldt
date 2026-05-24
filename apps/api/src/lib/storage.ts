@@ -182,21 +182,32 @@ export async function uploadPublicPdf(
   pathInBucket: string,
   pdf: Buffer,
 ): Promise<string | null> {
+  return uploadPublicFile(pathInBucket, pdf, "application/pdf");
+}
+
+// Generic public-bucket uploader. Used for invoice/receipt PDFs as well
+// as room gallery images (Phase 1 amenities work). Same bucket, same
+// public-URL pattern — the caller decides the content type.
+export async function uploadPublicFile(
+  pathInBucket: string,
+  body: Buffer,
+  contentType: string,
+): Promise<string | null> {
   try {
     await ensureDocsBucket();
     const obfuscatedPath = withRandomSuffix(pathInBucket);
     const { error } = await supabaseAdmin.storage
       .from(DOCS_BUCKET)
-      .upload(obfuscatedPath, pdf, { contentType: "application/pdf", upsert: true });
+      .upload(obfuscatedPath, body, { contentType, upsert: true });
     if (error) {
-      logger.warn({ err: error.message, path: obfuscatedPath }, "PDF upload failed");
+      logger.warn({ err: error.message, path: obfuscatedPath }, "public upload failed");
       return null;
     }
     const { data } = supabaseAdmin.storage.from(DOCS_BUCKET).getPublicUrl(obfuscatedPath);
-    logger.info({ url: data.publicUrl }, "PDF uploaded");
+    logger.info({ url: data.publicUrl }, "public file uploaded");
     return data.publicUrl;
   } catch (err) {
-    logger.warn({ err: err instanceof Error ? err.message : err }, "uploadPublicPdf threw");
+    logger.warn({ err: err instanceof Error ? err.message : err }, "uploadPublicFile threw");
     return null;
   }
 }

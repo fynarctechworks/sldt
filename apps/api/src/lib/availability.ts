@@ -1,10 +1,15 @@
 import { and, eq, inArray, ne, or, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
+import { RESERVATION_BLOCKING_STATUSES } from "../db/schema/enums.js";
 import { reservationRooms, reservations } from "../db/schema/reservations.js";
 import { rooms } from "../db/schema/rooms.js";
 
 type Db = typeof db;
 type Exec = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
+
+// Drizzle's inArray wants a writable string[]. Materialise the readonly
+// enum tuple once at module load so every availability query reuses it.
+const BLOCKING_STATUSES = [...RESERVATION_BLOCKING_STATUSES];
 
 export async function findAvailableRooms(checkIn: string, checkOut: string) {
   const conflicts = db
@@ -13,7 +18,7 @@ export async function findAvailableRooms(checkIn: string, checkOut: string) {
     .innerJoin(reservations, eq(reservations.id, reservationRooms.reservationId))
     .where(
       and(
-        inArray(reservations.status, ["confirmed", "checked_in"]),
+        inArray(reservations.status, BLOCKING_STATUSES),
         sql`daterange(${reservations.checkInDate}, ${reservations.checkOutDate}, '[)') && daterange(${checkIn}::date, ${checkOut}::date, '[)')`,
       ),
     );
@@ -33,7 +38,7 @@ export async function isRoomAvailable(
 ): Promise<boolean> {
   const overlap = and(
     eq(reservationRooms.roomId, roomId),
-    inArray(reservations.status, ["confirmed", "checked_in"]),
+    inArray(reservations.status, BLOCKING_STATUSES),
     sql`daterange(${reservations.checkInDate}, ${reservations.checkOutDate}, '[)') && daterange(${checkIn}::date, ${checkOut}::date, '[)')`,
     excludeReservationId ? ne(reservations.id, excludeReservationId) : undefined,
   );
@@ -58,34 +63,41 @@ export async function lockKey(exec: Exec, key: string): Promise<void> {
   await exec.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${key})::bigint)`);
 }
 
+// Sequence allocators. Phase 1 replaced the prior MAX(...)+advisory-lock
+// approach with real Postgres sequences (migration 0011). nextval() is
+// transaction-safe, contention-free, and gap-tolerant (a rolled-back tx
+// consumes the number, but for SLDT-RES/INV/RCP that's auditor-acceptable
+// and arguably *desirable* — gaps make a deleted reservation visible).
+//
+// The `like` parameter is now ignored at the DB level but kept in the
+// signature so callers don't have to change. If we ever introduce a
+// second numbering domain (e.g. SLDT-CN- for credit notes) we'll add a
+// new sequence rather than parameterising the LIKE.
 export async function nextDailySequence(
-  like: string,
+  _like: string,
   exec: Exec = db,
 ): Promise<number> {
-  await lockKey(exec, `seq:reservation:${like}`);
-  const result = await exec.execute<{ max: number | null }>(
-    sql`SELECT COALESCE(MAX(CAST(SPLIT_PART(reservation_number, '-', 3) AS INT)), 0) AS max FROM reservations WHERE reservation_number LIKE ${like}`,
+  const result = await exec.execute<{ nextval: string | number }>(
+    sql`SELECT nextval('sldt_reservation_seq') AS nextval`,
   );
-  const row = result[0] as { max: number | null } | undefined;
-  return (row?.max ?? 0) + 1;
+  const row = result[0] as { nextval: string | number } | undefined;
+  return Number(row?.nextval ?? 0);
 }
 
-export async function nextInvoiceSequence(like: string, exec: Exec = db): Promise<number> {
-  await lockKey(exec, `seq:invoice:${like}`);
-  const result = await exec.execute<{ max: number | null }>(
-    sql`SELECT COALESCE(MAX(CAST(SPLIT_PART(invoice_number, '-', 3) AS INT)), 0) AS max FROM invoices WHERE invoice_number LIKE ${like}`,
+export async function nextInvoiceSequence(_like: string, exec: Exec = db): Promise<number> {
+  const result = await exec.execute<{ nextval: string | number }>(
+    sql`SELECT nextval('sldt_invoice_seq') AS nextval`,
   );
-  const row = result[0] as { max: number | null } | undefined;
-  return (row?.max ?? 0) + 1;
+  const row = result[0] as { nextval: string | number } | undefined;
+  return Number(row?.nextval ?? 0);
 }
 
-export async function nextReceiptSequence(like: string, exec: Exec = db): Promise<number> {
-  await lockKey(exec, `seq:receipt:${like}`);
-  const result = await exec.execute<{ max: number | null }>(
-    sql`SELECT COALESCE(MAX(CAST(SPLIT_PART(receipt_number, '-', 3) AS INT)), 0) AS max FROM payments WHERE receipt_number LIKE ${like}`,
+export async function nextReceiptSequence(_like: string, exec: Exec = db): Promise<number> {
+  const result = await exec.execute<{ nextval: string | number }>(
+    sql`SELECT nextval('sldt_receipt_seq') AS nextval`,
   );
-  const row = result[0] as { max: number | null } | undefined;
-  return (row?.max ?? 0) + 1;
+  const row = result[0] as { nextval: string | number } | undefined;
+  return Number(row?.nextval ?? 0);
 }
 
 // Per-room advisory lock for double-booking prevention. Hold inside a tx

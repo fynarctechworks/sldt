@@ -39,6 +39,8 @@ router.get("/public", requireAuth, async (_req, res) => {
     .select({
       hotelName: settings.hotelName,
       hotelAddress: settings.hotelAddress,
+      hotelLatitude: settings.hotelLatitude,
+      hotelLongitude: settings.hotelLongitude,
       hotelPhone: settings.hotelPhone,
       hotelEmail: settings.hotelEmail,
       ownerPhone: settings.ownerPhone,

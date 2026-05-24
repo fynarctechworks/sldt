@@ -240,7 +240,12 @@ export default function ReservationDetail() {
   });
 
   const cancel = useMutation({
-    mutationFn: (reason: string) => api.post(`/reservations/${id}/cancel`, { reason }),
+    // The cancel endpoint's zod schema (cancelSchema) expects the field
+    // `cancellationReason`, not `reason` — sending the wrong key made the
+    // server receive undefined and fail validation ("Invalid request
+    // payload").
+    mutationFn: (cancellationReason: string) =>
+      api.post(`/reservations/${id}/cancel`, { cancellationReason }),
     onSuccess: invalidate,
     onError: (e: Error) => setErr(e.message),
   });
@@ -1702,11 +1707,13 @@ function ExtendModal(props: {
             checked={overrideRate}
             onChange={(e) => setOverrideRate(e.target.checked)}
           />
-          <label htmlFor="overrideRate" className="text-sm">Override rate per night</label>
+          <label htmlFor="overrideRate" className="text-sm">
+            Set a different rate for the new night(s)
+          </label>
         </div>
         {overrideRate && (
           <div>
-            <label className="label block mb-1">Rate / night (₹)</label>
+            <label className="label block mb-1">Rate / night for the extension (₹)</label>
             <input
               className="input"
               type="number"
@@ -1715,6 +1722,27 @@ function ExtendModal(props: {
               value={ratePerNight}
               onChange={(e) => setRatePerNight(Number(e.target.value))}
             />
+            {/* Live preview so staff see exactly what the guest pays for
+                the extension. Existing nights are NOT re-priced — only
+                the new nights bill at this rate. */}
+            {(() => {
+              const extraNights = Math.max(
+                0,
+                Math.round(
+                  (new Date(newCheckOutDate).getTime() -
+                    new Date(props.currentCheckOut).getTime()) /
+                    86400000,
+                ),
+              );
+              if (extraNights <= 0) return null;
+              return (
+                <p className="text-[11px] text-textSecondary mt-1">
+                  {extraNights} new night{extraNights === 1 ? "" : "s"} × ₹
+                  {ratePerNight.toFixed(2)} = <strong>₹{(extraNights * ratePerNight).toFixed(2)}</strong>.
+                  Existing nights stay at ₹{Number(props.currentRate).toFixed(2)}.
+                </p>
+              );
+            })()}
           </div>
         )}
         {err && <div className="text-danger text-sm">{err}</div>}

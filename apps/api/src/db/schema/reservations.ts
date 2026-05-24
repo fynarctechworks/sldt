@@ -12,6 +12,8 @@ import {
 import { BOOKING_SOURCES, RESERVATION_STATUSES } from "./enums.js";
 import { guests } from "./guests.js";
 import { profiles } from "./profiles.js";
+import { properties } from "./properties.js";
+import { ratePlans } from "./ratePlans.js";
 import { rooms } from "./rooms.js";
 
 export const reservations = pgTable(
@@ -19,6 +21,24 @@ export const reservations = pgTable(
   {
     id: uuid("id").primaryKey().defaultRandom(),
     reservationNumber: text("reservation_number").notNull().unique(),
+    // Phase 2: reservations live under a property. Back-filled to
+    // PRIMARY by migration 0013.
+    propertyId: uuid("property_id")
+      .notNull()
+      .references(() => properties.id),
+    // Phase 2: optional rate-plan snapshot. The id FK lets the rate
+    // calendar editor surface "live" rate-plan info; the code text is
+    // duplicated for legibility if the plan is later deleted.
+    ratePlanId: uuid("rate_plan_id").references(() => ratePlans.id),
+    ratePlanCode: text("rate_plan_code"),
+    // Phase 2 Revenue & Ops — optional company (B2B) and group block.
+    // Both FK-only; the application snapshots company_code for legibility.
+    // We do NOT import companies / group_blocks here to avoid a cyclic
+    // schema dep; the columns are plain uuid types and Drizzle is happy
+    // because the FK constraint lives at the DB level (added by 0014).
+    companyId: uuid("company_id"),
+    companyCode: text("company_code"),
+    groupBlockId: uuid("group_block_id"),
     guestId: uuid("guest_id")
       .notNull()
       .references(() => guests.id),

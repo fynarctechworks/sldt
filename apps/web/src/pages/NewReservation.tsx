@@ -1019,9 +1019,14 @@ export default function NewReservation() {
               <label className="label block mb-1">Phone</label>
               <input
                 className="input"
+                type="tel"
+                inputMode="numeric"
+                maxLength={10}
                 value={newGuest.phone}
-                onChange={(e) => setNewGuest({ ...newGuest, phone: e.target.value })}
-                placeholder="+91 98765 43210"
+                onChange={(e) =>
+                  setNewGuest({ ...newGuest, phone: e.target.value.replace(/\D/g, "").slice(0, 10) })
+                }
+                placeholder="9876543210"
               />
             </div>
             <div>
@@ -1105,7 +1110,7 @@ export default function NewReservation() {
                 ? "Walk-in guests must upload a customer photo and a government ID photo now. Check-in cannot proceed without them."
                 : "Upload a clear customer photo and government ID. You can skip now and upload later, but check-in will be blocked until both are verified."}
             </div>
-            <div className="grid grid-cols-3 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
               <KycFilePicker label="Customer Photo" file={kycPhoto} onChange={setKycPhoto} required={mode === "walkin"} />
               <KycFilePicker label="ID Front" file={kycFront} onChange={setKycFront} required={mode === "walkin"} />
               <KycFilePicker label="ID Back" file={kycBack} onChange={setKycBack} />

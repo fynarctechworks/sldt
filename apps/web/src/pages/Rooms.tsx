@@ -42,6 +42,11 @@ export default function Rooms() {
       }),
   });
 
+  const { data: allRooms = [] } = useQuery({
+    queryKey: ["rooms", "all"],
+    queryFn: () => api.get<Room[]>("/rooms", {}),
+  });
+
   // Pre-filter to the user-selected floor/status/type, then group by floor for
   // the section headers. The status filter narrows what the grid shows; the
   // chips above the grid always reflect *unfiltered* counts so staff knows the
@@ -131,14 +136,21 @@ export default function Rooms() {
           <div className="grow" />
 
           <div className="flex items-center gap-2">
-            <input
-              className="input !h-8 w-20 text-sm"
-              type="number"
+            <select
+              className="input !h-8 w-28 text-sm"
               value={floor}
               onChange={(e) => setFloor(e.target.value)}
-              placeholder="Floor"
               aria-label="Filter by floor"
-            />
+            >
+              <option value="">All floors</option>
+              {Array.from(new Set(allRooms.map((r) => r.floor)))
+                .sort((a, b) => a - b)
+                .map((f) => (
+                  <option key={f} value={String(f)}>
+                    Floor {f}
+                  </option>
+                ))}
+            </select>
             <select
               className="input !h-8 w-40 text-sm"
               value={type}

@@ -4,9 +4,11 @@ import {
   BedDouble,
   CalendarPlus,
   CheckCircle2,
+  LineChart,
   LogIn,
   LogOut,
   Receipt,
+  TrendingUp,
   UserPlus,
   Wallet,
 } from "lucide-react";
@@ -43,6 +45,18 @@ interface DashboardData {
   // Omitted by the API for users without `view_revenue`. We still render
   // the Dashboard, just without the Revenue Today tile.
   revenue_today?: { total_collected: number };
+  revenue_kpis?: {
+    mtd_collected: number;
+    mtd_room_revenue: number;
+    mtd_room_nights: number;
+    adr: number;
+    revpar: number;
+  };
+  // Forecast is always present (occupancy-only, no money).
+  forecast: {
+    total_rooms: number;
+    days: { day: string; occupied: number; arrivals: number }[];
+  };
   room_grid: { id: string; room_number: string; room_type: string; status: string; guest_name: string | null; reservation_id: string | null }[];
 }
 
@@ -76,46 +90,11 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {data.overdue && data.overdue.count > 0 && (
-        <div className="card border-2 border-danger/40 bg-danger/5">
-          <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
-            <div className="flex items-center gap-2">
-              <span className="text-danger text-lg leading-none">⚠</span>
-              <div className="font-bold text-danger uppercase tracking-wider text-sm">
-                {data.overdue.count} Overdue Check-out{data.overdue.count === 1 ? "" : "s"}
-              </div>
-            </div>
-            <div className="text-xs text-textSecondary">
-              Guest stayed past scheduled check-out. Resolve now.
-            </div>
-          </div>
-          <div className="divide-y divide-borderc/40">
-            {data.overdue.reservations.map((o) => (
-              <div
-                key={o.id}
-                className="flex items-center justify-between py-2 gap-3 flex-wrap"
-              >
-                <div className="min-w-0">
-                  <div className="font-mono text-accentBlue text-sm">{o.reservationNumber}</div>
-                  <div className="text-sm font-semibold text-brand-dark truncate">
-                    {o.guestName}
-                  </div>
-                  <div className="text-xs text-textSecondary">
-                    Scheduled out {o.checkOutDate} · {o.daysOverdue} day
-                    {o.daysOverdue === 1 ? "" : "s"} late
-                  </div>
-                </div>
-                <button
-                  className="btn-primary !h-8 text-xs"
-                  onClick={() => navigate(`/reservations/${o.id}`)}
-                >
-                  Open reservation
-                </button>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+      {/* Overdue check-out alert now lives in the app-wide sticky
+          CheckoutAlerts bar (rendered in AppShell), so it follows
+          staff to every page instead of only the Dashboard. The
+          duplicate card that used to live here was removed to keep a
+          single source of truth. */}
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <StatCard
@@ -149,6 +128,97 @@ export default function Dashboard() {
           />
         </Can>
       </div>
+
+      {/* Commercial KPIs. Three rupee numbers in a row only make sense
+          for users authorised to see money — gated behind view_revenue.
+          ADR and RevPAR are the standard hotel-industry benchmarks; we
+          surface both so operators can compare against industry data
+          (HVS / STR / Hotelivate quarterly reports). */}
+      {data.revenue_kpis && (
+        <Can do="view_revenue">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <StatCard
+              icon={<Receipt className="w-5 h-5" />}
+              label="Revenue MTD"
+              value={inr(data.revenue_kpis.mtd_collected)}
+              sub="collected this month"
+            />
+            <StatCard
+              icon={<LineChart className="w-5 h-5" />}
+              label="ADR"
+              value={inr(data.revenue_kpis.adr)}
+              sub={`${data.revenue_kpis.mtd_room_nights} room-night${data.revenue_kpis.mtd_room_nights === 1 ? "" : "s"}`}
+            />
+            <StatCard
+              icon={<TrendingUp className="w-5 h-5" />}
+              label="RevPAR"
+              value={inr(data.revenue_kpis.revpar)}
+              sub="revenue per available room"
+            />
+            <StatCard
+              icon={<Wallet className="w-5 h-5" />}
+              label="Room Revenue MTD"
+              value={inr(data.revenue_kpis.mtd_room_revenue)}
+              sub="rooms only, ex-extras"
+            />
+          </div>
+        </Can>
+      )}
+
+      {/* 7-day forecast strip. Bars sized to occupancy percentage; the
+          top of each cell shows the predicted-occupied count out of
+          total rooms. Arrivals are inset as a small badge so the desk
+          can see "we have 11 in-house tomorrow, of whom 4 are new
+          arrivals". Visible to everyone — no money on this widget. */}
+      {data.forecast.days.length > 0 && (
+        <div className="card">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="font-semibold text-brand-dark">Next 7 Days · Forecast</h2>
+            <span className="text-xs text-textSecondary">
+              {data.forecast.total_rooms} room{data.forecast.total_rooms === 1 ? "" : "s"} total
+            </span>
+          </div>
+          <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-7 gap-2">
+            {data.forecast.days.map((d, i) => {
+              const pct =
+                data.forecast.total_rooms > 0
+                  ? Math.round((d.occupied / data.forecast.total_rooms) * 100)
+                  : 0;
+              const dt = new Date(d.day + "T00:00:00");
+              return (
+                <div
+                  key={d.day}
+                  className="border border-borderc rounded-md p-2 bg-surface flex flex-col gap-1"
+                  title={`${d.occupied} occupied · ${d.arrivals} arriving · ${pct}%`}
+                >
+                  <div className="text-[10px] uppercase tracking-wider text-textSecondary leading-none">
+                    {i === 0
+                      ? "Today"
+                      : dt.toLocaleDateString("en-IN", { weekday: "short" })}
+                  </div>
+                  <div className="text-xs font-mono text-brand-dark leading-none">
+                    {dt.toLocaleDateString("en-IN", { day: "2-digit", month: "short" })}
+                  </div>
+                  <div className="mt-1 h-1.5 rounded-full bg-borderc/40 overflow-hidden">
+                    <div
+                      className={`h-full ${pct >= 80 ? "bg-danger" : pct >= 50 ? "bg-brass" : "bg-brand-dark"}`}
+                      style={{ width: `${pct}%` }}
+                    />
+                  </div>
+                  <div className="flex items-baseline justify-between">
+                    <span className="text-sm font-semibold text-brand-dark">{pct}%</span>
+                    {d.arrivals > 0 && (
+                      <span className="text-[10px] text-brass bg-brass/15 px-1.5 py-0.5 rounded-sm font-semibold">
+                        +{d.arrivals}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       <div className="card">
         <h2 className="font-semibold text-brand-dark mb-4">Availability by Room Type</h2>
@@ -218,7 +288,7 @@ export default function Dashboard() {
 
                     const tile = (
                       <span
-                        className={`min-w-[112px] px-4 py-3 rounded-lg font-mono shadow-sm border-2 hover:scale-105 hover:shadow-md transition-all flex flex-col items-center leading-tight cursor-pointer ${gridColor(r.status)}`}
+                        className={`min-w-[84px] sm:min-w-[112px] px-3 sm:px-4 py-2 sm:py-3 rounded-lg font-mono shadow-sm border-2 hover:scale-105 hover:shadow-md transition-all flex flex-col items-center leading-tight cursor-pointer ${gridColor(r.status)}`}
                       >
                         <span className="text-2xl font-bold tracking-wide">{r.room_number}</span>
                         <span className="text-[11px] uppercase tracking-[0.1em] font-semibold opacity-90 mt-1">
@@ -261,7 +331,7 @@ export default function Dashboard() {
                             navigate(`/rooms/${r.id}`);
                           }
                         }}
-                        className={`min-w-[112px] px-4 py-3 rounded-lg font-mono shadow-sm border-2 hover:scale-105 hover:shadow-md transition-all flex flex-col items-center leading-tight ${gridColor(r.status)}`}
+                        className={`min-w-[84px] sm:min-w-[112px] px-3 sm:px-4 py-2 sm:py-3 rounded-lg font-mono shadow-sm border-2 hover:scale-105 hover:shadow-md transition-all flex flex-col items-center leading-tight ${gridColor(r.status)}`}
                         title={tip}
                       >
                         <span className="text-2xl font-bold tracking-wide">{r.room_number}</span>

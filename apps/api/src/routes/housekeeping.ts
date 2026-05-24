@@ -14,6 +14,11 @@ const router = Router();
 const statusUpdate = z.object({
   status: z.enum(["dirty", "clean", "inspected", "available"]),
   reason: z.string().max(500).optional(),
+  // When true, a single "Mark Ready" action may jump a dirty or clean
+  // room straight to available, skipping the clean→inspected→available
+  // chain. Used by small properties where one person cleans and readies
+  // a room in one go. The step-by-step transitions still work without it.
+  directReady: z.boolean().optional(),
 });
 
 const maintenanceFlag = z.object({
@@ -39,7 +44,11 @@ router.get("/", requireAuth, async (req, res) => {
 
 router.patch("/:roomId", requireAuth, validate(statusUpdate), async (req, res) => {
   const roomId = req.params.roomId!;
-  const { status, reason } = req.body as { status: string; reason?: string };
+  const { status, reason, directReady } = req.body as {
+    status: string;
+    reason?: string;
+    directReady?: boolean;
+  };
 
   const current = await db.select().from(rooms).where(eq(rooms.id, roomId)).limit(1);
   if (!current.length) return fail(res, 404, "NOT_FOUND", "Room not found");
@@ -54,6 +63,12 @@ router.patch("/:roomId", requireAuth, validate(statusUpdate), async (req, res) =
     reserved: [],
     maintenance: ["available", "dirty"],
   };
+  // One-click "Mark Ready": allow a dirty or clean room to go straight to
+  // available, bypassing the inspection chain. Only honoured when the
+  // caller explicitly opts in, so accidental skips can't happen.
+  if (directReady && status === "available" && (room.status === "dirty" || room.status === "clean")) {
+    validTransitions[room.status] = [...(validTransitions[room.status] ?? []), "available"];
+  }
   const allowed = validTransitions[room.status] ?? [];
   if (!allowed.includes(status)) {
     return fail(
@@ -74,7 +89,7 @@ router.patch("/:roomId", requireAuth, validate(statusUpdate), async (req, res) =
     action: "housekeeping_update",
     entityType: "room",
     entityId: roomId,
-    description: `Room ${updated!.roomNumber}: ${room.status} → ${status}${reason ? ` (${reason})` : ""}`,
+    description: `Room ${updated!.roomNumber}: ${room.status} → ${status}${directReady && status === "available" ? " (marked ready)" : ""}${reason ? ` (${reason})` : ""}`,
     performedBy: req.user!.id,
     ipAddress: req.ip,
   });

@@ -6,10 +6,13 @@ import { Loader } from "@/components/Loader";
 import { useAuth } from "./AuthContext";
 
 export function ProtectedRoute({ children }: { children: ReactNode }) {
-  const { session, loading } = useAuth();
+  const { session, loading, mfaPending } = useAuth();
   const location = useLocation();
   if (loading) return <Loader size="lg" fullscreen />;
-  if (!session) return <Navigate to="/login" state={{ from: location }} replace />;
+  // A session that still owes a second factor is NOT authenticated —
+  // bounce to /login where the MFA challenge step lives.
+  if (!session || mfaPending)
+    return <Navigate to="/login" state={{ from: location }} replace />;
   return <>{children}</>;
 }
 

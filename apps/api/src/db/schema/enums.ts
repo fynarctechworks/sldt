@@ -1,3 +1,9 @@
+// Legacy role tags. Kept for back-compat with the small handful of code
+// paths that still inspect profiles.role directly (audit log filters,
+// seed scripts). The authoritative model is RBAC via roles +
+// role_permissions; new roles (manager, accountant, owner) are seeded
+// into that system, not added here, because adding to this enum forces
+// schema-level CHECK constraints we don't want on a soft tag.
 export const ROLES = ["admin", "frontdesk", "housekeeping"] as const;
 export type Role = (typeof ROLES)[number];
 
@@ -23,7 +29,20 @@ export const ID_PROOF_TYPES = [
 ] as const;
 export type IdProofType = (typeof ID_PROOF_TYPES)[number];
 
+// Reservation lifecycle. `inquiry`, `hold`, and `pending_payment` are
+// pre-confirmation states added in Phase 1:
+//   inquiry         — guest asked about availability; no rooms blocked.
+//   hold            — rooms tentatively blocked for N hours (auto-expires
+//                     via the holds_expire scheduled job — see TODO).
+//   confirmed       — booking is firm.
+//   pending_payment — confirmed but the agreed deposit hasn't arrived.
+//                     Surfaces in Collections as a follow-up.
+//   checked_in / checked_out — physical-presence states.
+//   cancelled / no_show — terminal negative states.
 export const RESERVATION_STATUSES = [
+  "inquiry",
+  "hold",
+  "pending_payment",
   "confirmed",
   "checked_in",
   "checked_out",
@@ -31,6 +50,16 @@ export const RESERVATION_STATUSES = [
   "no_show",
 ] as const;
 export type ReservationStatus = (typeof RESERVATION_STATUSES)[number];
+
+// Statuses that block room inventory. Used by availability checks and
+// the dashboard "occupied vs reserved" logic. inquiry doesn't block;
+// hold and pending_payment do (they were promised a room).
+export const RESERVATION_BLOCKING_STATUSES: readonly ReservationStatus[] = [
+  "hold",
+  "pending_payment",
+  "confirmed",
+  "checked_in",
+];
 
 export const INVOICE_STATUSES = ["issued", "paid", "partial", "voided"] as const;
 export type InvoiceStatus = (typeof INVOICE_STATUSES)[number];

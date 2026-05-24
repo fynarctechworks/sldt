@@ -65,8 +65,49 @@ async function sendWhatsAppStub(msg: SmsMessage): Promise<SendResult> {
 }
 
 async function sendEmailStub(_msg: EmailMessage): Promise<SendResult> {
-  // Email channel disabled — WhatsApp-only deployment via Twilio.
+  // Email channel disabled — fallback used when no provider is set.
   return { ok: true, provider: "disabled", id: "skipped" };
+}
+
+// Send via Resend (https://resend.com). Feature-flagged on env:
+// RESEND_API_KEY + RESEND_FROM must both be present. If either is
+// missing we fall back to the stub silently so the calling code path
+// (e.g. DPDP export with email-delivery) still completes.
+async function sendEmailResend(msg: EmailMessage): Promise<SendResult> {
+  if (!env.RESEND_API_KEY || !env.RESEND_FROM) {
+    return sendEmailStub(msg);
+  }
+  try {
+    const res = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.RESEND_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from: env.RESEND_FROM,
+        to: [msg.to],
+        subject: msg.subject,
+        text: msg.text,
+        html: msg.html,
+      }),
+    });
+    const json = (await res.json().catch(() => ({}))) as {
+      id?: string;
+      message?: string;
+      name?: string;
+    };
+    if (!res.ok) {
+      return { ok: false, provider: "resend", error: json.message ?? `HTTP ${res.status}` };
+    }
+    return { ok: true, provider: "resend", id: json.id };
+  } catch (err) {
+    return {
+      ok: false,
+      provider: "resend",
+      error: err instanceof Error ? err.message : "unknown",
+    };
+  }
 }
 
 function normalizeIndianNumber(raw: string): string {
@@ -165,8 +206,14 @@ export const messaging = {
   sendSms(msg: SmsMessage): Promise<SendResult> {
     return env.NOTIFICATIONS_PROVIDER === "live" ? sendWhatsAppLive(msg) : sendWhatsAppStub(msg);
   },
-  // Email channel is intentionally disabled — WhatsApp-only deployment.
+  // Email channel — uses Resend when configured, stub otherwise. The
+  // switch is purely env-driven: presence of RESEND_API_KEY + RESEND_FROM
+  // turns the channel on; absence keeps it disabled.
   sendEmail(msg: EmailMessage): Promise<SendResult> {
+    if (env.RESEND_API_KEY && env.RESEND_FROM) return sendEmailResend(msg);
     return sendEmailStub(msg);
+  },
+  isEmailConfigured(): boolean {
+    return !!(env.RESEND_API_KEY && env.RESEND_FROM);
   },
 };

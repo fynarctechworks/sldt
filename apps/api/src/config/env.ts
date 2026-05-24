@@ -91,6 +91,16 @@ const envSchema = z.object({
   OTP_LENGTH: z.coerce.number().int().min(4).max(8).default(6),
   OTP_TTL_SECONDS: z.coerce.number().int().min(60).max(1800).default(300),
   OTP_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(10).default(5),
+
+  // Phase 3 — feature-flagged integrations. All optional; the modules
+  // detect missing keys and degrade gracefully.
+  RAZORPAY_KEY_ID: z.string().optional().transform((v) => (v === "" ? undefined : v)),
+  RAZORPAY_KEY_SECRET: z.string().optional().transform((v) => (v === "" ? undefined : v)),
+  RESEND_API_KEY: z.string().optional().transform((v) => (v === "" ? undefined : v)),
+  RESEND_FROM: z.string().optional().transform((v) => (v === "" ? undefined : v)),
+  // Google review link the post-checkout WhatsApp deep-links to. When
+  // absent, the review-prompt template is sent without a link.
+  GOOGLE_REVIEW_URL: z.string().url().optional().transform((v) => (v === "" ? undefined : v)),
 });
 
 const parsed = envSchema.safeParse(process.env);

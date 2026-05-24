@@ -213,6 +213,29 @@ router.patch(
     if (inv[0]!.status === "voided") {
       return fail(res, 400, "VOIDED", "Invoice is voided");
     }
+    // Paid invoices are immutable. Phase 1 promise: once balance_due
+    // hits zero and the invoice flips to status='paid', the document
+    // is locked. To correct a paid invoice, staff must Void → Reissue,
+    // which produces a brand-new invoice number with a clean audit
+    // trail and leaves the original payment record intact.
+    //
+    // The narrow exception is the `notes` field. Internal notes can
+    // still be appended (e.g. "Customer queried on 12-May, resolved
+    // 13-May") since they don't change the financial position. Every
+    // other key is rejected.
+    if (inv[0]!.status === "paid") {
+      const onlyNotes =
+        Object.keys(req.body ?? {}).length > 0 &&
+        Object.keys(req.body ?? {}).every((k) => k === "notes");
+      if (!onlyNotes) {
+        return fail(
+          res,
+          409,
+          "INVOICE_LOCKED",
+          "Paid invoices are immutable. Void & reissue to correct it.",
+        );
+      }
+    }
 
     const original = inv[0]!;
     const beforeSnapshot = {

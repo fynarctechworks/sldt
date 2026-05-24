@@ -11,9 +11,11 @@ import {
 } from "lucide-react";
 import { useAuth } from "@/auth/AuthContext";
 import { useDialog } from "@/components/Dialog";
+import { api } from "@/lib/api";
+import { supabase } from "@/lib/supabase";
 
 export default function Login() {
-  const { signIn, session } = useAuth();
+  const { signIn, verifyMfa, session, mfaPending } = useAuth();
   const dialog = useDialog();
   const location = useLocation();
   const emailId = useId();
@@ -28,11 +30,22 @@ export default function Login() {
   const [error, setError] = useState<string | null>(null);
   const [touched, setTouched] = useState<{ email?: boolean; pw?: boolean }>({});
   const [capsOn, setCapsOn] = useState(false);
+  // Second-factor step. Shown after a correct password when the account
+  // has a verified authenticator. mfaCode holds the 6-digit TOTP entry.
+  const [mfaStep, setMfaStep] = useState(false);
+  const [mfaCode, setMfaCode] = useState("");
 
   useEffect(() => {
     const saved = localStorage.getItem("hd:lastEmail");
     if (saved) setEmail(saved);
   }, []);
+
+  // If the auth context says a challenge is owed (e.g. a restored AAL1
+  // session on page load), surface the MFA step even without going
+  // through the password form again.
+  useEffect(() => {
+    if (mfaPending) setMfaStep(true);
+  }, [mfaPending]);
 
   // Shown when api.ts redirects here after a 401. Avoids confusing the user
   // ("why am I back at login?") and tells them what happened.
@@ -41,7 +54,10 @@ export default function Login() {
     [location.search],
   );
 
-  if (session) {
+  // Only redirect into the app when fully authenticated — a session that
+  // still owes a second factor (mfaPending) must stay here for the
+  // challenge step.
+  if (session && !mfaPending) {
     const from =
       (location.state as { from?: { pathname: string } } | null)?.from?.pathname ?? "/";
     return <Navigate to={from} replace />;
@@ -58,14 +74,124 @@ export default function Login() {
     setError(null);
     setBusy(true);
     try {
-      await signIn(email, password);
+      const { mfaRequired } = await signIn(email, password);
       if (remember) localStorage.setItem("hd:lastEmail", email);
       else localStorage.removeItem("hd:lastEmail");
+      // If a second factor is owed, show the code step. Otherwise the
+      // `session && !mfaPending` redirect above takes over on re-render.
+      if (mfaRequired) {
+        setMfaStep(true);
+        setMfaCode("");
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Login failed");
     } finally {
       setBusy(false);
     }
+  }
+
+  // Second-factor verification. Sends the 6-digit TOTP code to Supabase;
+  // on success the session upgrades to AAL2 and the redirect above fires.
+  async function onVerifyMfa(e: React.FormEvent) {
+    e.preventDefault();
+    const code = mfaCode.replace(/\s/g, "");
+    if (code.length < 6 || busy) return;
+    setError(null);
+    setBusy(true);
+    try {
+      await verifyMfa(code);
+      // verifyMfa clears mfaPending; the `session && !mfaPending` guard
+      // re-renders and navigates into the app.
+    } catch (err) {
+      setError(
+        err instanceof Error && err.message
+          ? err.message
+          : "That code didn't work. Check your authenticator and try again.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Forgot-password: prompt for the email, then ask Supabase Auth to send
+  // a recovery email. The link in that email lands the user on
+  // /reset-password (see redirectTo) where they set a new password.
+  //
+  // We ALWAYS show the same "if an account exists, you'll get an email"
+  // confirmation regardless of whether the email is registered — this is
+  // standard practice so the reset form can't be used to enumerate which
+  // emails have accounts.
+  async function onForgotPassword() {
+    const entered = await dialog.prompt({
+      title: "Reset your password",
+      message:
+        "Enter the email for your account. We'll send a link to set a new password.",
+      placeholder: "you@sldtstayinn.com",
+      defaultValue: emailValid ? email : "",
+      okLabel: "Send reset link",
+      cancelLabel: "Cancel",
+      required: true,
+    });
+    if (!entered) return;
+    const target = entered.trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(target)) {
+      await dialog.alert({
+        title: "Invalid email",
+        message: "That doesn't look like a valid email address. Please try again.",
+        okLabel: "OK",
+      });
+      return;
+    }
+
+    // First confirm the email belongs to a registered, active staff
+    // account. If not, tell the user clearly to contact their admin
+    // rather than silently sending nothing.
+    let registered = false;
+    try {
+      const r = await api.post<{ registered: boolean }>(
+        "/auth/forgot-password/check",
+        { email: target },
+      );
+      registered = r.registered;
+    } catch (err) {
+      // If the check itself fails (rate-limited or server down), surface
+      // a soft error rather than pretending it worked.
+      await dialog.alert({
+        title: "Couldn't send reset link",
+        message:
+          err instanceof Error && err.message
+            ? err.message
+            : "Something went wrong. Please try again in a moment.",
+        okLabel: "OK",
+      });
+      return;
+    }
+
+    if (!registered) {
+      await dialog.alert({
+        title: "Email not registered",
+        message: `${target} isn't registered as a staff account. Please check the spelling, or contact your hotel administrator to set up access.`,
+        okLabel: "OK",
+      });
+      return;
+    }
+
+    // Registered → ask Supabase to send the recovery email.
+    try {
+      await supabase.auth.resetPasswordForEmail(target, {
+        // The recovery link redirects here; the reset page reads the
+        // recovery token from the URL hash that Supabase appends.
+        redirectTo: `${window.location.origin}/reset-password`,
+      });
+    } catch {
+      // Swallow the underlying send error — the account exists (we just
+      // confirmed it), so a generic "check your email" is correct UX.
+    }
+    await dialog.alert({
+      title: "Check your email",
+      message: `A password-reset link has been sent to ${target}. The link expires in 1 hour.`,
+      okLabel: "Got it",
+    });
   }
 
   return (
@@ -134,12 +260,14 @@ export default function Login() {
             </div>
           </div>
 
-          <div>
-            <h1 className="text-2xl font-semibold text-navy">Welcome back</h1>
-            <p className="text-textSecondary text-sm mt-1">
-              Sign in to continue to your workspace.
-            </p>
-          </div>
+          {!mfaStep && (
+            <div>
+              <h1 className="text-2xl font-semibold text-navy">Welcome back</h1>
+              <p className="text-textSecondary text-sm mt-1">
+                Sign in to continue to your workspace.
+              </p>
+            </div>
+          )}
 
           {expired && !error && (
             <div
@@ -162,6 +290,8 @@ export default function Login() {
             </div>
           )}
 
+          {!mfaStep && (
+          <>
           <div>
             <label htmlFor={emailId} className="label block mb-1">
               Email
@@ -198,13 +328,7 @@ export default function Login() {
               <button
                 type="button"
                 className="text-xs text-accentBlue hover:underline"
-                onClick={() =>
-                  dialog.alert({
-                    title: "Reset your password",
-                    message: "Please contact your administrator to reset your password.",
-                    okLabel: "Got it",
-                  })
-                }
+                onClick={onForgotPassword}
               >
                 Forgot password?
               </button>
@@ -217,6 +341,7 @@ export default function Login() {
                   touched.pw && !pwValid ? "border-danger focus:border-danger focus:ring-danger/30" : ""
                 }`}
                 type={showPw ? "text" : "password"}
+                placeholder="Enter your password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 onBlur={() => setTouched((t) => ({ ...t, pw: true }))}
@@ -256,7 +381,7 @@ export default function Login() {
               onChange={(e) => setRemember(e.target.checked)}
               className="w-4 h-4 rounded-sm border-borderc text-navy focus:ring-accentBlue/40"
             />
-            Remember my email
+            Remember me
           </label>
 
           <button
@@ -277,6 +402,70 @@ export default function Login() {
           <p className="text-center text-xs text-textSecondary">
             Trouble signing in? Contact your hotel administrator.
           </p>
+          </>
+          )}
+
+          {mfaStep && (
+            <div className="space-y-5">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-md bg-brand-soft grid place-items-center shrink-0">
+                  <ShieldCheck className="w-5 h-5 text-navy" />
+                </div>
+                <div className="leading-tight">
+                  <div className="font-semibold text-navy">Two-factor verification</div>
+                  <p className="text-textSecondary text-xs">
+                    Enter the 6-digit code from your authenticator app.
+                  </p>
+                </div>
+              </div>
+
+              <div>
+                <label htmlFor={`${pwId}-mfa`} className="label block mb-1">
+                  Authentication code
+                </label>
+                <input
+                  id={`${pwId}-mfa`}
+                  className="input text-center tracking-[0.5em] text-lg font-semibold"
+                  type="text"
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  maxLength={6}
+                  value={mfaCode}
+                  onChange={(e) => setMfaCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                  placeholder="000000"
+                  autoFocus
+                />
+              </div>
+
+              <button
+                type="button"
+                onClick={onVerifyMfa}
+                className="btn-primary w-full flex items-center justify-center gap-2"
+                disabled={busy || mfaCode.replace(/\s/g, "").length < 6}
+              >
+                {busy ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Verifying…
+                  </>
+                ) : (
+                  "Verify & sign in"
+                )}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setMfaStep(false);
+                  setMfaCode("");
+                  setError(null);
+                }}
+                className="w-full text-center text-xs text-accentBlue hover:underline"
+              >
+                Back to sign in
+              </button>
+            </div>
+          )}
         </form>
       </main>
     </div>

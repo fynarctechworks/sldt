@@ -1,6 +1,18 @@
 import { sql } from "drizzle-orm";
-import { date, index, pgTable, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
+import {
+  boolean,
+  date,
+  index,
+  jsonb,
+  pgTable,
+  text,
+  timestamp,
+  uniqueIndex,
+  uuid,
+} from "drizzle-orm/pg-core";
 import { ID_PROOF_TYPES } from "./enums.js";
+import { profiles } from "./profiles.js";
+import { properties } from "./properties.js";
 
 export const FOLLOW_UP_STATUSES = ["pending", "done", "cancelled"] as const;
 
@@ -8,6 +20,12 @@ export const guests = pgTable(
   "guests",
   {
     id: uuid("id").primaryKey().defaultRandom(),
+    // Phase 2: guest profiles are per-property. A guest who stays at
+    // two properties has two rows (intentional — keeps property data
+    // walls clean). Back-filled to PRIMARY by migration 0013.
+    propertyId: uuid("property_id")
+      .notNull()
+      .references(() => properties.id),
     fullName: text("full_name").notNull(),
     phone: text("phone").notNull(),
     email: text("email"),
@@ -28,6 +46,23 @@ export const guests = pgTable(
     guestPhoto: text("guest_photo"),
     kycVerifiedAt: timestamp("kyc_verified_at", { withTimezone: true }),
     kycVerifiedBy: uuid("kyc_verified_by"),
+    // Phase 1 commercial flags. Surfaced as ribbons / badges on the
+    // GuestProfile page and consulted by the reservation create flow
+    // (blacklist auto-blocks new bookings; VIP highlights the row).
+    isVip: boolean("is_vip").notNull().default(false),
+    isBlacklisted: boolean("is_blacklisted").notNull().default(false),
+    blacklistReason: text("blacklist_reason"),
+    blacklistedAt: timestamp("blacklisted_at", { withTimezone: true }),
+    blacklistedBy: uuid("blacklisted_by").references(() => profiles.id),
+    // Structured guest preferences. Known keys (extensible): smoking
+    // (bool), floor ("low"|"mid"|"high"), pillow ("soft"|"firm"),
+    // wakeup_time (HH:MM), dietary (string[]). The room-assignment
+    // picker reads this to prefer matching rooms.
+    preferences: jsonb("preferences").notNull().default(sql`'{}'::jsonb`),
+    // DPDP Act 2023 consent timestamp. Null = not consented (default).
+    // Marketing dispatch helpers MUST check this before sending.
+    marketingConsentAt: timestamp("marketing_consent_at", { withTimezone: true }),
+    marketingConsentChannel: text("marketing_consent_channel"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

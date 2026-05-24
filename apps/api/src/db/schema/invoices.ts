@@ -3,17 +3,26 @@ import { boolean, check, date, integer, numeric, pgTable, text, timestamp, uuid 
 import { INVOICE_STATUSES, LINE_ITEM_TYPES, PAYMENT_METHODS } from "./enums.js";
 import { guests } from "./guests.js";
 import { profiles } from "./profiles.js";
+import { properties } from "./properties.js";
 import { reservations } from "./reservations.js";
 
 export const invoices = pgTable("invoices", {
   id: uuid("id").primaryKey().defaultRandom(),
   invoiceNumber: text("invoice_number").notNull().unique(),
+  // Phase 2: every operational row is scoped to a property. Today
+  // there's exactly one (PRIMARY); the field is NOT NULL once
+  // migration 0013 has back-filled the bootstrap id.
+  propertyId: uuid("property_id")
+    .notNull()
+    .references(() => properties.id),
   reservationId: uuid("reservation_id")
     .notNull()
     .references(() => reservations.id),
   guestId: uuid("guest_id")
     .notNull()
     .references(() => guests.id),
+  // Phase 2 Revenue & Ops — optional B2B attribution.
+  companyId: uuid("company_id"),
   hotelName: text("hotel_name").notNull(),
   hotelAddress: text("hotel_address").notNull(),
   hotelGstin: text("hotel_gstin").notNull(),
@@ -67,10 +76,17 @@ export const payments = pgTable(
   {
     id: uuid("id").primaryKey().defaultRandom(),
     receiptNumber: text("receipt_number").unique(),
+    // Phase 2: payments live under a property. Back-filled by 0013.
+    propertyId: uuid("property_id")
+      .notNull()
+      .references(() => properties.id),
     invoiceId: uuid("invoice_id").references(() => invoices.id),
     reservationId: uuid("reservation_id")
       .notNull()
       .references(() => reservations.id),
+    // Phase 2 Revenue & Ops — optional folio linkage. When set, the
+    // folio's paid_total trigger keeps the per-payer balance in sync.
+    folioId: uuid("folio_id"),
     amount: numeric("amount", { precision: 10, scale: 2 }).notNull(),
     paymentMethod: text("payment_method", { enum: PAYMENT_METHODS }).notNull(),
     status: text("status", { enum: ["received", "pending"] }).notNull().default("received"),
@@ -86,7 +102,11 @@ export const payments = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
-    amountPositive: check("payment_amount_positive", sql`${t.amount} > 0`),
+    // ₹0 receipts are intentional placeholders for "we issued a
+    // receipt at check-in / booking even though no money was
+    // collected" — see migration 0016. The previous strict > 0
+    // crashed the API on no-advance check-ins.
+    amountNonNeg: check("payment_amount_nonneg", sql`${t.amount} >= 0`),
   }),
 );
 

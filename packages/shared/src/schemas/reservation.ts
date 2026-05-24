@@ -46,6 +46,22 @@ export const reservationCreateSchema = z
     // the reservation insert, then proceeds. Omitting this rejects the
     // create unless an admin override flag is added later.
     otpCode: z.string().min(4).max(8).optional(),
+    // Phase 2 — Revenue & Operations.
+    //
+    // ratePlanId: when set, the server overrides each room's rate via
+    // the rate calendar (rate_override > base_rate × plan.modifier).
+    // The client may still supply per-room rates; if both are sent, the
+    // server uses the calendar-derived value and ignores the client's
+    // numeric rates. Set to null to skip rate-plan resolution entirely
+    // (use the client-supplied rates).
+    ratePlanId: z.string().uuid().nullable().optional(),
+    // companyId: B2B attribution. Stored on the reservation + invoice
+    // for aged-receivables reporting. Optional; null = guest pays.
+    companyId: z.string().uuid().nullable().optional(),
+    // groupBlockId: set when the booking came from a rooming list. The
+    // group-booking endpoint sets this internally; direct callers
+    // normally leave it null.
+    groupBlockId: z.string().uuid().nullable().optional(),
   })
   .superRefine((d, ctx) => {
     if (d.stayType === "short_stay") {
@@ -78,6 +94,11 @@ export const reservationListQuerySchema = z.object({
   q: z.string().trim().min(1).max(100).optional(),
   date_from: z.string().date().optional(),
   date_to: z.string().date().optional(),
+  // Filter by a specific room or floor. Both look at the reservation's
+  // reservation_rooms join — a reservation that spans multiple rooms
+  // matches if ANY of its rooms satisfies the filter.
+  room_id: z.string().uuid().optional(),
+  floor: z.coerce.number().int().min(0).max(99).optional(),
   // Complimentary bookings are hidden from the default list — they only
   // show up under Reports → Complimentary. Pass include_complimentary=true
   // to override (admin tooling, audits, etc).

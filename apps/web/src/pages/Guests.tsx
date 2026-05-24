@@ -440,8 +440,14 @@ function AddGuestModal({ onClose }: { onClose: () => void }) {
           <Field label="Phone (10-digit) *">
             <input
               className="input"
+              type="tel"
+              inputMode="numeric"
+              maxLength={10}
+              placeholder="9876543210"
               value={form.phone}
-              onChange={(e) => setForm({ ...form, phone: e.target.value })}
+              onChange={(e) =>
+                setForm({ ...form, phone: e.target.value.replace(/\D/g, "").slice(0, 10) })
+              }
               onBlur={checkDup}
               required
             />

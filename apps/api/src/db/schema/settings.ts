@@ -20,6 +20,11 @@ export const settings = pgTable("settings", {
   id: uuid("id").primaryKey().defaultRandom(),
   hotelName: text("hotel_name").notNull(),
   hotelAddress: text("hotel_address").notNull(),
+  // Optional precise location pin. Captured via "Use current location" in
+  // Settings or pasted manually from Google Maps. Drives the property
+  // location link shown to guests in their booking SMS.
+  hotelLatitude: numeric("hotel_latitude", { precision: 9, scale: 6 }),
+  hotelLongitude: numeric("hotel_longitude", { precision: 9, scale: 6 }),
   hotelPhone: text("hotel_phone").notNull(),
   hotelEmail: text("hotel_email"),
   ownerPhone: text("owner_phone"),

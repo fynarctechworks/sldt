@@ -37,9 +37,32 @@ function propertyStartOfDay(): Date {
   return new Date(`${istDate}T00:00:00+05:30`);
 }
 
+// First IST instant of the current calendar month — used to scope the
+// MTD revenue + ADR/RevPAR window. We rely on the IST date string so
+// the calculation stays correct regardless of the server timezone.
+function propertyStartOfMonth(): Date {
+  const istToday = propertyToday();
+  const firstOfMonth = `${istToday.slice(0, 7)}-01`;
+  return new Date(`${firstOfMonth}T00:00:00+05:30`);
+}
+
+// IST yyyy-MM-dd N days from the property's "today" — positive N for
+// future dates (forecast), negative for the past. Useful as inclusive
+// upper bounds in date comparisons (which are pure strings).
+function propertyDateOffset(days: number): string {
+  const todayIst = propertyToday();
+  const base = new Date(`${todayIst}T00:00:00+05:30`);
+  base.setUTCDate(base.getUTCDate() + days);
+  return base.toLocaleDateString("en-CA", { timeZone: PROPERTY_TIMEZONE });
+}
+
 async function buildDashboard() {
   const today = propertyToday();
   const startOfDay = propertyStartOfDay();
+  const startOfMonth = propertyStartOfMonth();
+  // 7-day forecast window. Inclusive on both ends. The "next 7 days"
+  // means today + 6 in standard calendar talk.
+  const forecastEnd = propertyDateOffset(6);
   const settings = await getSettings();
 
   const [
@@ -51,6 +74,9 @@ async function buildDashboard() {
     revenueRow,
     activity,
     upcomingCheckoutRows,
+    mtdRevenueRow,
+    mtdRoomNightsRow,
+    forecastRows,
   ] = await Promise.all([
       db.select().from(rooms).orderBy(rooms.floor, rooms.roomNumber),
       db
@@ -139,6 +165,18 @@ async function buildDashboard() {
           description: activityLog.description,
           performedBy: profiles.fullName,
           createdAt: activityLog.createdAt,
+          entityType: activityLog.entityType,
+          entityId: activityLog.entityId,
+          // For reservation activities, join the room numbers so the UI can
+          // show "RES-0031 (Room 302) checked in" instead of just the
+          // reservation number. NULL for non-reservation activities.
+          roomNumbers: sql<string | null>`(
+            SELECT string_agg(${rooms.roomNumber}, ', ' ORDER BY ${rooms.roomNumber})
+            FROM ${reservationRooms}
+            INNER JOIN ${rooms} ON ${rooms.id} = ${reservationRooms.roomId}
+            WHERE ${activityLog.entityType} = 'reservation'
+              AND ${reservationRooms.reservationId} = ${activityLog.entityId}::uuid
+          )`,
         })
         .from(activityLog)
         .innerJoin(profiles, eq(profiles.id, activityLog.performedBy))
@@ -175,6 +213,75 @@ async function buildDashboard() {
             eq(reservations.status, "checked_in"),
           ),
         ),
+      // Month-to-date collected revenue. Same exclusions as revenue
+      // today (received, non-voided, non-complimentary). Drives the
+      // MTD KPI card; rolling forward into "this calendar month" so
+      // it resets cleanly on the 1st.
+      db
+        .select({ total: sql<string>`COALESCE(SUM(${payments.amount}), 0)::text` })
+        .from(payments)
+        .innerJoin(reservations, eq(reservations.id, payments.reservationId))
+        .where(
+          and(
+            gte(payments.paymentDate, startOfMonth),
+            eq(payments.voided, false),
+            eq(payments.status, "received"),
+            sql`${reservations.bookingSource} <> 'complimentary'`,
+          ),
+        ),
+      // Room nights sold MTD (used for ADR + RevPAR). A "room night"
+      // is one reservation_rooms row per night of stay within the
+      // current month. We compute via the parent reservation's date
+      // range clipped to [startOfMonth, today]. Cancelled / no-show
+      // don't count.
+      db
+        .select({
+          revenue: sql<string>`COALESCE(SUM(CAST(${reservationRooms.ratePerNight} AS NUMERIC) * GREATEST(0, LEAST(${reservations.checkOutDate}, ${today}::date) - GREATEST(${reservations.checkInDate}, ${sql.raw(`'${propertyToday().slice(0, 7)}-01'::date`)}))), 0)::text`,
+          nights: sql<number>`COALESCE(SUM(GREATEST(0, LEAST(${reservations.checkOutDate}, ${today}::date) - GREATEST(${reservations.checkInDate}, ${sql.raw(`'${propertyToday().slice(0, 7)}-01'::date`)}))), 0)::int`,
+        })
+        .from(reservationRooms)
+        .innerJoin(reservations, eq(reservations.id, reservationRooms.reservationId))
+        .where(
+          and(
+            inArray(reservations.status, ["confirmed", "checked_in", "checked_out"]),
+            sql`${reservations.bookingSource} <> 'complimentary'`,
+            // Reservation must touch the current month at all.
+            lt(reservations.checkInDate, today),
+          ),
+        ),
+      // 7-day forecast: per-day count of reservations occupying a
+      // room. We unnest a generate_series over the window and join
+      // against reservation_rooms whose parent overlaps the day. The
+      // result is one row per day with a `count`.
+      db.execute<{ day: string; occupied: number; arrivals: number }>(
+        sql`
+          WITH days AS (
+            SELECT generate_series(
+              ${today}::date,
+              ${forecastEnd}::date,
+              interval '1 day'
+            )::date AS d
+          )
+          SELECT
+            to_char(d, 'YYYY-MM-DD') AS day,
+            COALESCE((
+              SELECT COUNT(DISTINCT rr.room_id)::int
+              FROM reservation_rooms rr
+              JOIN reservations r ON r.id = rr.reservation_id
+              WHERE r.status IN ('confirmed','checked_in','hold','pending_payment')
+                AND daterange(r.check_in_date, GREATEST(r.check_out_date, r.check_in_date + 1), '[)')
+                    @> d
+            ), 0) AS occupied,
+            COALESCE((
+              SELECT COUNT(*)::int
+              FROM reservations r
+              WHERE r.status IN ('confirmed','checked_in','hold','pending_payment')
+                AND r.check_in_date = d
+            ), 0) AS arrivals
+          FROM days
+          ORDER BY d
+        `,
+      ),
     ]);
 
   const occupiedCount = occupiedRows[0]?.count ?? 0;
@@ -269,6 +376,51 @@ async function buildDashboard() {
       };
     }),
     revenue_today: { total_collected: Number(revenueRow[0]?.total ?? 0) },
+    // Industry-standard hospitality KPIs.
+    //   MTD revenue   = total collected since the 1st of this month.
+    //   ADR           = room revenue / room nights sold (this month).
+    //                   Tells the operator the average price they got
+    //                   per occupied room — the price lever.
+    //   RevPAR        = room revenue / available room-nights so far.
+    //                   The single most important PMS metric: combines
+    //                   ADR and occupancy into one number. Compared
+    //                   month-over-month to gauge true performance.
+    //
+    // We compute "available room-nights so far" as total_rooms × days
+    // elapsed this month (inclusive of today). Maintenance days are
+    // not subtracted — the textbook definition keeps the denominator
+    // simple. If we ever want "available excluding OOO", we'd subtract
+    // OOO-days here.
+    revenue_kpis: (() => {
+      const mtdRevenue = Number(mtdRevenueRow[0]?.total ?? 0);
+      const roomNights = Number(mtdRoomNightsRow[0]?.nights ?? 0);
+      const roomRevenue = Number(mtdRoomNightsRow[0]?.revenue ?? 0);
+      const totalRooms = roomRows.length;
+      const dayOfMonth = Number(today.slice(-2));
+      const availableRoomNights = totalRooms * dayOfMonth;
+      const adr = roomNights > 0 ? roomRevenue / roomNights : 0;
+      const revpar = availableRoomNights > 0 ? roomRevenue / availableRoomNights : 0;
+      return {
+        mtd_collected: +mtdRevenue.toFixed(2),
+        mtd_room_revenue: +roomRevenue.toFixed(2),
+        mtd_room_nights: roomNights,
+        adr: +adr.toFixed(2),
+        revpar: +revpar.toFixed(2),
+      };
+    })(),
+    // 7-day occupancy + arrivals forecast. Drives the "next week"
+    // strip on the dashboard. % is computed client-side so we don't
+    // also have to plumb totalRooms into every row.
+    forecast: {
+      total_rooms: roomRows.length,
+      days: (forecastRows as unknown as { day: string; occupied: number; arrivals: number }[]).map(
+        (r) => ({
+          day: r.day,
+          occupied: Number(r.occupied),
+          arrivals: Number(r.arrivals),
+        }),
+      ),
+    },
     room_grid: roomRows.map((r) => {
       const live = roomResMap.get(r.id);
       const effectiveStatus = live
@@ -285,7 +437,14 @@ async function buildDashboard() {
         reservation_id: live?.reservationId ?? null,
       };
     }),
-    recent_activity: activity,
+    recent_activity: activity.map((a) => ({
+      action: a.action,
+      performedBy: a.performedBy,
+      createdAt: a.createdAt,
+      description: a.roomNumbers
+        ? `${a.description} (Room ${a.roomNumbers})`
+        : a.description,
+    })),
   };
 }
 
@@ -316,10 +475,15 @@ router.get("/", requireAuth, requirePermission("view_dashboard"), async (req, re
 });
 
 // Remove revenue-bearing fields so they never leave the server for users
-// without `view_revenue`. Currently the only field is revenue_today; if we
-// add more (collected-by-method, outstanding aggregates, etc.) extend here.
-function stripRevenue<T extends { revenue_today?: unknown }>(data: T): Omit<T, "revenue_today"> {
-  const { revenue_today: _omit, ...rest } = data;
+// without `view_revenue`. Phase 1 added revenue_kpis (MTD/ADR/RevPAR);
+// strip those alongside revenue_today. Forecast is occupancy-only with
+// no money, so it stays visible to everyone (housekeeping needs it too).
+function stripRevenue<T extends { revenue_today?: unknown; revenue_kpis?: unknown }>(
+  data: T,
+): Omit<T, "revenue_today" | "revenue_kpis"> {
+  const { revenue_today: _r1, revenue_kpis: _r2, ...rest } = data;
+  void _r1;
+  void _r2;
   return rest;
 }
 

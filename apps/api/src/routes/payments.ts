@@ -37,6 +37,8 @@ router.post(
         .insert(payments)
         .values({
           receiptNumber: rcpNum,
+          // Payment inherits its invoice's property scope.
+          propertyId: inv[0]!.propertyId,
           invoiceId: input.invoiceId,
           reservationId: inv[0]!.reservationId,
           amount: String(input.amount),

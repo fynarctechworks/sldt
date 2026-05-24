@@ -11,22 +11,39 @@ import { logger } from "./lib/logger.js";
 import { startDashboardSubscriber } from "./lib/redis.js";
 import { errorHandler, notFound } from "./middleware/error.js";
 import { loginLimiter, readLimiter, writeLimiter } from "./middleware/rateLimit.js";
+import activityRoutes from "./routes/activity.js";
+import amenitiesRoutes from "./routes/amenities.js";
 import auditRoutes from "./routes/audit.js";
 import authRoutes from "./routes/auth.js";
+import calendarRoutes from "./routes/calendar.js";
 import creditsRoutes from "./routes/credits.js";
 import dashboardRoutes from "./routes/dashboard.js";
 import guestRoutes from "./routes/guests.js";
+import { adminBookingEngineRouter, publicBookingRouter } from "./routes/bookingEngine.js";
+import companiesRoutes from "./routes/companies.js";
+import dpdpRoutes from "./routes/dpdp.js";
+import { foliosRouter, reservationFoliosRouter } from "./routes/folios.js";
+import groupBookingsRoutes from "./routes/groupBookings.js";
+import gstReturnsRoutes from "./routes/gstReturns.js";
 import housekeepingRoutes from "./routes/housekeeping.js";
+import housekeepingTasksRoutes from "./routes/housekeepingTasks.js";
 import invoiceRoutes from "./routes/invoices.js";
+import maintenanceRoutes from "./routes/maintenance.js";
+import nightAuditRoutes from "./routes/nightAudit.js";
 import ledgerRoutes from "./routes/ledger.js";
 import messageRoutes from "./routes/messages.js";
 import notificationRoutes from "./routes/notifications.js";
 import otpRoutes from "./routes/otp.js";
 import paymentRoutes from "./routes/payments.js";
+import pricingRulesRoutes from "./routes/pricingRules.js";
+import propertiesRoutes from "./routes/properties.js";
+import ratePlansRoutes from "./routes/ratePlans.js";
+import razorpayRoutes from "./routes/razorpay.js";
 import rbacRoutes from "./routes/rbac.js";
 import reportRoutes from "./routes/reports.js";
 import reservationRoutes from "./routes/reservations.js";
 import roomRoutes from "./routes/rooms.js";
+import searchRoutes from "./routes/search.js";
 import { settingsRouter, staffRouter } from "./routes/settings.js";
 
 const app = express();
@@ -110,12 +127,40 @@ v1.use((req, _res, next) => {
 });
 
 v1.use("/rooms", roomRoutes);
+// amenities + room images are mounted at /api/v1 so the route paths
+// stay readable: /amenities, /rooms/:id/amenities, /rooms/:id/images.
+v1.use("/", amenitiesRoutes);
 v1.use("/guests", guestRoutes);
 v1.use("/reservations", reservationRoutes);
 v1.use("/invoices", invoiceRoutes);
 v1.use("/payments", paymentRoutes);
 v1.use("/credits", creditsRoutes);
 v1.use("/housekeeping", housekeepingRoutes);
+// Phase 2 — structured housekeeping task model (separate from the
+// simple room status flow on /housekeeping). Each task is a unit of
+// work with checklist steps, assignee, and history.
+v1.use("/housekeeping-tasks", housekeepingTasksRoutes);
+// Phase 2 — maintenance tickets, rate plans, properties.
+v1.use("/maintenance", maintenanceRoutes);
+v1.use("/rate-plans", ratePlansRoutes);
+v1.use("/properties", propertiesRoutes);
+// Phase 2 Revenue & Operations — companies, folios, group bookings,
+// night audit. Folios mount at TWO prefixes: a reservation-scoped
+// subrouter (POST/GET inside /reservations/:resId/folios) and a flat
+// /folios router for detail + per-folio actions.
+v1.use("/companies", companiesRoutes);
+v1.use("/reservations/:resId/folios", reservationFoliosRouter);
+v1.use("/folios", foliosRouter);
+v1.use("/group-blocks", groupBookingsRoutes);
+v1.use("/night-audit", nightAuditRoutes);
+// Phase 3 — pricing rules + booking engine admin + Razorpay.
+v1.use("/pricing-rules", pricingRulesRoutes);
+v1.use("/booking-engine", adminBookingEngineRouter);
+v1.use("/public/booking", publicBookingRouter);
+v1.use("/razorpay", razorpayRoutes);
+// Phase 4 — DPDP + GST returns.
+v1.use("/dpdp", dpdpRoutes);
+v1.use("/gst-returns", gstReturnsRoutes);
 v1.use("/dashboard", dashboardRoutes);
 v1.use("/reports", reportRoutes);
 v1.use("/settings", settingsRouter);
@@ -125,6 +170,9 @@ v1.use("/notifications", notificationRoutes);
 v1.use("/messages", messageRoutes);
 v1.use("/rbac", rbacRoutes);
 v1.use("/audit", auditRoutes);
+v1.use("/activity", activityRoutes);
+v1.use("/calendar", calendarRoutes);
+v1.use("/search", searchRoutes);
 v1.use("/", ledgerRoutes);
 
 app.use("/api/v1", v1);

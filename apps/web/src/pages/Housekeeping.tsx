@@ -79,6 +79,16 @@ export default function Housekeeping() {
     onError: (e: Error) => setErr(e.message),
   });
 
+  // One-click shortcut: a dirty or clean room jumps straight to available,
+  // skipping the clean → inspected → available chain. directReady tells the
+  // API to allow the skip.
+  const markReady = useMutation({
+    mutationFn: (id: string) =>
+      api.patch(`/housekeeping/${id}`, { status: "available", directReady: true }),
+    onSuccess: invalidateRooms,
+    onError: (e: Error) => setErr(e.message),
+  });
+
   const flagMaint = useMutation({
     mutationFn: (v: { id: string; reason: string }) =>
       api.post(`/housekeeping/${v.id}/maintenance`, { reason: v.reason }),
@@ -133,7 +143,7 @@ export default function Housekeeping() {
         </div>
       </div>
 
-      <div className="flex flex-wrap gap-2">
+      <div className="inline-flex flex-wrap items-center bg-white border border-borderc rounded-md p-1 gap-1">
         {STATUS_FILTERS.map((s) => {
           const count = s === "all" ? rooms.length : counts[s] ?? 0;
           const active = statusFilter === s;
@@ -141,10 +151,10 @@ export default function Housekeeping() {
             <button
               key={s}
               onClick={() => setStatusFilter(s)}
-              className={`text-xs font-semibold px-3 py-1.5 rounded-sm border-2 transition-colors inline-flex items-center gap-2 ${
+              className={`text-xs font-semibold px-3 py-1.5 rounded-sm transition-colors inline-flex items-center gap-2 ${
                 active
-                  ? "bg-brand-dark text-cream border-brand-dark"
-                  : "bg-white text-textSecondary border-borderc hover:border-brand-dark hover:text-brand-dark"
+                  ? "bg-brand-dark text-cream"
+                  : "text-textSecondary hover:text-brand-dark hover:bg-bg"
               }`}
             >
               <span>{STATUS_LABELS[s]}</span>
@@ -169,6 +179,8 @@ export default function Housekeeping() {
           {sorted.map((r) => {
             const transitions = NEXT_STATUS[r.status] ?? [];
             const canFlag = r.status !== "maintenance" && r.status !== "occupied" && r.status !== "reserved";
+            // A dirty or clean room can be made bookable in one click.
+            const canMarkReady = r.status === "dirty" || r.status === "clean";
             return (
               <div key={r.id} className="card p-4 flex flex-col gap-3">
                 <div className="flex justify-between items-start">
@@ -226,14 +238,26 @@ export default function Housekeeping() {
                   </div>
                 )}
 
-                <div className="flex flex-wrap gap-1.5 mt-auto">
+                {canMarkReady && (
+                  <button
+                    className="w-full text-sm px-3 py-2 bg-brand-dark text-cream rounded-sm hover:opacity-90 inline-flex items-center justify-center gap-1.5 font-semibold disabled:opacity-60"
+                    onClick={() => markReady.mutate(r.id)}
+                    disabled={markReady.isPending}
+                  >
+                    <Check className="w-4 h-4" />
+                    Mark Ready
+                  </button>
+                )}
+
+                <div className="flex flex-wrap items-center gap-1.5 mt-auto">
+                  {/* Step-by-step transitions, kept as a secondary path for
+                      properties that track cleaning vs inspection separately. */}
                   {transitions.map((t) => (
                     <button
                       key={t.status}
-                      className="text-xs px-2 py-1 bg-brand-dark text-cream rounded-sm hover:opacity-90 inline-flex items-center gap-1 font-semibold"
+                      className="text-xs px-2 py-1 border border-borderc text-brand-dark rounded-sm hover:bg-bg inline-flex items-center gap-1 font-medium"
                       onClick={() => updateStatus.mutate({ id: r.id, status: t.status })}
                     >
-                      <Check className="w-3 h-3" />
                       {t.label}
                     </button>
                   ))}

@@ -8,9 +8,14 @@ import {
   uuid,
 } from "drizzle-orm/pg-core";
 import { ROOM_STATUSES } from "./enums.js";
+import { properties } from "./properties.js";
 
 export const rooms = pgTable("rooms", {
   id: uuid("id").primaryKey().defaultRandom(),
+  // Phase 2: rooms belong to a property. Back-filled to PRIMARY by 0013.
+  propertyId: uuid("property_id")
+    .notNull()
+    .references(() => properties.id),
   roomNumber: text("room_number").notNull().unique(),
   floor: integer("floor").notNull(),
   roomType: text("room_type").notNull(),

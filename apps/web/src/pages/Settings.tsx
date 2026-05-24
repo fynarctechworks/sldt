@@ -1,5 +1,17 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Download, Pencil, Plus, Trash2, UserPlus } from "lucide-react";
+import {
+  Check,
+  Copy,
+  Eye,
+  EyeOff,
+  MapPin,
+  Pencil,
+  Plus,
+  ShieldCheck,
+  Smartphone,
+  Trash2,
+  UserPlus,
+} from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useAuth } from "@/auth/AuthContext";
 import { useDialog } from "@/components/Dialog";
@@ -9,22 +21,20 @@ import { api } from "@/lib/api";
 import { supabase } from "@/lib/supabase";
 import { inr } from "@/lib/utils";
 
-type Tab = "hotel" | "room-types" | "staff" | "roles" | "audit";
+type Tab = "my-profile" | "hotel" | "room-types" | "staff" | "roles";
 
 export default function Settings() {
-  const { can } = useAuth();
-  const canAudit = can("manage_staff");
-  const tabs = useMemo<{ id: Tab; label: string }[]>(() => {
-    const base: { id: Tab; label: string }[] = [
+  const tabs = useMemo<{ id: Tab; label: string }[]>(
+    () => [
+      { id: "my-profile", label: "My Profile" },
       { id: "hotel", label: "Hotel Profile" },
       { id: "room-types", label: "Room Types" },
       { id: "staff", label: "Staff" },
       { id: "roles", label: "Roles & Permissions" },
-    ];
-    if (canAudit) base.push({ id: "audit", label: "Audit Log" });
-    return base;
-  }, [canAudit]);
-  const [tab, setTab] = useState<Tab>("hotel");
+    ],
+    [],
+  );
+  const [tab, setTab] = useState<Tab>("my-profile");
   return (
     <div className="space-y-4">
       <h1 className="text-2xl font-bold text-navy">Settings</h1>
@@ -43,11 +53,657 @@ export default function Settings() {
           </button>
         ))}
       </div>
+      {tab === "my-profile" && <MyProfileTab />}
       {tab === "hotel" && <HotelTab />}
       {tab === "room-types" && <RoomTypesTab />}
       {tab === "staff" && <StaffTab />}
       {tab === "roles" && <RolesTab />}
-      {tab === "audit" && canAudit && <AuditTab />}
+    </div>
+  );
+}
+
+// ============================================================
+// My Profile tab — the signed-in user edits their own account
+// ============================================================
+
+interface MeProfile {
+  id: string;
+  email: string;
+  fullName: string;
+  phone: string | null;
+  rbacRoleKey: string | null;
+  role: string;
+}
+
+function MyProfileTab() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  const { profile: authProfile } = useAuth();
+
+  const { data: me, isLoading } = useQuery({
+    queryKey: ["auth-me"],
+    queryFn: () => api.get<{ profile: MeProfile }>("/auth/me").then((r) => r.profile),
+  });
+
+  const [form, setForm] = useState({ fullName: "", email: "", phone: "" });
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!me) return;
+    setForm({ fullName: me.fullName, email: me.email, phone: me.phone ?? "" });
+  }, [me]);
+
+  const save = useMutation({
+    mutationFn: async () => {
+      const patch: Record<string, unknown> = {};
+      if (me && form.fullName !== me.fullName) patch.fullName = form.fullName;
+      if (me && form.email !== me.email) patch.email = form.email;
+      const newPhone = form.phone.trim() || null;
+      if (me && newPhone !== (me.phone ?? null)) patch.phone = newPhone;
+      if (Object.keys(patch).length === 0) {
+        throw new Error("Nothing to save");
+      }
+      return api.put("/auth/me", patch);
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["auth-me"] });
+      setErr(null);
+      toast("Profile updated", "success");
+    },
+    onError: (e: Error) => setErr(e.message),
+  });
+
+  if (isLoading || !me) return <Loader />;
+
+  return (
+    <div className="space-y-4 max-w-2xl">
+      <div className="card space-y-5">
+        <div>
+          <h3 className="font-semibold text-brand-dark text-lg">My Profile</h3>
+          <p className="text-xs text-textSecondary mt-1">
+            Update your own account details. Only an administrator can change your role or
+            permissions.
+          </p>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <Field label="Full Name">
+            <input
+              className="input"
+              value={form.fullName}
+              onChange={(e) => setForm({ ...form, fullName: e.target.value })}
+            />
+          </Field>
+          <Field label="Email">
+            <input
+              className="input"
+              type="email"
+              value={form.email}
+              onChange={(e) => setForm({ ...form, email: e.target.value })}
+            />
+          </Field>
+          <Field label="Phone">
+            <input
+              className="input"
+              type="tel"
+              inputMode="numeric"
+              maxLength={10}
+              placeholder="9876543210"
+              value={form.phone}
+              onChange={(e) =>
+                setForm({ ...form, phone: e.target.value.replace(/\D/g, "").slice(0, 10) })
+              }
+            />
+          </Field>
+          <Field label="Role">
+            <input
+              className="input bg-bg cursor-not-allowed"
+              value={authProfile?.rbacRoleKey ?? me.role}
+              readOnly
+              disabled
+            />
+          </Field>
+        </div>
+
+        {err && (
+          <div className="rounded-sm border border-danger/30 bg-danger/5 px-3 py-2 text-danger text-sm">
+            {err}
+          </div>
+        )}
+
+        <div className="flex justify-end">
+          <button
+            className="btn-primary"
+            onClick={() => save.mutate()}
+            disabled={save.isPending}
+          >
+            {save.isPending ? "Saving…" : "Save Changes"}
+          </button>
+        </div>
+      </div>
+
+      <ChangePasswordCard phone={me.phone} />
+
+      <TwoFactorCard />
+    </div>
+  );
+}
+
+// ============================================================
+// Password change with OTP-on-WhatsApp verification.
+// Step 1: enter current password → server sends OTP to phone on file.
+// Step 2: enter OTP + new password → server verifies all three, flips PW.
+// ============================================================
+function ChangePasswordCard({ phone }: { phone: string | null }) {
+  const { toast } = useToast();
+  const [step, setStep] = useState<1 | 2>(1);
+  const [oldPw, setOldPw] = useState("");
+  const [newPw, setNewPw] = useState("");
+  const [newPwConfirm, setNewPwConfirm] = useState("");
+  const [otp, setOtp] = useState("");
+  const [showOldPw, setShowOldPw] = useState(false);
+  const [showNewPw, setShowNewPw] = useState(false);
+  const [maskedTarget, setMaskedTarget] = useState<string>("");
+  const [devCode, setDevCode] = useState<string | undefined>(undefined);
+  const [err, setErr] = useState<string | null>(null);
+  const [secondsLeft, setSecondsLeft] = useState(0);
+
+  useEffect(() => {
+    if (secondsLeft <= 0) return;
+    const t = setInterval(() => setSecondsLeft((s) => Math.max(0, s - 1)), 1000);
+    return () => clearInterval(t);
+  }, [secondsLeft]);
+
+  function reset() {
+    setStep(1);
+    setOldPw("");
+    setNewPw("");
+    setNewPwConfirm("");
+    setOtp("");
+    setDevCode(undefined);
+    setMaskedTarget("");
+    setErr(null);
+    setSecondsLeft(0);
+  }
+
+  const sendOtp = useMutation({
+    mutationFn: async () => {
+      if (!oldPw) throw new Error("Enter your current password");
+      return api.post<{ target: string; expiresInSeconds: number; devCode?: string }>(
+        "/auth/me/password/send-otp",
+        { oldPassword: oldPw },
+      );
+    },
+    onSuccess: (data) => {
+      setMaskedTarget(data.target);
+      setDevCode(data.devCode);
+      setSecondsLeft(data.expiresInSeconds);
+      setStep(2);
+      setErr(null);
+      toast("OTP sent on WhatsApp", "success");
+    },
+    onError: (e: Error) => setErr(e.message),
+  });
+
+  const change = useMutation({
+    mutationFn: async () => {
+      if (newPw.length < 8) throw new Error("New password must be at least 8 characters");
+      if (newPw !== newPwConfirm) throw new Error("New passwords do not match");
+      if (!otp) throw new Error("Enter the OTP from WhatsApp");
+      return api.post("/auth/me/password/change", {
+        oldPassword: oldPw,
+        otp,
+        newPassword: newPw,
+      });
+    },
+    onSuccess: () => {
+      toast("Password changed", "success");
+      reset();
+    },
+    onError: (e: Error) => setErr(e.message),
+  });
+
+  const hasPhone = !!phone?.trim();
+
+  return (
+    <div className="card space-y-4">
+      <div>
+        <h3 className="font-semibold text-brand-dark text-lg">Change Password</h3>
+        <p className="text-xs text-textSecondary mt-1">
+          Verify your current password, then enter the OTP we send to your WhatsApp number.
+        </p>
+      </div>
+
+      {!hasPhone && (
+        <div className="rounded-sm border border-warning/40 bg-warning/10 px-3 py-2 text-warning text-sm">
+          You don't have a phone number on file. Add one above and save before changing your
+          password — the OTP is delivered via WhatsApp.
+        </div>
+      )}
+
+      {step === 1 && (
+        <>
+          <Field label="Current Password">
+            <div className="relative">
+              <input
+                className="input pr-10"
+                type={showOldPw ? "text" : "password"}
+                value={oldPw}
+                onChange={(e) => setOldPw(e.target.value)}
+                autoComplete="current-password"
+              />
+              <button
+                type="button"
+                onClick={() => setShowOldPw((v) => !v)}
+                className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 text-textSecondary hover:text-navy"
+                aria-label={showOldPw ? "Hide" : "Show"}
+              >
+                {showOldPw ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              </button>
+            </div>
+          </Field>
+
+          {err && (
+            <div className="rounded-sm border border-danger/30 bg-danger/5 px-3 py-2 text-danger text-sm">
+              {err}
+            </div>
+          )}
+
+          <div className="flex justify-end">
+            <button
+              className="btn-primary"
+              onClick={() => sendOtp.mutate()}
+              disabled={sendOtp.isPending || !hasPhone || !oldPw}
+            >
+              {sendOtp.isPending ? "Sending OTP…" : "Send OTP on WhatsApp"}
+            </button>
+          </div>
+        </>
+      )}
+
+      {step === 2 && (
+        <>
+          <div className="rounded-sm bg-brand-soft/40 border border-borderc px-3 py-2 text-sm">
+            OTP sent to <span className="font-mono">{maskedTarget}</span> via WhatsApp.
+            {secondsLeft > 0 && (
+              <span className="text-textSecondary ml-2">
+                Expires in {Math.floor(secondsLeft / 60)}m {String(secondsLeft % 60).padStart(2, "0")}s
+              </span>
+            )}
+            {devCode && (
+              <div className="mt-1 text-xs text-warning">
+                Dev mode code: <span className="font-mono font-bold">{devCode}</span>
+              </div>
+            )}
+          </div>
+
+          <Field label="OTP from WhatsApp">
+            <input
+              className="input font-mono tracking-widest text-lg"
+              inputMode="numeric"
+              maxLength={8}
+              value={otp}
+              onChange={(e) => setOtp(e.target.value.replace(/\D/g, ""))}
+              placeholder="••••••"
+              autoFocus
+            />
+          </Field>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <Field label="New Password">
+              <div className="relative">
+                <input
+                  className="input pr-10"
+                  type={showNewPw ? "text" : "password"}
+                  value={newPw}
+                  onChange={(e) => setNewPw(e.target.value)}
+                  autoComplete="new-password"
+                  minLength={8}
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowNewPw((v) => !v)}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 text-textSecondary hover:text-navy"
+                  aria-label={showNewPw ? "Hide" : "Show"}
+                >
+                  {showNewPw ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+            </Field>
+            <Field label="Confirm New Password">
+              <input
+                className="input"
+                type={showNewPw ? "text" : "password"}
+                value={newPwConfirm}
+                onChange={(e) => setNewPwConfirm(e.target.value)}
+                autoComplete="new-password"
+                minLength={8}
+              />
+            </Field>
+          </div>
+
+          {err && (
+            <div className="rounded-sm border border-danger/30 bg-danger/5 px-3 py-2 text-danger text-sm">
+              {err}
+            </div>
+          )}
+
+          <div className="flex justify-between items-center">
+            <button
+              type="button"
+              className="text-sm text-textSecondary hover:text-navy"
+              onClick={reset}
+            >
+              Cancel
+            </button>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                className="text-sm text-accentBlue hover:underline disabled:opacity-50"
+                onClick={() => sendOtp.mutate()}
+                disabled={sendOtp.isPending || secondsLeft > 0}
+                title={secondsLeft > 0 ? "Wait for current code to expire or use it" : "Resend"}
+              >
+                {sendOtp.isPending ? "Sending…" : "Resend OTP"}
+              </button>
+              <button
+                className="btn-primary"
+                onClick={() => change.mutate()}
+                disabled={change.isPending}
+              >
+                {change.isPending ? "Updating…" : "Change Password"}
+              </button>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// Two-factor authentication (TOTP via authenticator app).
+// Uses Supabase Auth MFA directly from the browser — the factor,
+// QR code, and verification all go through supabase-js. No backend
+// route needed; Supabase stores the factor against the auth user.
+//
+// Flow:
+//   idle      — show enrolled factors (if any) + "Add" button
+//   enrolling — created an unverified factor; show QR + secret + code field
+// A factor only becomes "verified" after the user enters one correct
+// code. Unverified factors are cleaned up on cancel so they don't pile up.
+// ============================================================
+function TwoFactorCard() {
+  const { toast } = useToast();
+  const dialog = useDialog();
+  const qc = useQueryClient();
+
+  const { data: factors, isLoading } = useQuery({
+    queryKey: ["mfa-factors"],
+    queryFn: async () => {
+      const { data, error } = await supabase.auth.mfa.listFactors();
+      if (error) throw error;
+      return data.totp ?? [];
+    },
+  });
+
+  const verified = (factors ?? []).filter((f) => f.status === "verified");
+  const hasVerified = verified.length > 0;
+
+  // Active enrollment session (an unverified factor we just created).
+  const [enroll, setEnroll] = useState<{
+    factorId: string;
+    qr: string;
+    secret: string;
+  } | null>(null);
+  const [code, setCode] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  const startEnroll = useMutation({
+    mutationFn: async () => {
+      const { data, error } = await supabase.auth.mfa.enroll({
+        factorType: "totp",
+        friendlyName: `Authenticator ${new Date().toLocaleDateString()}`,
+      });
+      if (error) throw error;
+      return data;
+    },
+    onSuccess: (data) => {
+      setErr(null);
+      setCode("");
+      setEnroll({
+        factorId: data.id,
+        qr: data.totp.qr_code,
+        secret: data.totp.secret,
+      });
+    },
+    onError: (e: Error) => setErr(e.message),
+  });
+
+  const confirmEnroll = useMutation({
+    mutationFn: async () => {
+      if (!enroll) throw new Error("No enrollment in progress");
+      const clean = code.replace(/\D/g, "");
+      if (clean.length !== 6) throw new Error("Enter the 6-digit code from your app");
+      const { data: chal, error: chalErr } = await supabase.auth.mfa.challenge({
+        factorId: enroll.factorId,
+      });
+      if (chalErr) throw chalErr;
+      const { error: verErr } = await supabase.auth.mfa.verify({
+        factorId: enroll.factorId,
+        challengeId: chal.id,
+        code: clean,
+      });
+      if (verErr) throw verErr;
+    },
+    onSuccess: () => {
+      setEnroll(null);
+      setCode("");
+      setErr(null);
+      qc.invalidateQueries({ queryKey: ["mfa-factors"] });
+      toast("Two-factor authentication enabled", "success");
+    },
+    onError: (e: Error) => setErr(e.message),
+  });
+
+  // Cancel an in-progress enrollment: remove the unverified factor so it
+  // doesn't linger on the account.
+  async function cancelEnroll() {
+    if (enroll) {
+      try {
+        await supabase.auth.mfa.unenroll({ factorId: enroll.factorId });
+      } catch {
+        // best-effort cleanup
+      }
+    }
+    setEnroll(null);
+    setCode("");
+    setErr(null);
+  }
+
+  const removeFactor = useMutation({
+    mutationFn: async (factorId: string) => {
+      const { error } = await supabase.auth.mfa.unenroll({ factorId });
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["mfa-factors"] });
+      toast("Two-factor authentication removed", "success");
+    },
+    onError: (e: Error) => toast(e.message, "error"),
+  });
+
+  async function onRemove(factorId: string) {
+    const ok = await dialog.confirm({
+      title: "Remove two-factor authentication?",
+      message:
+        "You'll sign in with just your password until you set it up again. We recommend keeping 2FA enabled.",
+      okLabel: "Remove",
+      tone: "danger",
+    });
+    if (ok) removeFactor.mutate(factorId);
+  }
+
+  function copySecret() {
+    if (!enroll) return;
+    navigator.clipboard?.writeText(enroll.secret).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  }
+
+  return (
+    <div className="card space-y-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h3 className="font-semibold text-brand-dark text-lg flex items-center gap-2">
+            <ShieldCheck className="w-5 h-5 text-brand" />
+            Two-Factor Authentication
+          </h3>
+          <p className="text-xs text-textSecondary mt-1">
+            Add a second layer of security. After your password, you'll enter a 6-digit code
+            from an authenticator app (Google Authenticator, Authy, 1Password, etc).
+          </p>
+        </div>
+        {hasVerified && !enroll && (
+          <span className="shrink-0 inline-flex items-center gap-1 rounded-full bg-success/10 text-success text-xs font-medium px-2.5 py-1">
+            <Check className="w-3 h-3" /> Enabled
+          </span>
+        )}
+      </div>
+
+      {isLoading && <Loader />}
+
+      {/* No enrollment in progress — show status + actions */}
+      {!isLoading && !enroll && (
+        <>
+          {hasVerified ? (
+            <div className="space-y-2">
+              {verified.map((f) => (
+                <div
+                  key={f.id}
+                  className="flex items-center justify-between rounded-sm border border-borderc bg-bg px-3 py-2"
+                >
+                  <div className="flex items-center gap-2 text-sm">
+                    <Smartphone className="w-4 h-4 text-textSecondary" />
+                    <span className="font-medium text-brand-dark">
+                      {f.friendly_name || "Authenticator app"}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    className="text-xs text-danger hover:underline disabled:opacity-50"
+                    onClick={() => onRemove(f.id)}
+                    disabled={removeFactor.isPending}
+                  >
+                    Remove
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="rounded-sm border border-warning/40 bg-warning/10 px-3 py-2 text-warning text-sm">
+              Two-factor authentication is not enabled on your account.
+            </div>
+          )}
+
+          {err && (
+            <div className="rounded-sm border border-danger/30 bg-danger/5 px-3 py-2 text-danger text-sm">
+              {err}
+            </div>
+          )}
+
+          <div className="flex justify-end">
+            <button
+              className="btn-primary"
+              onClick={() => startEnroll.mutate()}
+              disabled={startEnroll.isPending}
+            >
+              {startEnroll.isPending
+                ? "Preparing…"
+                : hasVerified
+                  ? "Add another authenticator"
+                  : "Enable 2FA"}
+            </button>
+          </div>
+        </>
+      )}
+
+      {/* Enrollment in progress — show QR + secret + code entry */}
+      {enroll && (
+        <div className="space-y-4">
+          <div className="grid grid-cols-1 sm:grid-cols-[auto_1fr] gap-4 items-start">
+            <div className="bg-white border border-borderc rounded-md p-2 mx-auto sm:mx-0">
+              {/* Supabase returns an SVG data URI for the QR code. */}
+              <img
+                src={enroll.qr}
+                alt="Scan this QR code with your authenticator app"
+                className="w-40 h-40"
+              />
+            </div>
+            <div className="space-y-3 text-sm">
+              <p className="text-textSecondary">
+                1. Scan this QR code with your authenticator app. Can't scan? Enter this key
+                manually:
+              </p>
+              <div className="flex items-center gap-2">
+                <code className="flex-1 break-all rounded-sm bg-bg border border-borderc px-2 py-1.5 text-xs font-mono">
+                  {enroll.secret}
+                </code>
+                <button
+                  type="button"
+                  onClick={copySecret}
+                  className="shrink-0 p-2 rounded-sm border border-borderc text-textSecondary hover:text-navy hover:bg-bg"
+                  aria-label="Copy setup key"
+                  title="Copy setup key"
+                >
+                  {copied ? (
+                    <Check className="w-4 h-4 text-success" />
+                  ) : (
+                    <Copy className="w-4 h-4" />
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <Field label="2. Enter the 6-digit code from your app">
+            <input
+              className="input text-center tracking-[0.4em] text-lg font-semibold max-w-[12rem]"
+              inputMode="numeric"
+              maxLength={6}
+              value={code}
+              onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+              placeholder="000000"
+              autoFocus
+            />
+          </Field>
+
+          {err && (
+            <div className="rounded-sm border border-danger/30 bg-danger/5 px-3 py-2 text-danger text-sm">
+              {err}
+            </div>
+          )}
+
+          <div className="flex justify-between items-center">
+            <button
+              type="button"
+              className="text-sm text-textSecondary hover:text-navy"
+              onClick={cancelEnroll}
+            >
+              Cancel
+            </button>
+            <button
+              className="btn-primary"
+              onClick={() => confirmEnroll.mutate()}
+              disabled={confirmEnroll.isPending || code.replace(/\D/g, "").length !== 6}
+            >
+              {confirmEnroll.isPending ? "Verifying…" : "Verify & enable"}
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -56,6 +712,10 @@ interface HotelSettings {
   id: string;
   hotelName: string;
   hotelAddress: string;
+  // Numeric on the DB but Drizzle returns string. We keep them as strings in
+  // the form so the inputs stay controlled across empty/typing states.
+  hotelLatitude: string | null;
+  hotelLongitude: string | null;
   hotelPhone: string;
   hotelEmail: string | null;
   hotelGstin: string;
@@ -94,6 +754,8 @@ function HotelTab() {
       const payload: Record<string, unknown> = {
         hotelName: f.hotelName,
         hotelAddress: f.hotelAddress,
+        hotelLatitude: f.hotelLatitude && f.hotelLatitude.trim() !== "" ? f.hotelLatitude : null,
+        hotelLongitude: f.hotelLongitude && f.hotelLongitude.trim() !== "" ? f.hotelLongitude : null,
         hotelPhone: f.hotelPhone,
         hotelGstin: f.hotelGstin,
         invoicePrefix: f.invoicePrefix,
@@ -124,6 +786,39 @@ function HotelTab() {
   const set = <K extends keyof HotelSettings>(k: K, v: HotelSettings[K]) =>
     setForm({ ...form, [k]: v });
 
+  const lat = form.hotelLatitude?.trim() ?? "";
+  const lng = form.hotelLongitude?.trim() ?? "";
+  const hasPin = lat !== "" && lng !== "";
+  const mapsHref = hasPin
+    ? `https://www.google.com/maps?q=${encodeURIComponent(`${lat},${lng}`)}`
+    : form.hotelAddress
+    ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(form.hotelAddress)}`
+    : "";
+
+  function useMyLocation() {
+    if (!("geolocation" in navigator)) {
+      setMsg("Geolocation not supported in this browser");
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setForm((prev) =>
+          prev
+            ? {
+                ...prev,
+                hotelLatitude: pos.coords.latitude.toFixed(6),
+                hotelLongitude: pos.coords.longitude.toFixed(6),
+              }
+            : prev,
+        );
+        setMsg("Location captured");
+        setTimeout(() => setMsg(null), 2000);
+      },
+      (err) => setMsg(`Couldn't get location: ${err.message}`),
+      { enableHighAccuracy: true, timeout: 10000 },
+    );
+  }
+
   return (
     <div className="card space-y-3">
       <div className="grid grid-cols-2 gap-3">
@@ -131,7 +826,15 @@ function HotelTab() {
           <input className="input" value={form.hotelName} onChange={(e) => set("hotelName", e.target.value)} />
         </Field>
         <Field label="Phone">
-          <input className="input" value={form.hotelPhone ?? ""} onChange={(e) => set("hotelPhone", e.target.value)} />
+          <input
+            className="input"
+            type="tel"
+            inputMode="numeric"
+            maxLength={10}
+            value={form.hotelPhone ?? ""}
+            onChange={(e) => set("hotelPhone", e.target.value.replace(/\D/g, "").slice(0, 10))}
+            placeholder="9876543210"
+          />
         </Field>
         <Field label="Email">
           <input className="input" value={form.hotelEmail ?? ""} onChange={(e) => set("hotelEmail", e.target.value)} />
@@ -148,22 +851,6 @@ function HotelTab() {
             className="input"
             value={form.invoicePrefix ?? "INV"}
             onChange={(e) => set("invoicePrefix", e.target.value)}
-          />
-        </Field>
-        <Field label="Default Check-in">
-          <input
-            className="input"
-            type="time"
-            value={form.checkInTime ?? "12:00"}
-            onChange={(e) => set("checkInTime", e.target.value)}
-          />
-        </Field>
-        <Field label="Default Check-out">
-          <input
-            className="input"
-            type="time"
-            value={form.checkOutTime ?? "11:00"}
-            onChange={(e) => set("checkOutTime", e.target.value)}
           />
         </Field>
         <Field label="GST Pricing Mode">
@@ -198,10 +885,76 @@ function HotelTab() {
             </span>
           </div>
         </Field>
+        <Field label="Default Check-in">
+          <input
+            className="input"
+            type="time"
+            value={form.checkInTime ?? "12:00"}
+            onChange={(e) => set("checkInTime", e.target.value)}
+          />
+        </Field>
+        <Field label="Default Check-out">
+          <input
+            className="input"
+            type="time"
+            value={form.checkOutTime ?? "11:00"}
+            onChange={(e) => set("checkOutTime", e.target.value)}
+          />
+        </Field>
       </div>
+
       <Field label="Address">
         <input className="input" value={form.hotelAddress ?? ""} onChange={(e) => set("hotelAddress", e.target.value)} />
       </Field>
+
+      <div className="grid grid-cols-1 sm:grid-cols-[1fr_1fr_auto_auto] gap-3 items-end">
+        <Field label="Latitude">
+          <input
+            className="input font-mono"
+            inputMode="decimal"
+            value={form.hotelLatitude ?? ""}
+            onChange={(e) => set("hotelLatitude", e.target.value)}
+            placeholder="17.687320"
+          />
+        </Field>
+        <Field label="Longitude">
+          <input
+            className="input font-mono"
+            inputMode="decimal"
+            value={form.hotelLongitude ?? ""}
+            onChange={(e) => set("hotelLongitude", e.target.value)}
+            placeholder="83.123900"
+          />
+        </Field>
+        <button
+          type="button"
+          onClick={useMyLocation}
+          className="px-3 py-2 text-sm border border-borderc rounded-sm bg-surface hover:bg-bg inline-flex items-center gap-1.5 whitespace-nowrap"
+          title="Capture from this device"
+        >
+          <MapPin className="w-4 h-4 text-brand-dark" />
+          Use my location
+        </button>
+        <a
+          href={mapsHref || "#"}
+          target="_blank"
+          rel="noopener noreferrer"
+          aria-disabled={!mapsHref}
+          className={`px-3 py-2 text-sm border rounded-sm inline-flex items-center gap-1.5 whitespace-nowrap ${
+            mapsHref
+              ? "border-brand-dark bg-brand-dark text-cream hover:opacity-90"
+              : "border-borderc bg-bg text-textSecondary pointer-events-none opacity-60"
+          }`}
+          title={hasPin ? "Open pin in Google Maps" : "Open address in Google Maps"}
+        >
+          <MapPin className="w-4 h-4" />
+          {hasPin ? "View pin" : "Find on Maps"}
+        </a>
+      </div>
+      <p className="text-[11px] text-textSecondary -mt-1">
+        Tip: open Google Maps, long-press the property, copy the coordinates that appear, then
+        paste here. Or click <em>Use my location</em> while standing at the hotel.
+      </p>
 
       <div className="border-t border-borderc pt-4 mt-2 space-y-3">
         <h3 className="font-semibold text-brand-dark">Owner Notifications</h3>
@@ -911,8 +1664,14 @@ function EditStaffModal({ staff, onClose }: { staff: Staff; onClose: () => void 
           <Field label="Phone (optional)">
             <input
               className="input"
+              type="tel"
+              inputMode="numeric"
+              maxLength={10}
+              placeholder="9876543210"
               value={form.phone}
-              onChange={(e) => setForm({ ...form, phone: e.target.value })}
+              onChange={(e) =>
+                setForm({ ...form, phone: e.target.value.replace(/\D/g, "").slice(0, 10) })
+              }
             />
           </Field>
           <Field label="Role">
@@ -1144,7 +1903,15 @@ function AddStaffModal({ onClose }: { onClose: () => void }) {
           </select>
         </Field>
         <Field label="Phone (optional)">
-          <input className="input" value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} />
+          <input
+            className="input"
+            type="tel"
+            inputMode="numeric"
+            maxLength={10}
+            placeholder="9876543210"
+            value={form.phone}
+            onChange={(e) => setForm({ ...form, phone: e.target.value.replace(/\D/g, "").slice(0, 10) })}
+          />
         </Field>
         {err && <div className="text-danger text-sm">{err}</div>}
         <div className="flex justify-end gap-2 pt-2">
@@ -1504,115 +2271,3 @@ function RoleEditor({
   );
 }
 
-// ============================================================
-// Audit Log tab — admin-only CSV export of activity_log
-// ============================================================
-
-function AuditTab() {
-  const { toast } = useToast();
-  const today = new Date().toISOString().slice(0, 10);
-  const firstOfMonth = `${today.slice(0, 8)}01`;
-  const [dateFrom, setDateFrom] = useState(firstOfMonth);
-  const [dateTo, setDateTo] = useState(today);
-  const [limit, setLimit] = useState(10000);
-  const [downloading, setDownloading] = useState(false);
-
-  async function download() {
-    if (!dateFrom || !dateTo) {
-      toast("Pick a date range", "error");
-      return;
-    }
-    if (dateFrom > dateTo) {
-      toast("From date must be on or before To date", "error");
-      return;
-    }
-    setDownloading(true);
-    try {
-      const { data } = await supabase.auth.getSession();
-      const token = data.session?.access_token;
-      if (!token) throw new Error("Not signed in");
-      const base = (import.meta.env.VITE_API_URL as string).replace(/\/+$/, "");
-      const url = new URL(`${base}/audit/activity.csv`);
-      url.searchParams.set("date_from", dateFrom);
-      url.searchParams.set("date_to", dateTo);
-      url.searchParams.set("limit", String(limit));
-      const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-      if (!res.ok) {
-        const text = await res.text().catch(() => "");
-        throw new Error(text || `Download failed (HTTP ${res.status})`);
-      }
-      const blob = await res.blob();
-      const objUrl = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = objUrl;
-      a.download = `activity_${dateFrom.replace(/-/g, "")}_${dateTo.replace(/-/g, "")}.csv`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(objUrl);
-      toast("Audit log downloaded", "success");
-    } catch (e) {
-      toast(e instanceof Error ? e.message : "Download failed", "error");
-    } finally {
-      setDownloading(false);
-    }
-  }
-
-  return (
-    <div className="card space-y-4">
-      <div>
-        <h3 className="font-semibold text-brand-dark">Export activity log</h3>
-        <p className="text-xs text-textSecondary mt-1">
-          Downloads every staff action — logins, check-ins, payments, voids, settings changes — as
-          CSV for the chosen range. Use this for periodic compliance reviews.
-        </p>
-      </div>
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-        <Field label="From">
-          <input
-            className="input"
-            type="date"
-            value={dateFrom}
-            max={dateTo || undefined}
-            onChange={(e) => setDateFrom(e.target.value)}
-          />
-        </Field>
-        <Field label="To">
-          <input
-            className="input"
-            type="date"
-            value={dateTo}
-            min={dateFrom || undefined}
-            max={today}
-            onChange={(e) => setDateTo(e.target.value)}
-          />
-        </Field>
-        <Field label="Row limit (max 50,000)">
-          <input
-            className="input"
-            type="number"
-            min={1}
-            max={50000}
-            step={1000}
-            value={limit}
-            onChange={(e) => setLimit(Math.max(1, Math.min(50000, Number(e.target.value) || 0)))}
-          />
-        </Field>
-      </div>
-      <div className="flex justify-end">
-        <button
-          className="btn-primary inline-flex items-center gap-2"
-          onClick={download}
-          disabled={downloading}
-        >
-          <Download className="w-4 h-4" />
-          {downloading ? "Downloading…" : "Download CSV"}
-        </button>
-      </div>
-      <div className="text-[11px] text-textSecondary border-t border-borderc pt-3">
-        Note: each export is itself recorded in the audit log under the action{" "}
-        <code className="font-mono">audit_export</code>.
-      </div>
-    </div>
-  );
-}

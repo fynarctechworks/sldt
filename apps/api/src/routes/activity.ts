@@ -1,0 +1,77 @@
+import { and, desc, eq, gte, lt, sql } from "drizzle-orm";
+import { Router } from "express";
+import { z } from "zod";
+import { db } from "../db/client.js";
+import { activityLog } from "../db/schema/activity.js";
+import { profiles } from "../db/schema/profiles.js";
+import { reservationRooms, reservations } from "../db/schema/reservations.js";
+import { rooms } from "../db/schema/rooms.js";
+import { ok } from "../lib/response.js";
+import { requireAuth } from "../middleware/auth.js";
+import { validate } from "../middleware/validate.js";
+
+const router = Router();
+
+// yyyy-mm-dd. Caller is expected to pass a date string in the property's
+// local timezone; we treat it as that calendar day, not UTC.
+const dateStr = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
+
+const listSchema = z.object({
+  date_from: dateStr.optional(),
+  date_to: dateStr.optional(),
+  limit: z.coerce.number().int().min(1).max(500).default(200),
+});
+
+router.get(
+  "/",
+  requireAuth,
+  validate(listSchema, "query"),
+  async (req, res) => {
+    const { date_from, date_to, limit } = req.query as unknown as z.infer<typeof listSchema>;
+
+    // Inclusive day-range. We compare against the column directly, but expand
+    // date_to to "< next day" so the entire end-day is included.
+    const conds = [];
+    if (date_from) conds.push(gte(activityLog.createdAt, sql`${date_from}::date`));
+    if (date_to) conds.push(lt(activityLog.createdAt, sql`(${date_to}::date + interval '1 day')`));
+
+    const rows = await db
+      .select({
+        id: activityLog.id,
+        action: activityLog.action,
+        description: activityLog.description,
+        performedBy: profiles.fullName,
+        createdAt: activityLog.createdAt,
+        entityType: activityLog.entityType,
+        entityId: activityLog.entityId,
+        // Same trick as the dashboard recent_activity: append room numbers
+        // for reservation-scoped entries so the Activity page reads as
+        // "RES-0035 checked in (Room 203, 204, 302)" not just "RES-0035".
+        roomNumbers: sql<string | null>`(
+          SELECT string_agg(${rooms.roomNumber}, ', ' ORDER BY ${rooms.roomNumber})
+          FROM ${reservationRooms}
+          INNER JOIN ${rooms} ON ${rooms.id} = ${reservationRooms.roomId}
+          WHERE ${activityLog.entityType} = 'reservation'
+            AND ${reservationRooms.reservationId} = ${activityLog.entityId}::uuid
+        )`,
+      })
+      .from(activityLog)
+      .innerJoin(profiles, eq(profiles.id, activityLog.performedBy))
+      .where(conds.length ? and(...conds) : undefined)
+      .orderBy(desc(activityLog.createdAt))
+      .limit(limit);
+
+    return ok(
+      res,
+      rows.map((r) => ({
+        id: r.id,
+        action: r.action,
+        performedBy: r.performedBy,
+        createdAt: r.createdAt,
+        description: r.roomNumbers ? `${r.description} (Room ${r.roomNumbers})` : r.description,
+      })),
+    );
+  },
+);
+
+export default router;
