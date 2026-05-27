@@ -551,9 +551,15 @@ function AddGuestModal({ onClose }: { onClose: () => void }) {
           <Field label="Company GSTIN">
             <input
               className="input"
+              placeholder="22AAAAA0000A1Z5"
               value={form.gstin}
               onChange={(e) => setForm({ ...form, gstin: e.target.value.toUpperCase() })}
             />
+            {form.gstin && !/^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/.test(form.gstin) && (
+              <div className="text-[11px] text-danger mt-0.5">
+                Enter a valid 15-character GSTIN (e.g. 22AAAAA0000A1Z5)
+              </div>
+            )}
           </Field>
         </div>
 
@@ -569,7 +575,13 @@ function AddGuestModal({ onClose }: { onClose: () => void }) {
           <button
             className="btn-primary"
             onClick={() => create.mutate()}
-            disabled={create.isPending || !form.fullName.trim() || form.phone.length !== 10 || !form.idProofNumber.trim()}
+            disabled={
+              create.isPending ||
+              !form.fullName.trim() ||
+              form.phone.length !== 10 ||
+              !form.idProofNumber.trim() ||
+              (!!form.gstin && !/^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/.test(form.gstin))
+            }
           >
             {create.isPending ? "Saving…" : "Create Guest"}
           </button>
