@@ -412,7 +412,12 @@ function AddGuestModal({ onClose }: { onClose: () => void }) {
       api.post("/guests", {
         ...form,
         email: form.email || undefined,
+        city: form.city || undefined,
+        state: form.state || undefined,
+        address: form.address || undefined,
+        companyName: form.companyName || undefined,
         gstin: form.gstin || undefined,
+        notes: form.notes || undefined,
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["guests"] });
