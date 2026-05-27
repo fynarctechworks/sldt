@@ -14,13 +14,14 @@ import multer from "multer";
 import { z } from "zod";
 import { db } from "../db/client.js";
 import { guestFollowUps, guestNotes, guests } from "../db/schema/guests.js";
-import { reservations } from "../db/schema/reservations.js";
+import { reservations, reservationRooms } from "../db/schema/reservations.js";
+import { rooms } from "../db/schema/rooms.js";
 import { invoices, payments } from "../db/schema/invoices.js";
 import { logActivity } from "../lib/activity.js";
 import { encrypt, last4 } from "../lib/crypto.js";
 import { resolveCurrentPropertyId } from "../lib/currentProperty.js";
 import { fail, list, ok } from "../lib/response.js";
-import { signedKycUrl, uploadKycPhoto, validateKycFile } from "../lib/storage.js";
+import { deleteKycFile, signedKycUrl, uploadKycPhoto, validateKycFile } from "../lib/storage.js";
 import { requireAuth, requirePermission } from "../middleware/auth.js";
 import { validate } from "../middleware/validate.js";
 
@@ -106,7 +107,17 @@ router.get(
       db.select({ count: sql<number>`count(*)::int` }).from(guests).where(where),
     ]);
 
-    const masked = rows.map((r) => maskGuest(r, req.user!.role));
+    // Resolve signed photo URLs in parallel so the guest search dropdown
+    // can render thumbnails. Rows without a guestPhoto get null. URLs are
+    // short-lived (5 min) — fine for the list view.
+    const photoUrls = await Promise.all(
+      rows.map((r) => (r.guestPhoto ? signedKycUrl(r.guestPhoto) : Promise.resolve(null))),
+    );
+
+    const masked = rows.map((r, i) => ({
+      ...maskGuest(r, req.user!.role),
+      photoUrl: photoUrls[i] ?? null,
+    }));
     return list(res, masked, { total: totalRows[0]?.count ?? 0, page, per_page });
   },
 );
@@ -282,6 +293,101 @@ router.get(
         }))
         .sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
     });
+  },
+);
+
+// Full stay history for the guest profile's "Stays" tab. Returns every
+// reservation the guest is on (booker or per-room occupant), newest first,
+// with each booking's rooms attached. Drives the inline list of rooms +
+// dates + status shown on the guest page.
+router.get(
+  "/:id/reservations",
+  requireAuth,
+  requirePermission("view_guests"),
+  async (req, res) => {
+    const id = req.params.id!;
+    const exists = await db
+      .select({ id: guests.id })
+      .from(guests)
+      .where(eq(guests.id, id))
+      .limit(1);
+    if (!exists.length) return fail(res, 404, "NOT_FOUND", "Guest not found");
+
+    // Reservations where this guest is either the booker OR a per-room
+    // occupant. Using a UNION on reservation ids keeps the result set
+    // deduplicated even when both are true.
+    const bookerIds = await db
+      .select({ id: reservations.id })
+      .from(reservations)
+      .where(eq(reservations.guestId, id));
+    const occupantIds = await db
+      .select({ id: reservationRooms.reservationId })
+      .from(reservationRooms)
+      .where(eq(reservationRooms.guestId, id));
+    const allIds = Array.from(
+      new Set([...bookerIds.map((r) => r.id), ...occupantIds.map((r) => r.id)]),
+    );
+    if (allIds.length === 0) return ok(res, []);
+
+    const resvRows = await db
+      .select({
+        id: reservations.id,
+        reservationNumber: reservations.reservationNumber,
+        status: reservations.status,
+        bookingSource: reservations.bookingSource,
+        stayType: reservations.stayType,
+        checkInDate: reservations.checkInDate,
+        checkOutDate: reservations.checkOutDate,
+        numNights: reservations.numNights,
+        grandTotal: reservations.grandTotal,
+        balanceDue: reservations.balanceDue,
+        guestId: reservations.guestId,
+        createdAt: reservations.createdAt,
+      })
+      .from(reservations)
+      .where(inArray(reservations.id, allIds))
+      .orderBy(desc(reservations.checkInDate), desc(reservations.createdAt));
+
+    const roomRows = await db
+      .select({
+        id: reservationRooms.id,
+        reservationId: reservationRooms.reservationId,
+        roomNumber: rooms.roomNumber,
+        roomType: rooms.roomType,
+        soldAsType: reservationRooms.soldAsType,
+        ratePerNight: reservationRooms.ratePerNight,
+        guestId: reservationRooms.guestId,
+        status: reservationRooms.status,
+      })
+      .from(reservationRooms)
+      .innerJoin(rooms, eq(rooms.id, reservationRooms.roomId))
+      .where(inArray(reservationRooms.reservationId, allIds));
+
+    const roomsByRes = new Map<string, typeof roomRows>();
+    for (const r of roomRows) {
+      const arr = roomsByRes.get(r.reservationId) ?? [];
+      arr.push(r);
+      roomsByRes.set(r.reservationId, arr);
+    }
+
+    return ok(
+      res,
+      resvRows.map((r) => ({
+        ...r,
+        // Role this guest played on the booking — useful for the UI to
+        // label "You were the booker" vs "Stayed in Room 202".
+        role: r.guestId === id ? "booker" : "occupant",
+        rooms: (roomsByRes.get(r.id) ?? []).map((rm) => ({
+          id: rm.id,
+          roomNumber: rm.roomNumber,
+          roomType: rm.roomType,
+          soldAsType: rm.soldAsType,
+          ratePerNight: rm.ratePerNight,
+          status: rm.status,
+          isThisGuest: rm.guestId === id,
+        })),
+      })),
+    );
   },
 );
 
@@ -576,6 +682,49 @@ router.get(
       backUrl,
       photoUrl,
     });
+  },
+);
+
+// Delete a single KYC file (photo, front, or back). Sets the column to
+// NULL and removes the file from the storage bucket. Used when staff
+// accidentally uploaded the wrong document and wants to clear it
+// without immediately replacing it.
+router.delete(
+  "/:id/kyc/:field",
+  requireAuth,
+  requirePermission("view_guests"),
+  async (req, res) => {
+    const { id, field } = req.params as { id: string; field: string };
+    const columnMap: Record<string, "guestPhoto" | "idProofPhotoFront" | "idProofPhotoBack"> = {
+      photo: "guestPhoto",
+      front: "idProofPhotoFront",
+      back: "idProofPhotoBack",
+    };
+    const col = columnMap[field];
+    if (!col) return fail(res, 400, "INVALID_FIELD", "field must be photo, front, or back");
+
+    const [g] = await db.select().from(guests).where(eq(guests.id, id)).limit(1);
+    if (!g) return fail(res, 404, "NOT_FOUND", "Guest not found");
+
+    const storagePath = g[col];
+    if (!storagePath) return ok(res, { deleted: false });
+
+    await deleteKycFile(storagePath);
+    await db
+      .update(guests)
+      .set({ [col]: null, updatedAt: new Date() })
+      .where(eq(guests.id, id));
+
+    await logActivity({
+      action: "kyc_deleted",
+      entityType: "guest",
+      entityId: id,
+      description: `Deleted KYC ${field} for ${g.fullName}`,
+      performedBy: req.user!.id,
+      ipAddress: req.ip,
+    });
+
+    return ok(res, { deleted: true });
   },
 );
 

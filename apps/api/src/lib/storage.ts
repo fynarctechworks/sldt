@@ -143,6 +143,11 @@ export async function signedKycUrl(path: string, expiresInSeconds = 300): Promis
   return data.signedUrl;
 }
 
+export async function deleteKycFile(path: string): Promise<void> {
+  if (!path) return;
+  await supabaseAdmin.storage.from(BUCKET).remove([path]);
+}
+
 // ============ DOCUMENT LINKS (invoices, receipts, slips) ============
 // Public bucket so the link works in WhatsApp without auth.
 const DOCS_BUCKET = "documents";

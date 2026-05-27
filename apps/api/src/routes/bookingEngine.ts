@@ -228,6 +228,10 @@ adminBookingEngineRouter.post(
         reservationId: r!.id,
         roomId: input.roomId,
         ratePerNight: pending.quotedRate,
+        // Per-room (0017): occupant defaults to the booker; status
+        // mirrors a fresh confirmed reservation.
+        guestId,
+        status: "confirmed" as const,
       });
 
       await tx

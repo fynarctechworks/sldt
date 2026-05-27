@@ -18,7 +18,7 @@ interface Props {
   // In reservationId mode the modal calls /otp/verify itself; onVerified
   // is invoked with no args. In guestId mode onVerified receives the raw
   // code so the caller can include it in POST /reservations.
-  onVerified: (code?: string) => void;
+  onVerified: (code?: string) => void | Promise<void>;
 }
 
 interface SendResp {
@@ -88,7 +88,9 @@ export function OtpModal({ reservationId, guestId, open, onClose, onVerified }: 
       // In guestId mode we don't consume the OTP here — the create-
       // reservation endpoint does that atomically. We hand the code back
       // so the caller can include it in POST /reservations.
-      onVerified(guestId ? code : undefined);
+      // Await the callback so the spinner stays visible while the
+      // parent fires the actual reservation-create mutation.
+      await onVerified(guestId ? code : undefined);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Verification failed");
     } finally {
@@ -191,8 +193,8 @@ export function OtpModal({ reservationId, guestId, open, onClose, onVerified }: 
                 disabled={busy || code.length < 4 || secondsLeft <= 0}
                 className="btn-primary w-full flex items-center justify-center gap-2"
               >
-                {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
-                Verify &amp; continue
+                {busy && <Loader2 className="w-4 h-4 animate-spin" />}
+                {busy ? "Creating reservation…" : "Verify & continue"}
               </button>
             </>
           )}

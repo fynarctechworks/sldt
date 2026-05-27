@@ -1,12 +1,16 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { addDays, differenceInCalendarDays, format } from "date-fns";
-import { AlertTriangle, ChevronLeft, FileText, ShieldCheck, Snowflake, Tv, Upload, Wifi, X } from "lucide-react";
+import { AlertTriangle, ChevronLeft, FileText, ShieldCheck, Snowflake, Sparkles, Tv, Upload, Wifi, X } from "lucide-react";
 import { CheckInReceiptModal, type CheckInReceiptData } from "@/components/CheckInReceiptModal";
 import { OtpModal } from "@/components/OtpModal";
 import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { Loader } from "@/components/Loader";
+import { Combobox } from "@/components/Combobox";
+import { EmailInput } from "@/components/EmailInput";
 import { ApiError, api } from "@/lib/api";
+import { citiesForState } from "@/lib/indianCities";
+import { INDIAN_STATES, INDIAN_UNION_TERRITORIES } from "@/lib/indianStates";
 import { invalidateReservationData } from "@/lib/invalidate";
 import { inr } from "@/lib/utils";
 
@@ -30,6 +34,10 @@ interface Guest {
   email: string | null;
   idProofType: string | null;
   idProofLast4: string | null;
+  // Signed URL to the guest's customer photo (KYC). Used by the search
+  // dropdown so staff can visually confirm they're picking the right
+  // person before continuing. Null when the guest has no photo on file.
+  photoUrl?: string | null;
 }
 
 interface AvailableRoom {
@@ -42,6 +50,11 @@ interface AvailableRoom {
   hasAc: boolean;
   hasTv: boolean;
   hasWifi: boolean;
+  // Housekeeping status from the rooms table. "dirty" rooms are still
+  // bookable but require a one-tap "Mark clean & select" acknowledgement
+  // so staff doesn't accidentally hand keys to a guest before the room
+  // is ready.
+  status?: "available" | "occupied" | "reserved" | "maintenance" | "dirty" | "clean" | "inspected";
 }
 
 const todayStr = format(new Date(), "yyyy-MM-dd");
@@ -98,6 +111,8 @@ export default function NewReservation() {
     idProofType: "aadhaar" as "aadhaar" | "pan" | "passport" | "driving_license" | "voter_id",
     idProofNumber: "",
     address: "",
+    city: "",
+    state: "",
     nationality: "Indian",
   });
   const [useNewGuest, setUseNewGuest] = useState(false);
@@ -422,6 +437,22 @@ export default function NewReservation() {
 
   const [pendingOtpGuestId, setPendingOtpGuestId] = useState<string | null>(null);
 
+  // Flip a dirty room straight to "clean" so staff can re-let it without
+  // leaving this page. The optimistic update bumps the cached availability
+  // list immediately; the server PATCH writes through and re-fetches.
+  const markRoomClean = useMutation({
+    mutationFn: (roomId: string) =>
+      api.patch(`/rooms/${roomId}/status`, { status: "clean", reason: "Re-let at booking" }),
+    onSuccess: (_data, roomId) => {
+      qc.setQueryData<AvailableRoom[]>(
+        ["avail", checkInDate, checkOutDate, isShortStay],
+        (cur) =>
+          cur?.map((r) => (r.id === roomId ? { ...r, status: "clean" as const } : r)) ?? cur,
+      );
+      qc.invalidateQueries({ queryKey: ["rooms"] });
+    },
+  });
+
   const create = useMutation({
     mutationFn: async () => {
       let guestId = selectedGuest?.id;
@@ -447,7 +478,12 @@ export default function NewReservation() {
           throw new Error("Customer photo is required for walk-in check-in");
         }
       }
-      if (kycFront || kycPhoto) {
+      // Only auto-upload when we just created the guest. For existing
+      // guests, the KYC pickers in this page are display-only — overwriting
+      // their on-file documents on every booking would silently destroy
+      // history. Use the dedicated Replace flow on the guest profile to
+      // intentionally swap KYC for an existing guest.
+      if (useNewGuest && (kycFront || kycPhoto || kycBack)) {
         const form = new FormData();
         if (kycFront) form.append("front", kycFront);
         if (kycBack) form.append("back", kycBack);
@@ -948,7 +984,16 @@ export default function NewReservation() {
           <h2 className="font-semibold text-navy">2. Guest</h2>
           <div className="flex gap-2 text-xs">
             <button
-              onClick={() => setUseNewGuest(false)}
+              onClick={() => {
+                setUseNewGuest(false);
+                // Clear any KYC files staff may have attached while
+                // in "New Guest" mode. Without this, those files would
+                // silently upload to the *existing* guest's profile
+                // and overwrite their actual photos on submit.
+                setKycFront(null);
+                setKycBack(null);
+                setKycPhoto(null);
+              }}
               className={`px-3 py-1 rounded-sm ${!useNewGuest ? "bg-navy text-white" : "bg-gray-100"}`}
             >
               Existing
@@ -957,6 +1002,12 @@ export default function NewReservation() {
               onClick={() => {
                 setUseNewGuest(true);
                 setSelectedGuest(null);
+                // Same reasoning in reverse — flipping back to "New"
+                // shouldn't carry over a file the staffer pre-selected
+                // for a then-different guest.
+                setKycFront(null);
+                setKycBack(null);
+                setKycPhoto(null);
               }}
               className={`px-3 py-1 rounded-sm ${useNewGuest ? "bg-navy text-white" : "bg-gray-100"}`}
             >
@@ -991,15 +1042,32 @@ export default function NewReservation() {
               />
             )}
             {guestsSearch.data && guestsSearch.data.length > 0 && !selectedGuest && (
-              <div className="max-h-48 overflow-auto border rounded-sm">
+              <div className="max-h-64 overflow-auto border rounded-sm">
                 {guestsSearch.data.map((g) => (
                   <button
                     key={g.id}
-                    className="w-full text-left px-3 py-2 hover:bg-gray-50 border-b last:border-b-0 text-sm"
+                    className="w-full text-left px-3 py-2 hover:bg-gray-50 border-b last:border-b-0 text-sm flex items-center gap-3"
                     onClick={() => setSelectedGuest(g)}
                   >
-                    <div className="font-medium">{g.fullName}</div>
-                    <div className="text-xs text-textSecondary">{g.phone}</div>
+                    {g.photoUrl ? (
+                      <img
+                        src={g.photoUrl}
+                        alt={g.fullName}
+                        className="w-10 h-10 rounded-sm object-cover border border-borderc shrink-0"
+                        loading="lazy"
+                      />
+                    ) : (
+                      <div
+                        className="w-10 h-10 rounded-sm bg-bg border border-borderc shrink-0 flex items-center justify-center text-xs font-semibold text-textSecondary uppercase"
+                        aria-hidden="true"
+                      >
+                        {g.fullName.trim().slice(0, 2)}
+                      </div>
+                    )}
+                    <div className="min-w-0 flex-1">
+                      <div className="font-medium truncate">{g.fullName}</div>
+                      <div className="text-xs text-textSecondary font-mono">{g.phone}</div>
+                    </div>
                   </button>
                 ))}
               </div>
@@ -1031,10 +1099,9 @@ export default function NewReservation() {
             </div>
             <div>
               <label className="label block mb-1">Email</label>
-              <input
-                className="input"
+              <EmailInput
                 value={newGuest.email}
-                onChange={(e) => setNewGuest({ ...newGuest, email: e.target.value })}
+                onChange={(v) => setNewGuest({ ...newGuest, email: v })}
               />
             </div>
             <div>
@@ -1069,6 +1136,40 @@ export default function NewReservation() {
                 onChange={(e) => setNewGuest({ ...newGuest, idProofNumber: e.target.value })}
               />
             </div>
+            <div>
+              <label className="label block mb-1">State</label>
+              <Combobox
+                value={newGuest.state}
+                onChange={(v) =>
+                  setNewGuest((prev) => ({
+                    ...prev,
+                    state: v,
+                    // Clear city when state changes so a previously-
+                    // picked city from a different state doesn't sit
+                    // stale in the field.
+                    city: prev.state === v ? prev.city : "",
+                  }))
+                }
+                groups={[
+                  { label: "States", options: INDIAN_STATES },
+                  { label: "Union Territories", options: INDIAN_UNION_TERRITORIES },
+                ]}
+                placeholder="Type to search or pick from list…"
+              />
+            </div>
+            <div>
+              <label className="label block mb-1">City</label>
+              <Combobox
+                value={newGuest.city}
+                onChange={(v) => setNewGuest({ ...newGuest, city: v })}
+                options={citiesForState(newGuest.state)}
+                placeholder={
+                  newGuest.state
+                    ? `Type to search ${newGuest.state} cities…`
+                    : "Pick a state first, or type any city…"
+                }
+              />
+            </div>
             <div className="col-span-2">
               <label className="label block mb-1">Address</label>
               <input
@@ -1081,43 +1182,54 @@ export default function NewReservation() {
         )}
       </div>
 
-      <div className="card space-y-3">
-        {kycOnFile && selectedGuest && walletQ.data ? (
-          <KycOnFileCard
-            guestId={selectedGuest.id}
-            guestName={selectedGuest.fullName}
-            verifiedAt={walletQ.data.kycVerifiedAt!}
-            idProofType={walletQ.data.idProofType}
-            idProofLast4={walletQ.data.idProofLast4}
-            photoUrl={walletQ.data.photoUrl}
-            kycFront={kycFront}
-            setKycFront={setKycFront}
-            kycBack={kycBack}
-            setKycBack={setKycBack}
-            kycPhoto={kycPhoto}
-            setKycPhoto={setKycPhoto}
-          />
-        ) : (
-          <>
-            <div className="flex items-center gap-2">
-              <ShieldCheck className="w-4 h-4 text-accentBlue" />
-              <h2 className="font-semibold text-navy">
-                KYC Documents {mode === "walkin" ? "(required)" : "(optional now, required at check-in)"}
-              </h2>
-            </div>
-            <div className="text-xs text-textSecondary -mt-1">
-              {mode === "walkin"
-                ? "Walk-in guests must upload a customer photo and a government ID photo now. Check-in cannot proceed without them."
-                : "Upload a clear customer photo and government ID. You can skip now and upload later, but check-in will be blocked until both are verified."}
-            </div>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              <KycFilePicker label="Customer Photo" file={kycPhoto} onChange={setKycPhoto} required={mode === "walkin"} />
-              <KycFilePicker label="ID Front" file={kycFront} onChange={setKycFront} required={mode === "walkin"} />
-              <KycFilePicker label="ID Back" file={kycBack} onChange={setKycBack} />
-            </div>
-          </>
-        )}
-      </div>
+      {/* KYC card is contextual:
+            - New Guest mode → render the upload pickers (required for
+              walk-ins, optional otherwise).
+            - Existing guest with KYC on file → render the verified-on-
+              file summary so staff sees who's checking in.
+            - Existing guest WITHOUT KYC on file → render the upload
+              pickers so the missing docs can be captured.
+            - No guest selected yet → render nothing; the section only
+              makes sense once we know who the booking is for. */}
+      {(useNewGuest || selectedGuest) && (
+        <div className="card space-y-3">
+          {kycOnFile && selectedGuest && walletQ.data ? (
+            <KycOnFileCard
+              guestId={selectedGuest.id}
+              guestName={selectedGuest.fullName}
+              verifiedAt={walletQ.data.kycVerifiedAt!}
+              idProofType={walletQ.data.idProofType}
+              idProofLast4={walletQ.data.idProofLast4}
+              photoUrl={walletQ.data.photoUrl}
+              kycFront={kycFront}
+              setKycFront={setKycFront}
+              kycBack={kycBack}
+              setKycBack={setKycBack}
+              kycPhoto={kycPhoto}
+              setKycPhoto={setKycPhoto}
+            />
+          ) : (
+            <>
+              <div className="flex items-center gap-2">
+                <ShieldCheck className="w-4 h-4 text-accentBlue" />
+                <h2 className="font-semibold text-navy">
+                  KYC Documents {mode === "walkin" ? "(required)" : "(optional now, required at check-in)"}
+                </h2>
+              </div>
+              <div className="text-xs text-textSecondary -mt-1">
+                {mode === "walkin"
+                  ? "Walk-in guests must upload a customer photo and a government ID photo now. Check-in cannot proceed without them."
+                  : "Upload a clear customer photo and government ID. You can skip now and upload later, but check-in will be blocked until both are verified."}
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <KycFilePicker label="Customer Photo" file={kycPhoto} onChange={setKycPhoto} required={mode === "walkin"} />
+                <KycFilePicker label="ID Front" file={kycFront} onChange={setKycFront} required={mode === "walkin"} />
+                <KycFilePicker label="ID Back" file={kycBack} onChange={setKycBack} />
+              </div>
+            </>
+          )}
+        </div>
+      )}
 
       <div className="card space-y-3">
         <div className="flex items-center justify-between flex-wrap gap-3">
@@ -1168,18 +1280,36 @@ export default function NewReservation() {
               )
               .map((r) => {
               const selected = selectedRooms.find((s) => s.roomId === r.id);
+              const isDirty = r.status === "dirty";
+              const cleanInFlight =
+                markRoomClean.isPending && markRoomClean.variables === r.id;
               return (
                 <div
                   key={r.id}
-                  className={`border rounded-sm p-3 cursor-pointer transition ${
-                    selected ? "border-accentBlue bg-accentBlue/5" : "border-borderc hover:border-navy"
+                  className={`border rounded-sm p-3 transition ${
+                    isDirty && !selected
+                      ? "border-warning/50 bg-warning/5"
+                      : selected
+                        ? "border-accentBlue bg-accentBlue/5 cursor-pointer"
+                        : "border-borderc hover:border-navy cursor-pointer"
                   }`}
-                  onClick={() => toggleRoom(r)}
+                  onClick={() => {
+                    if (isDirty && !selected) return;
+                    toggleRoom(r);
+                  }}
                 >
                   <div className="flex justify-between items-start">
                     <div className="min-w-0">
                       <div className="flex items-center gap-2 flex-wrap">
                         <div className="font-mono font-bold">{r.roomNumber}</div>
+                        {isDirty && (
+                          <span
+                            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-sm text-[10px] font-semibold bg-warning/15 text-warning"
+                            title="Room hasn't been cleaned since the last checkout. Mark clean before assigning to a guest."
+                          >
+                            <Sparkles className="w-3 h-3" /> DIRTY
+                          </span>
+                        )}
                         {r.hasAc ? (
                           <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-sm text-[10px] font-semibold bg-accentBlue/15 text-accentBlue">
                             <Snowflake className="w-3 h-3" /> AC
@@ -1206,6 +1336,27 @@ export default function NewReservation() {
                     </div>
                     <div className="text-sm font-mono">{inr(r.baseRate)}</div>
                   </div>
+
+                  {isDirty && !selected && (
+                    <div className="mt-2" onClick={(e) => e.stopPropagation()}>
+                      <button
+                        type="button"
+                        disabled={cleanInFlight}
+                        onClick={() => {
+                          markRoomClean.mutate(r.id, {
+                            onSuccess: () => toggleRoom({ ...r, status: "clean" }),
+                          });
+                        }}
+                        className="w-full inline-flex items-center justify-center gap-1.5 px-2 h-8 rounded-sm border border-warning/50 text-warning hover:bg-warning/10 text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        <Sparkles className="w-3.5 h-3.5" />
+                        {cleanInFlight ? "Marking clean…" : "Mark clean & select"}
+                      </button>
+                      <div className="text-[10px] text-textSecondary mt-1 leading-tight">
+                        Confirms the room has been cleaned. Required before assigning a guest.
+                      </div>
+                    </div>
+                  )}
                   {selected && (
                     <div className="mt-2 space-y-2" onClick={(e) => e.stopPropagation()}>
                       <div>
@@ -1535,11 +1686,13 @@ export default function NewReservation() {
           // staff on the form so they can retry or back out.
           setPendingOtpGuestId(null);
         }}
-        onVerified={(code) => {
+        onVerified={async (code) => {
           // OTP verified — now POST the reservation with the code so the
-          // server can re-verify atomically with the insert.
+          // server can re-verify atomically with the insert. Returning
+          // the promise keeps OtpModal's spinner visible until the
+          // reservation is fully created and navigation fires.
           if (!code) return;
-          createAfterOtp.mutate(code);
+          await createAfterOtp.mutateAsync(code);
         }}
       />
     </div>

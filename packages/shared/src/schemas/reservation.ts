@@ -121,6 +121,12 @@ export const checkOutSchema = z.object({
   paymentNotes: z.string().max(500).optional(),
   refundMode: z.enum(["cash", "credit"]).optional(),
   refundNote: z.string().max(500).optional(),
+  // How to bill the remaining un-invoiced rooms. Default 'per_room' issues
+  // one invoice per still-open room (each guest can take their own GST
+  // invoice). 'combined' rolls every remaining room + reservation-wide
+  // charges into a single invoice — the legacy behaviour, kept as an
+  // opt-in for groups who want one consolidated bill.
+  invoiceMode: z.enum(["per_room", "combined"]).optional().default("per_room"),
 });
 
 export const cancelSchema = z.object({
@@ -145,6 +151,11 @@ export const additionalChargeSchema = z.object({
   quantity: z.coerce.number().int().min(1).default(1),
   rate: z.coerce.number().positive(),
   gstRate: z.coerce.number().min(0).max(100).default(18),
+  // Per-room attribution (migration 0018). When null/omitted, the
+  // charge is reservation-wide and lands on whichever invoice covers
+  // the last remaining rooms. When set to a room's id, the charge is
+  // billed only on that room's per-room invoice.
+  roomId: z.string().uuid().nullable().optional(),
 });
 
 export const paymentSchema = z.object({

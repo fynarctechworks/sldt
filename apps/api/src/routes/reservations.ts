@@ -42,6 +42,8 @@ import { getGuestBalance } from "../lib/ledger.js";
 import { resolveCurrentPropertyId } from "../lib/currentProperty.js";
 import { resolveAverageRate } from "../lib/ratePlanResolve.js";
 import { calcGstBreakdown, getGstRate } from "../lib/gst.js";
+import { buildInvoice, selectChargesForScope } from "../lib/invoiceBuilder.js";
+import { PAYMENT_METHODS } from "../db/schema/enums.js";
 import { ratePlans } from "../db/schema/ratePlans.js";
 import { companies } from "../db/schema/companies.js";
 import { invoiceNumber, reservationNumber } from "../lib/numbers.js";
@@ -217,12 +219,38 @@ router.get("/:id", requireAuth, requirePermission("view_reservations"), async (r
     db.select().from(guests).where(eq(guests.id, r[0]!.guestId)).limit(1),
   ]);
 
-  const inv = await db.select().from(invoices).where(eq(invoices.reservationId, id)).limit(1);
+  // Pull ALL invoices for this reservation. Per-room (0017) means a
+  // multi-room booking may have several invoices — one per room plus
+  // an optional combined one. `invoice` (singular) stays for back-compat;
+  // `invoices` (plural) is the full list with scope tags.
+  const allInvoices = await db
+    .select()
+    .from(invoices)
+    .where(eq(invoices.reservationId, id))
+    .orderBy(asc(invoices.createdAt));
+  const inv = allInvoices[0] ?? null;
   const pays = await db
     .select()
     .from(payments)
     .where(eq(payments.reservationId, id))
     .orderBy(desc(payments.paymentDate));
+
+  // Per-room occupants. We need each room's guest for the UI, but the
+  // guest_id on reservation_rooms doesn't carry the row — fetch them
+  // in one batch by distinct id.
+  const occupantIds = Array.from(new Set(resRooms.map((x) => x.rr.guestId))).filter(Boolean);
+  const occupants = occupantIds.length
+    ? await db
+        .select({
+          id: guests.id,
+          fullName: guests.fullName,
+          phone: guests.phone,
+          guestPhoto: guests.guestPhoto,
+        })
+        .from(guests)
+        .where(inArray(guests.id, occupantIds))
+    : [];
+  const occupantById = new Map(occupants.map((g) => [g.id, g]));
 
   const s = await getSettings();
 
@@ -233,18 +261,36 @@ router.get("/:id", requireAuth, requirePermission("view_reservations"), async (r
     guest: guest[0] ? { ...guest[0], photoUrl: guestPhotoUrl } : guest[0],
     rooms: await (async () => {
       const m = await buildRoomTypeLabelMap();
-      return resRooms.map((x) => ({
-        ...x.room,
-        ratePerNight: x.rr.ratePerNight,
-        soldAsType: x.rr.soldAsType,
-        // Pre-rendered display label for the receipt + reservation detail:
-        // "Ac Single Bed Rooms" or "Ac Single Bed Rooms booked as Non Ac
-        // Bed Rooms" — see lib/roomTypeLabel.ts.
-        displayType: combinedRoomTypeLabel(x.room.roomType, x.rr.soldAsType, m),
-      }));
+      return resRooms.map((x) => {
+        const occ = occupantById.get(x.rr.guestId);
+        return {
+          ...x.room,
+          // Per-row state from reservation_rooms (0017).
+          reservationRoomId: x.rr.id,
+          ratePerNight: x.rr.ratePerNight,
+          soldAsType: x.rr.soldAsType,
+          roomStatus: x.rr.status,
+          roomCheckedInAt: x.rr.checkedInAt,
+          roomCheckedOutAt: x.rr.checkedOutAt,
+          roomInvoiceId: x.rr.invoiceId,
+          occupant: occ
+            ? {
+                id: occ.id,
+                fullName: occ.fullName,
+                phone: occ.phone,
+                isBooker: occ.id === r[0]!.guestId,
+              }
+            : null,
+          // Pre-rendered display label for the receipt + reservation detail:
+          // "Ac Single Bed Rooms" or "Ac Single Bed Rooms booked as Non Ac
+          // Bed Rooms" — see lib/roomTypeLabel.ts.
+          displayType: combinedRoomTypeLabel(x.room.roomType, x.rr.soldAsType, m),
+        };
+      });
     })(),
     additionalCharges: charges,
-    invoice: inv[0] ?? null,
+    invoice: inv,
+    invoices: allInvoices,
     payments: pays,
     hotelCheckInTime: s.checkInTime,
     hotelCheckOutTime: s.checkOutTime,
@@ -585,6 +631,13 @@ router.post(
             roomId: rm.roomId,
             ratePerNight: String(rm.ratePerNight),
             soldAsType: rm.soldAsType ?? null,
+            // Per-room (0017): default the occupant to the booker. The
+            // operator can reassign each room to a different guest via
+            // POST /reservations/:id/rooms/:roomId/assign-guest after
+            // creation. status='confirmed' mirrors the reservation's
+            // initial status.
+            guestId: input.guestId,
+            status: "confirmed" as const,
           })),
         );
 
@@ -1114,24 +1167,45 @@ router.post(
         .set({ status: "occupied", updatedAt: new Date() })
         .where(inArray(rooms.id, roomIds));
 
-      // Always issue a check-in receipt — paid or not. ₹0 advances at
-      // check-in get a receipt with method='cash' so staff have a printable
-      // acknowledgement for the guest even when no payment is collected.
-      {
+      // Per-room (0017): the bulk check-in flips every room on this
+      // reservation that isn't already checked-out or cancelled.
+      // Staff that wants to check rooms in individually instead would
+      // use the per-room endpoint (future) and skip this bulk action.
+      await tx
+        .update(reservationRooms)
+        .set({
+          status: "checked_in",
+          checkedInAt: new Date(),
+          checkedInBy: req.user!.id,
+        })
+        .where(
+          and(
+            eq(reservationRooms.reservationId, id),
+            inArray(reservationRooms.status, ["confirmed"] as const),
+          ),
+        );
+
+      // Issue a check-in receipt ONLY when an additional payment was
+      // actually collected at the desk. The previous "always emit a
+      // ₹0 receipt as audit acknowledgement" pattern produced
+      // confusing "Check-in — no advance collected" rows next to
+      // the real Advance-at-booking row in Payment History. The
+      // check-in event itself is already logged in activity_log
+      // (action='check_in'), so no audit data is lost by skipping
+      // the placeholder row.
+      const advance = input.advancePayment ?? 0;
+      if (advance > 0) {
         const rcpNum = await generateReceiptNumber(tx);
-        const advance = input.advancePayment ?? 0;
-        const amount = advance > 0 ? advance : 0;
-        const method = advance > 0 && input.paymentMethod ? input.paymentMethod : "cash";
-        const notes = advance > 0 ? "Advance at check-in" : "Check-in — no advance collected";
+        const method = input.paymentMethod ?? "cash";
         await tx.insert(payments).values({
           receiptNumber: rcpNum,
           propertyId: r[0]!.propertyId,
           invoiceId: null,
           reservationId: id,
-          amount: String(amount),
+          amount: String(advance),
           paymentMethod: method,
           receivedBy: req.user!.id,
-          notes,
+          notes: "Advance at check-in",
         });
       }
     });
@@ -1245,6 +1319,421 @@ router.post(
   },
 );
 
+// Per-room checkout handler. Issues one tax invoice per still-un-invoiced
+// room, splits the staff-entered finalPayment proportionally across those
+// invoices, and runs the same status flips + housekeeping task creation as
+// the combined path. Charges with a roomId go to that room's invoice;
+// reservation-wide (room-NULL) charges land on the FIRST room's invoice so
+// they don't disappear and don't double-count (matches the per-room
+// invoice endpoint's behaviour).
+async function handlePerRoomCheckout(args: {
+  req: import("express").Request;
+  res: import("express").Response;
+  reservation: typeof reservations.$inferSelect;
+  guest: typeof guests.$inferSelect;
+  resRooms: Array<{
+    rr: typeof reservationRooms.$inferSelect;
+    room: typeof rooms.$inferSelect;
+  }>;
+  charges: Array<typeof additionalCharges.$inferSelect>;
+  labelMap: RoomTypeLabelMap;
+  settings: Awaited<ReturnType<typeof getSettings>>;
+  input: import("@hoteldesk/shared").CheckOutInput;
+}) {
+  const { req, res, reservation: r, guest, resRooms, charges, labelMap, settings, input } = args;
+  const id = r.id;
+
+  // Only rooms that don't yet have an invoice are in scope. Already-
+  // invoiced rooms (someone checked them out individually earlier) stay
+  // as they are — their invoice + payment are untouched.
+  const targetRooms = resRooms.filter((x) => !x.rr.invoiceId);
+  if (targetRooms.length === 0) {
+    return fail(
+      res,
+      409,
+      "ALREADY_INVOICED",
+      "Every room already has its own invoice — nothing left to bill",
+    );
+  }
+
+  // Pre-build each invoice (math only, no DB writes yet) so we know the
+  // total and can split the final payment proportionally.
+  const targetRoomIds = targetRooms.map((x) => x.room.id);
+  const builts = targetRooms.map((rrm, idx) => {
+    // Pin orphan (room-NULL) charges to the FIRST target room — they only
+    // appear on one invoice so they don't double-count. selectChargesForScope
+    // attaches orphans only when scope == remaining; for non-first rooms we
+    // pass an OTHER-room placeholder for "remaining" so the helper sees the
+    // scope as a STRICT subset and excludes the orphans. For the first
+    // room we make scope == remaining so the orphans are picked up.
+    const scopedCharges = selectChargesForScope({
+      allCharges: charges,
+      scopeRoomIds: [rrm.room.id],
+      remainingUnInvoicedRoomIds:
+        idx === 0
+          ? [rrm.room.id]
+          : [rrm.room.id, ...targetRoomIds.filter((id) => id !== rrm.room.id)],
+    });
+    const built = buildInvoice({
+      reservation: {
+        stayType: r.stayType,
+        durationHours: r.durationHours,
+        checkInDate: r.checkInDate,
+        checkOutDate: r.checkOutDate,
+        numNights: r.numNights,
+        gstRate: r.gstRate,
+        gstMode: r.gstMode,
+      },
+      rooms: [{ ...rrm.rr, room: rrm.room }] as never,
+      charges: scopedCharges,
+      labelMap,
+      gstSlab: {
+        exemptBelow: Number(settings.gstSlabExemptBelow),
+        lowRate: Number(settings.gstSlabLowRate),
+        lowMax: Number(settings.gstSlabLowMax),
+        highRate: Number(settings.gstSlabHighRate),
+      },
+    });
+    return { rrm, built };
+  });
+
+  const totalGrand = +builts.reduce((s, b) => s + b.built.grandTotal, 0).toFixed(2);
+  const previouslyPaid = Number(r.advancePaid);
+  const walletCreditApplied = Number(r.walletCreditApplied ?? 0);
+  const finalPayment = input.finalPayment ?? 0;
+  const isUnpaid = input.paymentMethod === "unpaid";
+
+  const remainingBeforeFinal = +(totalGrand - previouslyPaid - walletCreditApplied).toFixed(2);
+  if (remainingBeforeFinal > 0.009) {
+    if (!input.paymentMethod) {
+      return fail(res, 400, "PAYMENT_REQUIRED", "Payment method is required at check-out");
+    }
+    if (finalPayment <= 0.009) {
+      return fail(res, 400, "PAYMENT_REQUIRED", "Final payment amount is required at check-out");
+    }
+    if (isUnpaid && (!input.paymentNotes || input.paymentNotes.trim() === "")) {
+      return fail(res, 400, "NOTES_REQUIRED", "Notes are required for unpaid checkouts");
+    }
+  }
+
+  // Distribute previouslyPaid + walletCreditApplied + finalPayment across
+  // the per-room invoices proportionally to each invoice's grandTotal.
+  // Wallet credit + advance attach to the FIRST invoice so the receipt
+  // trail stays sane (a single "advance carry-in" row, not N slivers).
+  const realFinalPaid = isUnpaid ? 0 : finalPayment;
+  const totalCollected = +(previouslyPaid + walletCreditApplied + realFinalPaid).toFixed(2);
+  const hasOverpaid = totalCollected - totalGrand > 0.009;
+  const overpaidAmount = +(totalCollected - totalGrand).toFixed(2);
+  if (hasOverpaid && !input.refundMode) {
+    return fail(
+      res,
+      400,
+      "REFUND_MODE_REQUIRED",
+      `Guest overpaid by ₹${overpaidAmount.toFixed(2)}. Choose refund mode (cash or credit).`,
+    );
+  }
+
+  // For payment splitting: how much of the staff's final payment goes to
+  // each invoice (proportional to that invoice's bill, after accounting
+  // for the advance + wallet that lands on invoice #0).
+  const advanceForFirst = +(previouslyPaid + walletCreditApplied).toFixed(2);
+  // Each invoice's "billed minus pre-paid" determines how much real money
+  // it still needs from the finalPayment pool.
+  const owedPerInvoice = builts.map((b, idx) => {
+    const carry = idx === 0 ? Math.min(advanceForFirst, b.built.grandTotal) : 0;
+    return +(b.built.grandTotal - carry).toFixed(2);
+  });
+  const totalStillOwed = +owedPerInvoice.reduce((s, x) => s + x, 0).toFixed(2);
+  const splitFinal = owedPerInvoice.map((owed, idx) => {
+    if (totalStillOwed <= 0.009) return 0;
+    // Last invoice absorbs the rounding remainder.
+    if (idx === owedPerInvoice.length - 1) {
+      const used = +owedPerInvoice
+        .slice(0, -1)
+        .reduce(
+          (s, _, i) => s + +((realFinalPaid * (owedPerInvoice[i] ?? 0)) / totalStillOwed).toFixed(2),
+          0,
+        )
+        .toFixed(2);
+      return +(realFinalPaid - used).toFixed(2);
+    }
+    return +((realFinalPaid * owed) / totalStillOwed).toFixed(2);
+  });
+
+  const issuedInvoices: Array<{ id: string; invoiceNumber: string }> = [];
+
+  await db.transaction(async (tx) => {
+    for (let i = 0; i < builts.length; i++) {
+      const { rrm, built } = builts[i]!;
+      const invoiceSeq = await nextInvoiceSequence(`SLDT-INV-%`, tx);
+      const invNum = invoiceNumber(settings.invoicePrefix, invoiceSeq);
+
+      const cgstRate = +(built.roomGstRate / 2).toFixed(2);
+      const sgstRate = +(built.roomGstRate / 2).toFixed(2);
+
+      // Per-room invoice bills the room's occupant by default, falling
+      // back to the booker (matches /:id/invoice scope=room behaviour).
+      const billedToGuestId = rrm.rr.guestId;
+      const [billedTo] = await tx
+        .select()
+        .from(guests)
+        .where(eq(guests.id, billedToGuestId))
+        .limit(1);
+      const billedToGuest = billedTo ?? guest;
+
+      const advanceOnThisInv = i === 0 ? Math.min(advanceForFirst, built.grandTotal) : 0;
+      const paymentOnThisInv = splitFinal[i] ?? 0;
+      const collectedOnThisInv = +(advanceOnThisInv + paymentOnThisInv).toFixed(2);
+      const balanceOnThisInv = +(built.grandTotal - collectedOnThisInv).toFixed(2);
+      const invStatusForRow =
+        balanceOnThisInv <= 0.009 ? "paid" : collectedOnThisInv > 0 ? "partial" : "issued";
+
+      const [inv] = await tx
+        .insert(invoices)
+        .values({
+          invoiceNumber: invNum,
+          propertyId: r.propertyId,
+          reservationId: id,
+          guestId: billedToGuestId,
+          hotelName: settings.hotelName,
+          hotelAddress: settings.hotelAddress,
+          hotelGstin: settings.hotelGstin,
+          guestName: billedToGuest.fullName,
+          guestAddress: billedToGuest.address ?? null,
+          guestGstin: billedToGuest.gstin ?? null,
+          subtotal: String(built.subtotal),
+          cgstRate: String(cgstRate),
+          cgstAmount: String(built.cgst),
+          sgstRate: String(sgstRate),
+          sgstAmount: String(built.sgst),
+          grandTotal: String(built.grandTotal),
+          // Wallet credit only attaches to the first invoice (the booker's
+          // wallet pays the booker's share).
+          walletCreditApplied: i === 0 ? String(walletCreditApplied.toFixed(2)) : "0.00",
+          totalPaid: String(collectedOnThisInv),
+          balanceDue: String(balanceOnThisInv),
+          status: invStatusForRow,
+          scope: "room" as const,
+          scopeRoomIds: [rrm.room.id],
+          issuedBy: req.user!.id,
+        })
+        .returning();
+
+      await tx
+        .insert(invoiceLineItems)
+        .values(built.lineItems.map((li) => ({ invoiceId: inv!.id, ...li })));
+
+      // Link reservation_room → its invoice for the per-room queries.
+      await tx
+        .update(reservationRooms)
+        .set({
+          invoiceId: inv!.id,
+          status: "checked_out",
+          checkedOutAt: new Date(),
+          checkedOutBy: req.user!.id,
+        })
+        .where(eq(reservationRooms.id, rrm.rr.id));
+
+      // Attach any orphan (no invoice_id) payments to the FIRST invoice
+      // so the advance-at-booking receipt isn't lost. Only do this on
+      // the first iteration.
+      if (i === 0) {
+        await tx
+          .update(payments)
+          .set({ invoiceId: inv!.id })
+          .where(and(eq(payments.reservationId, id), sql`${payments.invoiceId} IS NULL`));
+      }
+
+      if (paymentOnThisInv > 0.009 && input.paymentMethod) {
+        const rcpNum = await generateReceiptNumber(tx);
+        await tx.insert(payments).values({
+          receiptNumber: rcpNum,
+          propertyId: r.propertyId,
+          invoiceId: inv!.id,
+          reservationId: id,
+          amount: String(paymentOnThisInv),
+          paymentMethod: input.paymentMethod,
+          status: isUnpaid ? "pending" : "received",
+          receivedBy: req.user!.id,
+          notes:
+            input.paymentNotes ??
+            (builts.length > 1 ? `Per-room share of check-out collection (Room ${rrm.room.roomNumber})` : null),
+        });
+      }
+
+      issuedInvoices.push({ id: inv!.id, invoiceNumber: invNum });
+    }
+
+    // Refund overpayment as wallet credit (one row, against the first
+    // invoice). Cash refunds are handled outside this transaction (front
+    // desk pays out from the drawer manually).
+    if (hasOverpaid && input.refundMode === "credit") {
+      await tx.insert(guestLedger).values({
+        guestId: r.guestId,
+        entryType: "credit_issued",
+        amount: String(overpaidAmount.toFixed(2)),
+        reservationId: id,
+        invoiceId: issuedInvoices[0]!.id,
+        note:
+          input.refundNote ??
+          `Refund issued as wallet credit on early checkout (reservation ${r.reservationNumber})`,
+        createdBy: req.user!.id,
+      });
+    }
+
+    // Reservation-level updates — same as the combined path.
+    const newReservationBalance = +builts
+      .reduce((s, _, i) => {
+        const advanceOnInv = i === 0 ? Math.min(advanceForFirst, builts[i]!.built.grandTotal) : 0;
+        const payOnInv = splitFinal[i] ?? 0;
+        return s + (builts[i]!.built.grandTotal - advanceOnInv - payOnInv);
+      }, 0)
+      .toFixed(2);
+
+    await tx
+      .update(reservations)
+      .set({
+        status: "checked_out",
+        checkedOutAt: new Date(),
+        checkedOutBy: req.user!.id,
+        balanceDue: String(Math.max(0, newReservationBalance)),
+        updatedAt: new Date(),
+      })
+      .where(eq(reservations.id, id));
+
+    const checkoutRoomIds = targetRooms.map((x) => x.room.id);
+    await tx
+      .update(rooms)
+      .set({ status: "dirty", updatedAt: new Date() })
+      .where(inArray(rooms.id, checkoutRoomIds));
+
+    // Housekeeping task per vacated room (matches the combined path).
+    for (const roomId of checkoutRoomIds) {
+      const [hkTask] = await tx
+        .insert(housekeepingTasks)
+        .values({
+          propertyId: r.propertyId,
+          roomId,
+          reservationId: id,
+          taskType: "checkout_clean",
+          status: "pending",
+          priority: 70,
+          createdBy: req.user!.id,
+        })
+        .returning({ id: housekeepingTasks.id });
+      if (hkTask) {
+        await tx.insert(housekeepingTaskSteps).values(
+          DEFAULT_TASK_STEPS.checkout_clean.map((label, idx) => ({
+            taskId: hkTask.id,
+            label,
+            sortOrder: (idx + 1) * 10,
+          })),
+        );
+      }
+    }
+  });
+
+  // Fire-and-forget post-checkout work — PDFs per invoice, owner +
+  // guest notifications. Matches the combined path's behaviour but
+  // loops over every invoice we just issued.
+  void (async () => {
+    try {
+      const settingsCo = await getSettings();
+      const invoiceLinks: string[] = [];
+      for (const issued of issuedInvoices) {
+        try {
+          const [fullInv] = await db
+            .select()
+            .from(invoices)
+            .where(eq(invoices.id, issued.id))
+            .limit(1);
+          if (!fullInv) continue;
+          const [items, pays] = await Promise.all([
+            db.select().from(invoiceLineItems).where(eq(invoiceLineItems.invoiceId, fullInv.id)),
+            db.select().from(payments).where(eq(payments.invoiceId, fullInv.id)),
+          ]);
+          const pdf = await renderInvoicePdf({
+            invoice: fullInv,
+            lineItems: items,
+            payments: pays,
+            settings: settingsCo,
+            stay: {
+              checkInDate: r.checkInDate,
+              checkOutDate: r.checkOutDate,
+              numNights: Number(r.numNights),
+              stayType: r.stayType,
+              durationHours: r.durationHours ? Number(r.durationHours) : null,
+              checkedInAt: r.checkedInAt ? r.checkedInAt.toISOString() : null,
+            },
+          });
+          const url = await uploadPublicPdf(`invoices/${issued.invoiceNumber}.pdf`, pdf);
+          if (url) invoiceLinks.push(url);
+        } catch (err) {
+          logger.warn(
+            { err, invoiceNumber: issued.invoiceNumber },
+            "invoice PDF render/upload failed",
+          );
+        }
+      }
+
+      const checkedOutRooms = await getReservationRoomNumbers(id);
+      const coRoomSuffix = checkedOutRooms ? ` · Room ${checkedOutRooms}` : "";
+      const summaryNumbers = issuedInvoices.map((x) => x.invoiceNumber).join(", ");
+      await dispatchNotification({
+        type: "guest_checked_out",
+        title: "Guest checked out",
+        body: `${guest.fullName} (${r.reservationNumber}${coRoomSuffix}). Invoices: ${summaryNumbers}.`,
+        href: `/reservations/${id}`,
+        payload: {
+          reservationId: id,
+          invoiceNumbers: issuedInvoices.map((x) => x.invoiceNumber),
+          invoiceLinks,
+        },
+        recipientRoles: ["admin", "frontdesk", "housekeeping"],
+      });
+
+      const baseVars = {
+        hotel: env.HOTEL_DISPLAY_NAME,
+        hotel_phone: settingsCo.hotelPhone ?? "",
+        guest_name: guest.fullName,
+        guest_phone: guest.phone ?? "",
+        guest_email: guest.email ?? "",
+        reservation_number: r.reservationNumber,
+        check_out_date: r.checkOutDate,
+        invoice_number: summaryNumbers,
+        invoice_link: invoiceLinks[0] ?? "",
+        total: String(totalGrand),
+      };
+      if (guest.phone) {
+        const t = await renderTemplate("checkout_guest_sms", baseVars);
+        if (t.enabled) await notifyGuestSms({ to: guest.phone, text: t.body });
+      }
+      const ownerT = await renderTemplate("checkout_owner_sms", baseVars);
+      if (ownerT.enabled) await notifyOwner(ownerT.body);
+    } catch (err) {
+      logger.warn({ err, reservationId: id }, "per-room post-check-out work failed");
+    }
+  })();
+
+  await logActivity({
+    action: "check_out",
+    entityType: "reservation",
+    entityId: id,
+    description: `${r.reservationNumber} checked out, ${issuedInvoices.length} per-room invoice${issuedInvoices.length === 1 ? "" : "s"} issued`,
+    performedBy: req.user!.id,
+    ipAddress: req.ip,
+    metadata: {
+      invoiceMode: "per_room",
+      invoiceIds: issuedInvoices.map((x) => x.id),
+      finalPayment,
+      overpaidAmount: hasOverpaid ? overpaidAmount : 0,
+      refundMode: hasOverpaid ? input.refundMode : null,
+    },
+  });
+  await invalidateDashboard();
+  return ok(res, { invoices: issuedInvoices });
+}
+
 router.post(
   "/:id/check-out",
   requireAuth,
@@ -1274,6 +1763,25 @@ router.post(
       .where(eq(additionalCharges.reservationId, id));
     const labelMap = await buildRoomTypeLabelMap();
 
+    // Per-room invoicing branch. Default behaviour for multi-room
+    // checkouts — each remaining un-invoiced room gets its own tax
+    // invoice (so each occupant can claim their own GST). The combined
+    // branch below stays as an opt-in via invoiceMode='combined'.
+    const invoiceMode = input.invoiceMode ?? "per_room";
+    if (invoiceMode === "per_room") {
+      return await handlePerRoomCheckout({
+        req,
+        res,
+        reservation: r[0]!,
+        guest,
+        resRooms,
+        charges,
+        labelMap,
+        settings,
+        input,
+      });
+    }
+
     const isShortStayInvoice = r[0]!.stayType === "short_stay";
     const shortStayHours = Number(r[0]!.durationHours ?? 0);
     const nights = Number(r[0]!.numNights);
@@ -1283,6 +1791,26 @@ router.post(
     const roomUnits = isShortStayInvoice ? 1 : nights;
     const roomGstRate = Number(r[0]!.gstRate);
     const reservationGstMode = r[0]!.gstMode ?? "exclusive";
+
+    // Combined branch: only bill rooms (and per-room charges) that don't
+    // already have an invoice. Without this filter the combined invoice
+    // would double-bill any room that was per-room checked out earlier in
+    // the stay (e.g. the early-leaver who already paid via the per-room
+    // flow). Reservation-wide charges (room_id == null) still belong on
+    // the combined invoice — they were never billed elsewhere.
+    const billableRooms = resRooms.filter((x) => !x.rr.invoiceId);
+    if (billableRooms.length === 0) {
+      return fail(
+        res,
+        409,
+        "ALREADY_INVOICED",
+        "Every room already has its own invoice — nothing left to combine",
+      );
+    }
+    const billableRoomIds = new Set(billableRooms.map((x) => x.room.id));
+    const billableCharges = charges.filter(
+      (c) => c.roomId == null || billableRoomIds.has(c.roomId),
+    );
 
     let subtotal = 0;
     const lineItems: Array<{
@@ -1296,7 +1824,7 @@ router.post(
       itemType: "room_charge" | "additional_charge";
     }> = [];
 
-    for (const rr of resRooms) {
+    for (const rr of billableRooms) {
       // In exclusive mode the stored rate IS the net price per unit.
       // In inclusive mode the stored rate is the gross per unit, so we
       // extract the per-unit net via the breakdown helper and store
@@ -1344,7 +1872,7 @@ router.post(
     let totalGst = +lineItems
       .reduce((s, li) => s + Number(li.gstAmount), 0)
       .toFixed(2);
-    for (const c of charges) {
+    for (const c of billableCharges) {
       const amount = Number(c.amount);
       const gstAmount = +(amount * (Number(c.gstRate) / 100)).toFixed(2);
       subtotal += amount;
@@ -1441,6 +1969,7 @@ router.post(
           totalPaid: String(totalPaid),
           balanceDue: String(balanceDue),
           status: invStatus,
+          scopeRoomIds: billableRooms.map((x) => x.room.id),
           issuedBy: req.user!.id,
         })
         .returning();
@@ -1448,6 +1977,22 @@ router.post(
       await tx
         .insert(invoiceLineItems)
         .values(lineItems.map((li) => ({ invoiceId: inv!.id, ...li })));
+
+      // Link the rooms we just billed to this invoice so they're treated
+      // as "invoiced" by any later /:id/invoice scope=room call and the
+      // UI's roomInvoiceId field gets populated.
+      await tx
+        .update(reservationRooms)
+        .set({ invoiceId: inv!.id })
+        .where(
+          and(
+            eq(reservationRooms.reservationId, id),
+            inArray(
+              reservationRooms.roomId,
+              billableRooms.map((x) => x.room.id),
+            ),
+          ),
+        );
 
       await tx
         .update(payments)
@@ -1494,11 +2039,33 @@ router.post(
         })
         .where(eq(reservations.id, id));
 
-      const checkoutRoomIds = resRooms.map((x) => x.room.id);
+      // Only flip rooms that this checkout actually billed. Already-
+      // invoiced rooms were vacated by their own per-room checkout and
+      // are either already dirty or have moved on to clean/inspected —
+      // re-flipping them here would re-trigger housekeeping unnecessarily.
+      const checkoutRoomIds = billableRooms.map((x) => x.room.id);
       await tx
         .update(rooms)
         .set({ status: "dirty", updatedAt: new Date() })
         .where(inArray(rooms.id, checkoutRoomIds));
+
+      // Per-room (0017): bulk checkout flips every still-checked-in
+      // room on the reservation to checked_out. The roll-up logic in
+      // the per-room endpoint then sees "all done" and won't
+      // double-process.
+      await tx
+        .update(reservationRooms)
+        .set({
+          status: "checked_out",
+          checkedOutAt: new Date(),
+          checkedOutBy: req.user!.id,
+        })
+        .where(
+          and(
+            eq(reservationRooms.reservationId, id),
+            inArray(reservationRooms.status, ["confirmed", "checked_in"] as const),
+          ),
+        );
 
       // Phase 2: auto-create a checkout-clean housekeeping task per
       // vacated room with the default checklist. Inside the same tx so
@@ -1851,6 +2418,13 @@ router.post(
           .set({ status: targetRoomStatus, updatedAt: new Date() })
           .where(inArray(rooms.id, roomIds));
       }
+
+      // Per-room (0017): mirror the cancellation onto every
+      // reservation_room row so per-room queries are accurate.
+      await tx
+        .update(reservationRooms)
+        .set({ status: "cancelled" })
+        .where(eq(reservationRooms.reservationId, id));
     });
 
     const descBits = [
@@ -1961,6 +2535,8 @@ router.post(
       .insert(additionalCharges)
       .values({
         reservationId: id,
+        // Migration 0018 — optional per-room attribution.
+        roomId: input.roomId ?? null,
         description: input.description,
         quantity: input.quantity,
         rate: String(input.rate),
@@ -2304,6 +2880,18 @@ router.post(
         roomId: input.roomId,
         ratePerNight: String(input.ratePerNight),
         soldAsType: input.soldAsType ?? null,
+        // Mid-stay add-room: occupant defaults to the booker, status
+        // mirrors the parent reservation so a checked-in reservation's
+        // added room is immediately occupied. Reassign via the
+        // per-room assign-guest endpoint when the new room is for a
+        // different person.
+        guestId: current.guestId,
+        status:
+          current.status === "checked_in"
+            ? ("checked_in" as const)
+            : ("confirmed" as const),
+        checkedInAt: current.status === "checked_in" ? new Date() : null,
+        checkedInBy: current.status === "checked_in" ? req.user!.id : null,
       });
       await tx
         .update(reservations)
@@ -2793,6 +3381,11 @@ const advancePaymentSchema = z.object({
   amount: z.coerce.number().positive(),
   paymentMethod: z.enum(["cash", "upi", "card", "bank_transfer"]),
   notes: z.string().max(500).optional(),
+  // When set, the payment lands on this specific invoice (validated to
+  // belong to this reservation). Without it, the server picks the first
+  // invoice on the reservation — fine for single-invoice cases but wrong
+  // when multiple per-room / combined invoices coexist.
+  invoiceId: z.string().uuid().optional(),
 });
 
 router.post(
@@ -2811,11 +3404,26 @@ router.post(
       return fail(res, 409, "CANCELLED", "Reservation is cancelled");
     }
 
-    const existingInvoice = await db
-      .select()
-      .from(invoices)
-      .where(eq(invoices.reservationId, id))
-      .limit(1);
+    // If the caller targeted a specific invoice, fetch + validate it.
+    // Otherwise fall back to the first invoice on the reservation (legacy
+    // single-invoice behaviour).
+    let existingInvoice: (typeof invoices.$inferSelect)[] = [];
+    if (input.invoiceId) {
+      existingInvoice = await db
+        .select()
+        .from(invoices)
+        .where(and(eq(invoices.id, input.invoiceId), eq(invoices.reservationId, id)))
+        .limit(1);
+      if (!existingInvoice.length) {
+        return fail(res, 404, "INVOICE_NOT_FOUND", "Invoice not on this reservation");
+      }
+    } else {
+      existingInvoice = await db
+        .select()
+        .from(invoices)
+        .where(eq(invoices.reservationId, id))
+        .limit(1);
+    }
 
     const created = await db.transaction(async (tx) => {
       const rcpNum = await generateReceiptNumber(tx);
@@ -3012,6 +3620,737 @@ router.post(
     });
     await invalidateDashboard();
     return ok(res, result);
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Per-room operations (migration 0017 / 0018).
+//
+// These endpoints make multi-room reservations behave like 3 separate
+// stays where required: each room has its own occupant, its own check-
+// in / check-out timing, and its own invoice. The reservation row stays
+// as the parent: its overall status is a roll-up of its rooms.
+// ---------------------------------------------------------------------------
+
+// Reassign the occupant of one room to a different guest. Default
+// occupant is the booker; once staff knows who's actually staying
+// where, they flip each room to the right guest. The new guest must
+// already exist (created via Guests page); we don't create a guest
+// inline here.
+const assignGuestSchema = z.object({ guestId: z.string().uuid() });
+router.post(
+  "/:id/rooms/:roomId/assign-guest",
+  requireAuth,
+  requirePermission("edit_reservations"),
+  validate(assignGuestSchema),
+  async (req, res) => {
+    const { id, roomId } = req.params as { id: string; roomId: string };
+    const { guestId } = req.body as z.infer<typeof assignGuestSchema>;
+
+    const [resv] = await db
+      .select({ id: reservations.id, status: reservations.status })
+      .from(reservations)
+      .where(eq(reservations.id, id))
+      .limit(1);
+    if (!resv) return fail(res, 404, "NOT_FOUND", "Reservation not found");
+    if (resv.status === "cancelled") {
+      return fail(res, 409, "CANCELLED", "Reservation is cancelled");
+    }
+
+    const [g] = await db
+      .select({ id: guests.id, fullName: guests.fullName })
+      .from(guests)
+      .where(eq(guests.id, guestId))
+      .limit(1);
+    if (!g) return fail(res, 404, "GUEST_NOT_FOUND", "Guest not found");
+
+    const [updated] = await db
+      .update(reservationRooms)
+      .set({ guestId })
+      .where(and(eq(reservationRooms.reservationId, id), eq(reservationRooms.roomId, roomId)))
+      .returning();
+    if (!updated) return fail(res, 404, "ROOM_NOT_FOUND", "Room not in this reservation");
+
+    await logActivity({
+      action: "reservation_room_guest_assigned",
+      entityType: "reservation_room",
+      entityId: updated.id,
+      description: `Room ${roomId} reassigned to ${g.fullName}`,
+      performedBy: req.user!.id,
+      ipAddress: req.ip,
+      metadata: { reservationId: id, guestId },
+    });
+    return ok(res, updated);
+  },
+);
+
+// Quick quote — what's owed for one room before checkout. Used by
+// the PerRoomCheckoutModal so staff can see the bill before
+// collecting money. Returns the same numbers the per-room invoice
+// would generate, so the modal can confidently say "guest owes
+// exactly this much".
+router.get(
+  "/:id/rooms/:roomId/checkout-quote",
+  requireAuth,
+  requirePermission("check_out"),
+  async (req, res) => {
+    const { id, roomId } = req.params as { id: string; roomId: string };
+    const [resv] = await db.select().from(reservations).where(eq(reservations.id, id)).limit(1);
+    if (!resv) return fail(res, 404, "NOT_FOUND", "Reservation not found");
+    const [allResRooms, allCharges] = await Promise.all([
+      db
+        .select({ rr: reservationRooms, room: rooms })
+        .from(reservationRooms)
+        .innerJoin(rooms, eq(rooms.id, reservationRooms.roomId))
+        .where(eq(reservationRooms.reservationId, id)),
+      db
+        .select()
+        .from(additionalCharges)
+        .where(eq(additionalCharges.reservationId, id)),
+    ]);
+    const scopedRooms = allResRooms.filter((x) => x.room.id === roomId);
+    if (!scopedRooms.length) return fail(res, 404, "ROOM_NOT_FOUND", "Room not in this reservation");
+    const settings = await getSettings();
+    const labelMap = await buildRoomTypeLabelMap();
+
+    // If this room is already linked to an invoice (per-room or combined),
+    // the bill is THAT invoice's remaining balance — not a fresh re-quote.
+    // Otherwise generate a "what would the per-room invoice look like"
+    // preview the same way as before.
+    const existingInvoiceId = scopedRooms[0]!.rr.invoiceId;
+    if (existingInvoiceId) {
+      const [inv] = await db
+        .select()
+        .from(invoices)
+        .where(eq(invoices.id, existingInvoiceId))
+        .limit(1);
+      if (inv) {
+        const cgstNum = Number(inv.cgstAmount);
+        const sgstNum = Number(inv.sgstAmount);
+        return ok(res, {
+          subtotal: Number(inv.subtotal),
+          gst: +(cgstNum + sgstNum).toFixed(2),
+          cgst: cgstNum,
+          sgst: sgstNum,
+          grandTotal: Number(inv.grandTotal),
+          balanceDue: Number(inv.balanceDue),
+          totalPaid: Number(inv.totalPaid),
+          invoiceNumber: inv.invoiceNumber,
+          invoiceScope: inv.scope,
+          alreadyInvoiced: true,
+          // Echo the line items from the bound invoice for completeness —
+          // useful if the modal wants to render them. We fetch them on
+          // demand only when the caller needs them; for the quote summary
+          // the totals above are enough.
+          lineItems: [] as never[],
+        });
+      }
+    }
+
+    const remainingUnInvoicedRoomIds = allResRooms
+      .filter((x) => !x.rr.invoiceId)
+      .map((x) => x.room.id);
+    const scopedCharges = selectChargesForScope({
+      allCharges,
+      scopeRoomIds: [roomId],
+      remainingUnInvoicedRoomIds,
+    });
+    const built = buildInvoice({
+      reservation: {
+        stayType: resv.stayType,
+        durationHours: resv.durationHours,
+        checkInDate: resv.checkInDate,
+        checkOutDate: resv.checkOutDate,
+        numNights: resv.numNights,
+        gstRate: resv.gstRate,
+        gstMode: resv.gstMode,
+      },
+      rooms: scopedRooms.map((x) => ({ ...x.rr, room: x.room })) as never,
+      charges: scopedCharges,
+      labelMap,
+      gstSlab: {
+        exemptBelow: Number(settings.gstSlabExemptBelow),
+        lowRate: Number(settings.gstSlabLowRate),
+        lowMax: Number(settings.gstSlabLowMax),
+        highRate: Number(settings.gstSlabHighRate),
+      },
+    });
+    return ok(res, {
+      subtotal: built.subtotal,
+      gst: built.totalGst,
+      cgst: built.cgst,
+      sgst: built.sgst,
+      grandTotal: built.grandTotal,
+      balanceDue: built.grandTotal,
+      totalPaid: 0,
+      lineItems: built.lineItems,
+      alreadyInvoiced: false,
+    });
+  },
+);
+
+// Check OUT a single room — and settle it. This endpoint does
+// everything atomically:
+//   1. If the room has no invoice yet, generate the per-room invoice
+//      (same math as POST /:id/invoice with scope=room)
+//   2. Record the payment against that invoice (if amount > 0)
+//   3. Flip the reservation_room status, free the physical room,
+//      create the housekeeping-clean task
+//   4. Roll up the parent reservation if every room is now done
+//
+// Body (all optional except when balance > 0):
+//   { skipInvoice?: boolean,  // default false; rarely used
+//     paymentAmount?: number, // required when there's a balance
+//     paymentMethod?: PaymentMethod,
+//     paymentNotes?: string }
+const perRoomCheckoutSchema = z.object({
+  skipInvoice: z.boolean().optional(),
+  paymentAmount: z.coerce.number().min(0).optional(),
+  paymentMethod: z.enum(PAYMENT_METHODS).optional(),
+  paymentNotes: z.string().max(500).optional(),
+});
+
+router.post(
+  "/:id/rooms/:roomId/check-out",
+  requireAuth,
+  requirePermission("check_out"),
+  validate(perRoomCheckoutSchema),
+  async (req, res) => {
+    const { id, roomId } = req.params as { id: string; roomId: string };
+    const input = req.body as z.infer<typeof perRoomCheckoutSchema>;
+
+    const [resv] = await db
+      .select()
+      .from(reservations)
+      .where(eq(reservations.id, id))
+      .limit(1);
+    if (!resv) return fail(res, 404, "NOT_FOUND", "Reservation not found");
+
+    const [rr] = await db
+      .select()
+      .from(reservationRooms)
+      .where(and(eq(reservationRooms.reservationId, id), eq(reservationRooms.roomId, roomId)))
+      .limit(1);
+    if (!rr) return fail(res, 404, "ROOM_NOT_FOUND", "Room not in this reservation");
+    if (rr.status !== "checked_in") {
+      return fail(
+        res,
+        409,
+        "NOT_CHECKED_IN",
+        `Room is ${rr.status}, can only check out a checked_in room`,
+      );
+    }
+
+    // Compute this room's bill via the same invoice builder used by
+    // POST /:id/invoice. If a per-room invoice already exists for
+    // this room we won't issue another; the balance comes from THAT
+    // invoice's remaining unpaid amount.
+    const [allResRooms, allCharges, settings] = await Promise.all([
+      db
+        .select({ rr: reservationRooms, room: rooms })
+        .from(reservationRooms)
+        .innerJoin(rooms, eq(rooms.id, reservationRooms.roomId))
+        .where(eq(reservationRooms.reservationId, id)),
+      db.select().from(additionalCharges).where(eq(additionalCharges.reservationId, id)),
+      getSettings(),
+    ]);
+    const scopedRooms = allResRooms.filter((x) => x.room.id === roomId);
+    const labelMap = await buildRoomTypeLabelMap();
+    const remainingUnInvoicedRoomIds = allResRooms
+      .filter((x) => !x.rr.invoiceId)
+      .map((x) => x.room.id);
+    const scopedCharges = selectChargesForScope({
+      allCharges,
+      scopeRoomIds: [roomId],
+      remainingUnInvoicedRoomIds,
+    });
+    const built = buildInvoice({
+      reservation: {
+        stayType: resv.stayType,
+        durationHours: resv.durationHours,
+        checkInDate: resv.checkInDate,
+        checkOutDate: resv.checkOutDate,
+        numNights: resv.numNights,
+        gstRate: resv.gstRate,
+        gstMode: resv.gstMode,
+      },
+      rooms: scopedRooms.map((x) => ({ ...x.rr, room: x.room })) as never,
+      charges: scopedCharges,
+      labelMap,
+      gstSlab: {
+        exemptBelow: Number(settings.gstSlabExemptBelow),
+        lowRate: Number(settings.gstSlabLowRate),
+        lowMax: Number(settings.gstSlabLowMax),
+        highRate: Number(settings.gstSlabHighRate),
+      },
+    });
+
+    const willIssueInvoice = !rr.invoiceId && !input.skipInvoice;
+    const payAmount = input.paymentAmount ?? 0;
+    const grandTotal = built.grandTotal;
+    // If we're issuing the invoice fresh, the entire grandTotal is
+    // due. If invoice was already issued, we let the operator decide
+    // the amount (we don't introspect prior payments on that invoice
+    // here — that's the standalone Record Payment flow).
+    if (willIssueInvoice && grandTotal > 0.009) {
+      if (payAmount <= 0.009) {
+        return fail(
+          res,
+          400,
+          "PAYMENT_REQUIRED",
+          `Guest owes ₹${grandTotal.toFixed(2)} for this room. Collect payment or mark unpaid.`,
+        );
+      }
+      if (!input.paymentMethod) {
+        return fail(res, 400, "PAYMENT_METHOD_REQUIRED", "Payment method is required");
+      }
+      if (input.paymentMethod === "unpaid" && !input.paymentNotes?.trim()) {
+        return fail(res, 400, "NOTES_REQUIRED", "Notes are required when marking unpaid");
+      }
+    }
+
+    // Per-room occupant is the guest of record on the invoice.
+    const [billedTo] = await db.select().from(guests).where(eq(guests.id, rr.guestId)).limit(1);
+    if (!billedTo) return fail(res, 500, "GUEST_MISSING", "Occupant guest not found");
+
+    const cgstRate = +(built.roomGstRate / 2).toFixed(2);
+    const sgstRate = +(built.roomGstRate / 2).toFixed(2);
+    const isUnpaid = input.paymentMethod === "unpaid";
+    const realPaid = isUnpaid ? 0 : payAmount;
+
+    const now = new Date();
+    let issuedInvoiceId: string | null = rr.invoiceId;
+    let issuedInvoiceNumber: string | null = null;
+
+    await db.transaction(async (tx) => {
+      // 1. Issue the per-room invoice if it doesn't exist yet.
+      if (willIssueInvoice) {
+        const invoiceSeq = await nextInvoiceSequence(`SLDT-INV-%`, tx);
+        const invNumber = invoiceNumber(settings.invoicePrefix, invoiceSeq);
+        const [inv] = await tx
+          .insert(invoices)
+          .values({
+            invoiceNumber: invNumber,
+            propertyId: resv.propertyId,
+            reservationId: id,
+            guestId: billedTo.id,
+            hotelName: settings.hotelName,
+            hotelAddress: settings.hotelAddress,
+            hotelGstin: settings.hotelGstin,
+            guestName: billedTo.fullName,
+            guestAddress: billedTo.address ?? null,
+            guestGstin: billedTo.gstin ?? null,
+            subtotal: String(built.subtotal),
+            cgstRate: String(cgstRate),
+            cgstAmount: String(built.cgst),
+            sgstRate: String(sgstRate),
+            sgstAmount: String(built.sgst),
+            grandTotal: String(grandTotal),
+            walletCreditApplied: "0.00",
+            totalPaid: String(realPaid.toFixed(2)),
+            balanceDue: String((grandTotal - realPaid).toFixed(2)),
+            status:
+              realPaid + 0.009 >= grandTotal
+                ? "paid"
+                : realPaid > 0.009
+                  ? "partial"
+                  : "issued",
+            scope: "room" as const,
+            scopeRoomIds: [roomId],
+            issuedBy: req.user!.id,
+          })
+          .returning();
+        issuedInvoiceId = inv!.id;
+        issuedInvoiceNumber = inv!.invoiceNumber;
+        await tx
+          .insert(invoiceLineItems)
+          .values(built.lineItems.map((li) => ({ invoiceId: inv!.id, ...li })));
+      }
+
+      // 2. Record the payment (always, when amount > 0). Tied to the
+      //    newly-issued invoice OR the pre-existing one on the room.
+      if (payAmount > 0.009 && input.paymentMethod) {
+        const rcpNum = await generateReceiptNumber(tx);
+        await tx.insert(payments).values({
+          receiptNumber: rcpNum,
+          propertyId: resv.propertyId,
+          invoiceId: issuedInvoiceId,
+          reservationId: id,
+          amount: String(payAmount.toFixed(2)),
+          paymentMethod: input.paymentMethod,
+          status: isUnpaid ? "pending" : "received",
+          receivedBy: req.user!.id,
+          notes: input.paymentNotes ?? null,
+        });
+      }
+
+      // 3. Flip the per-room row + link the invoice.
+      await tx
+        .update(reservationRooms)
+        .set({
+          status: "checked_out",
+          checkedOutAt: now,
+          checkedOutBy: req.user!.id,
+          invoiceId: issuedInvoiceId,
+        })
+        .where(eq(reservationRooms.id, rr.id));
+
+      // 4. Free the physical room → dirty so housekeeping picks it up.
+      await tx
+        .update(rooms)
+        .set({ status: "dirty", updatedAt: now })
+        .where(eq(rooms.id, roomId));
+
+      // 5. Auto-create the checkout-clean HK task.
+      const [hkTask] = await tx
+        .insert(housekeepingTasks)
+        .values({
+          propertyId: resv.propertyId,
+          roomId,
+          reservationId: id,
+          taskType: "checkout_clean",
+          status: "pending",
+          priority: 70,
+          createdBy: req.user!.id,
+        })
+        .returning({ id: housekeepingTasks.id });
+      if (hkTask) {
+        await tx.insert(housekeepingTaskSteps).values(
+          DEFAULT_TASK_STEPS.checkout_clean.map((label, i) => ({
+            taskId: hkTask.id,
+            label,
+            sortOrder: (i + 1) * 10,
+          })),
+        );
+      }
+
+      // 6. Roll up the parent reservation. If every non-cancelled
+      //    room is now checked_out, flip the reservation to
+      //    checked_out and accumulate the per-room invoice totals
+      //    into the reservation's balance_due.
+      const siblings = await tx
+        .select({ status: reservationRooms.status })
+        .from(reservationRooms)
+        .where(eq(reservationRooms.reservationId, id));
+      const stillActive = siblings.some(
+        (s) => s.status === "confirmed" || s.status === "checked_in",
+      );
+      if (!stillActive && resv.status !== "checked_out") {
+        await tx
+          .update(reservations)
+          .set({
+            status: "checked_out",
+            checkedOutAt: now,
+            checkedOutBy: req.user!.id,
+            updatedAt: now,
+          })
+          .where(eq(reservations.id, id));
+      }
+    });
+
+    await logActivity({
+      action: "reservation_room_check_out",
+      entityType: "reservation_room",
+      entityId: rr.id,
+      description: `Room ${roomId} checked out from ${resv.reservationNumber}${issuedInvoiceNumber ? ` · invoice ${issuedInvoiceNumber}` : ""}${payAmount > 0 ? ` · ₹${payAmount.toFixed(2)} ${input.paymentMethod}` : ""}`,
+      performedBy: req.user!.id,
+      ipAddress: req.ip,
+      metadata: {
+        reservationId: id,
+        roomId,
+        invoiceId: issuedInvoiceId,
+        paymentAmount: payAmount,
+        paymentMethod: input.paymentMethod,
+      },
+    });
+    await invalidateDashboard();
+    return ok(res, {
+      roomId,
+      status: "checked_out" as const,
+      invoiceId: issuedInvoiceId,
+      invoiceNumber: issuedInvoiceNumber,
+      grandTotal,
+    });
+  },
+);
+
+// Generate an invoice. scope='room' → bill for one specific room
+// (charges with roomId targeting that room + a fair share of any
+// reservation-wide charges when this invoice happens to cover the
+// last remaining rooms). scope='combined' → one bill for the whole
+// reservation, ignoring any per-room invoices already issued for
+// charges (they wouldn't double-count because they have their own
+// invoice_id link).
+// Optional payment payload accepted on invoice issue. When present, the
+// server inserts a payment row tied to the new invoice and adjusts
+// totalPaid / balanceDue / status accordingly — saves a second round-trip
+// when the front desk wants to settle the bill at the same moment the
+// invoice is generated.
+const issueInvoicePaymentSchema = z.object({
+  amount: z.coerce.number().positive(),
+  paymentMethod: z.enum(PAYMENT_METHODS),
+  paymentNotes: z.string().max(500).optional().nullable(),
+});
+
+const issueInvoiceSchema = z.discriminatedUnion("scope", [
+  z.object({
+    scope: z.literal("room"),
+    roomId: z.string().uuid(),
+    payment: issueInvoicePaymentSchema.optional(),
+  }),
+  z.object({
+    scope: z.literal("combined"),
+    // Optional subset of room IDs to combine. When omitted, every still-
+    // un-invoiced room rolls into one invoice (legacy default). When
+    // provided, only the listed rooms are billed — useful for "combine
+    // these three of the five remaining rooms" workflows.
+    roomIds: z.array(z.string().uuid()).min(1).optional(),
+    payment: issueInvoicePaymentSchema.optional(),
+  }),
+]);
+router.post(
+  "/:id/invoice",
+  requireAuth,
+  requirePermission("check_out"),
+  validate(issueInvoiceSchema),
+  async (req, res) => {
+    const id = req.params.id!;
+    const input = req.body as z.infer<typeof issueInvoiceSchema>;
+
+    const [resv] = await db
+      .select()
+      .from(reservations)
+      .where(eq(reservations.id, id))
+      .limit(1);
+    if (!resv) return fail(res, 404, "NOT_FOUND", "Reservation not found");
+    if (resv.status === "cancelled") {
+      return fail(res, 409, "CANCELLED", "Cannot invoice a cancelled reservation");
+    }
+
+    // Load everything we need in parallel.
+    const [allResRooms, allCharges, settings] = await Promise.all([
+      db
+        .select({ rr: reservationRooms, room: rooms })
+        .from(reservationRooms)
+        .innerJoin(rooms, eq(rooms.id, reservationRooms.roomId))
+        .where(eq(reservationRooms.reservationId, id)),
+      db
+        .select()
+        .from(additionalCharges)
+        .where(eq(additionalCharges.reservationId, id)),
+      getSettings(),
+    ]);
+
+    // Determine in-scope rooms.
+    let scopeRoomIds: string[];
+    let scopedRooms: typeof allResRooms;
+    if (input.scope === "room") {
+      scopedRooms = allResRooms.filter((x) => x.room.id === input.roomId);
+      if (!scopedRooms.length) {
+        return fail(res, 404, "ROOM_NOT_FOUND", "Room not in this reservation");
+      }
+      if (scopedRooms[0]!.rr.invoiceId) {
+        return fail(
+          res,
+          409,
+          "ALREADY_INVOICED",
+          "This room already has an invoice — void & reissue if you need to regenerate",
+        );
+      }
+      scopeRoomIds = [input.roomId];
+    } else {
+      // Combined: only include rooms that DON'T already have a per-room
+      // invoice. When the caller supplies an explicit roomIds list, narrow
+      // further to that subset (after rejecting any IDs that aren't on
+      // this reservation or are already invoiced).
+      const uninvoiced = allResRooms.filter((x) => !x.rr.invoiceId);
+      if (!uninvoiced.length) {
+        return fail(
+          res,
+          409,
+          "ALREADY_INVOICED",
+          "Every room already has its own invoice — nothing left to combine",
+        );
+      }
+      if (input.roomIds && input.roomIds.length > 0) {
+        const requested = new Set(input.roomIds);
+        const validUninvoicedIds = new Set(uninvoiced.map((x) => x.room.id));
+        for (const id of input.roomIds) {
+          if (!validUninvoicedIds.has(id)) {
+            return fail(
+              res,
+              409,
+              "INVALID_ROOM",
+              "One or more selected rooms aren't billable (not on this reservation, or already invoiced)",
+            );
+          }
+        }
+        scopedRooms = uninvoiced.filter((x) => requested.has(x.room.id));
+      } else {
+        scopedRooms = uninvoiced;
+      }
+      scopeRoomIds = scopedRooms.map((x) => x.room.id);
+    }
+
+    // Charges in scope (see invoiceBuilder docstring).
+    const remainingUnInvoicedRoomIds = allResRooms
+      .filter((x) => !x.rr.invoiceId && !scopeRoomIds.includes(x.room.id))
+      .map((x) => x.room.id);
+    // Plus our own scope rooms (they're "remaining" pre-issue).
+    const trulyRemaining = [...new Set([...scopeRoomIds, ...remainingUnInvoicedRoomIds])];
+    const scopedCharges = selectChargesForScope({
+      allCharges,
+      scopeRoomIds,
+      remainingUnInvoicedRoomIds: trulyRemaining,
+    });
+
+    const labelMap = await buildRoomTypeLabelMap();
+    const built = buildInvoice({
+      reservation: {
+        stayType: resv.stayType,
+        durationHours: resv.durationHours,
+        checkInDate: resv.checkInDate,
+        checkOutDate: resv.checkOutDate,
+        numNights: resv.numNights,
+        gstRate: resv.gstRate,
+        gstMode: resv.gstMode,
+      },
+      rooms: scopedRooms.map((x) => ({ ...x.rr, room: x.room })) as never,
+      charges: scopedCharges,
+      labelMap,
+      gstSlab: {
+        exemptBelow: Number(settings.gstSlabExemptBelow),
+        lowRate: Number(settings.gstSlabLowRate),
+        lowMax: Number(settings.gstSlabLowMax),
+        highRate: Number(settings.gstSlabHighRate),
+      },
+    });
+
+    // Per-room invoice has its own occupant as the guest-of-record;
+    // combined uses the booker (resv.guestId).
+    const billedToGuestId =
+      input.scope === "room" ? scopedRooms[0]!.rr.guestId : resv.guestId;
+    const [billedTo] = await db
+      .select()
+      .from(guests)
+      .where(eq(guests.id, billedToGuestId))
+      .limit(1);
+    if (!billedTo) {
+      return fail(res, 500, "GUEST_MISSING", "Billed-to guest not found");
+    }
+
+    const cgstRate = +(built.roomGstRate / 2).toFixed(2);
+    const sgstRate = +(built.roomGstRate / 2).toFixed(2);
+    let invNumber = "";
+
+    // Optional same-shot payment. Capped at the invoice total (paying
+    // more would imply an overpay refund that this endpoint doesn't
+    // handle — staff can refund via the check-out flow).
+    const paymentAmount = input.payment?.amount ?? 0;
+    if (paymentAmount > built.grandTotal + 0.009) {
+      return fail(
+        res,
+        400,
+        "PAYMENT_EXCEEDS_TOTAL",
+        `Payment ₹${paymentAmount.toFixed(2)} exceeds invoice total ₹${built.grandTotal.toFixed(2)}.`,
+      );
+    }
+    const walletCreditOnInvoice =
+      input.scope === "combined" ? Number(resv.walletCreditApplied) : 0;
+    const collectedOnInvoice = +(paymentAmount + walletCreditOnInvoice).toFixed(2);
+    const invoiceBalance = +(built.grandTotal - collectedOnInvoice).toFixed(2);
+    const invoiceStatus: "paid" | "partial" | "issued" =
+      invoiceBalance <= 0.009
+        ? "paid"
+        : collectedOnInvoice > 0.009
+          ? "partial"
+          : "issued";
+
+    const created = await db.transaction(async (tx) => {
+      const invoiceSeq = await nextInvoiceSequence(`SLDT-INV-%`, tx);
+      invNumber = invoiceNumber(settings.invoicePrefix, invoiceSeq);
+      const [inv] = await tx
+        .insert(invoices)
+        .values({
+          invoiceNumber: invNumber,
+          propertyId: resv.propertyId,
+          reservationId: id,
+          guestId: billedToGuestId,
+          hotelName: settings.hotelName,
+          hotelAddress: settings.hotelAddress,
+          hotelGstin: settings.hotelGstin,
+          guestName: billedTo.fullName,
+          guestAddress: billedTo.address ?? null,
+          guestGstin: billedTo.gstin ?? null,
+          subtotal: String(built.subtotal),
+          cgstRate: String(cgstRate),
+          cgstAmount: String(built.cgst),
+          sgstRate: String(sgstRate),
+          sgstAmount: String(built.sgst),
+          grandTotal: String(built.grandTotal),
+          // Per-room invoices don't absorb wallet credit by default
+          // (the booker holds the wallet, not the per-room occupant).
+          // Combined invoice carries any applied credit through.
+          walletCreditApplied: String(walletCreditOnInvoice.toFixed(2)),
+          totalPaid: String(collectedOnInvoice),
+          balanceDue: String(Math.max(0, invoiceBalance)),
+          status: invoiceStatus,
+          scope: input.scope === "room" ? ("room" as const) : ("combined" as const),
+          scopeRoomIds,
+          issuedBy: req.user!.id,
+        })
+        .returning();
+
+      await tx
+        .insert(invoiceLineItems)
+        .values(built.lineItems.map((li) => ({ invoiceId: inv!.id, ...li })));
+
+      // Link the in-scope reservation_rooms to this new invoice.
+      await tx
+        .update(reservationRooms)
+        .set({ invoiceId: inv!.id })
+        .where(
+          and(
+            eq(reservationRooms.reservationId, id),
+            inArray(reservationRooms.roomId, scopeRoomIds),
+          ),
+        );
+
+      if (paymentAmount > 0.009 && input.payment) {
+        const rcpNum = await generateReceiptNumber(tx);
+        await tx.insert(payments).values({
+          receiptNumber: rcpNum,
+          propertyId: resv.propertyId,
+          invoiceId: inv!.id,
+          reservationId: id,
+          amount: String(paymentAmount.toFixed(2)),
+          paymentMethod: input.payment.paymentMethod,
+          status: "received",
+          receivedBy: req.user!.id,
+          notes: input.payment.paymentNotes ?? null,
+        });
+      }
+
+      return inv!;
+    });
+
+    await logActivity({
+      action: "invoice_issued",
+      entityType: "invoice",
+      entityId: created.id,
+      description: `${invNumber} issued (scope=${input.scope}${input.scope === "room" ? ` room=${input.roomId}` : ""}) for ${resv.reservationNumber}${paymentAmount > 0 ? ` · ₹${paymentAmount.toFixed(2)} ${input.payment!.paymentMethod}` : ""}`,
+      performedBy: req.user!.id,
+      ipAddress: req.ip,
+      metadata: {
+        scope: input.scope,
+        scopeRoomIds,
+        grandTotal: built.grandTotal,
+        paymentAmount,
+        paymentMethod: input.payment?.paymentMethod,
+      },
+    });
+    await invalidateDashboard();
+    return ok(res, created);
   },
 );
 

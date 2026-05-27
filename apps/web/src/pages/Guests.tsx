@@ -22,7 +22,11 @@ import type { LucideIcon } from "lucide-react";
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Loader } from "@/components/Loader";
+import { Combobox } from "@/components/Combobox";
+import { EmailInput } from "@/components/EmailInput";
 import { getList, api } from "@/lib/api";
+import { citiesForState } from "@/lib/indianCities";
+import { INDIAN_STATES, INDIAN_UNION_TERRITORIES } from "@/lib/indianStates";
 import { GUEST_TAGS, ID_PROOF_TYPES, type IdProofType } from "@hoteldesk/shared";
 
 // Tag style registry. Each tag gets its own icon + color so the row of
@@ -429,7 +433,7 @@ function AddGuestModal({ onClose }: { onClose: () => void }) {
         <h2 className="text-lg font-semibold text-navy">Add Guest</h2>
 
         <div className="grid grid-cols-2 gap-3">
-          <Field label="Full Name *">
+          <Field label="Full Name" required>
             <input
               className="input"
               value={form.fullName}
@@ -437,7 +441,7 @@ function AddGuestModal({ onClose }: { onClose: () => void }) {
               required
             />
           </Field>
-          <Field label="Phone (10-digit) *">
+          <Field label="Phone (10-digit)" required>
             <input
               className="input"
               type="tel"
@@ -451,16 +455,19 @@ function AddGuestModal({ onClose }: { onClose: () => void }) {
               onBlur={checkDup}
               required
             />
+            {form.phone.length > 0 && form.phone.length < 10 && (
+              <div className="text-[11px] text-danger mt-0.5">
+                {10 - form.phone.length} more digit{10 - form.phone.length === 1 ? "" : "s"} needed
+              </div>
+            )}
           </Field>
           <Field label="Email">
-            <input
-              className="input"
-              type="email"
+            <EmailInput
               value={form.email}
-              onChange={(e) => setForm({ ...form, email: e.target.value })}
+              onChange={(v) => setForm({ ...form, email: v })}
             />
           </Field>
-          <Field label="ID Proof Type *">
+          <Field label="ID Proof Type" required>
             <select
               className="input"
               value={form.idProofType}
@@ -473,7 +480,7 @@ function AddGuestModal({ onClose }: { onClose: () => void }) {
               ))}
             </select>
           </Field>
-          <Field label="ID Proof Number *">
+          <Field label="ID Proof Number" required>
             <input
               className="input"
               value={form.idProofNumber}
@@ -488,18 +495,36 @@ function AddGuestModal({ onClose }: { onClose: () => void }) {
               onChange={(e) => setForm({ ...form, nationality: e.target.value })}
             />
           </Field>
-          <Field label="City">
-            <input
-              className="input"
-              value={form.city}
-              onChange={(e) => setForm({ ...form, city: e.target.value })}
+          <Field label="State">
+            <Combobox
+              value={form.state}
+              onChange={(v) =>
+                setForm((prev) => ({
+                  ...prev,
+                  state: v,
+                  // Wipe city when state changes — the old city was
+                  // probably tied to the old state's list and would
+                  // look out of place otherwise.
+                  city: prev.state === v ? prev.city : "",
+                }))
+              }
+              groups={[
+                { label: "States", options: INDIAN_STATES },
+                { label: "Union Territories", options: INDIAN_UNION_TERRITORIES },
+              ]}
+              placeholder="Type to search or pick from list…"
             />
           </Field>
-          <Field label="State">
-            <input
-              className="input"
-              value={form.state}
-              onChange={(e) => setForm({ ...form, state: e.target.value })}
+          <Field label="City">
+            <Combobox
+              value={form.city}
+              onChange={(v) => setForm({ ...form, city: v })}
+              options={citiesForState(form.state)}
+              placeholder={
+                form.state
+                  ? `Type to search ${form.state} cities…`
+                  : "Pick a state first, or type any city…"
+              }
             />
           </Field>
           <div className="col-span-2">
@@ -539,7 +564,7 @@ function AddGuestModal({ onClose }: { onClose: () => void }) {
           <button
             className="btn-primary"
             onClick={() => create.mutate()}
-            disabled={create.isPending || !form.fullName || !form.phone || !form.idProofNumber}
+            disabled={create.isPending || !form.fullName.trim() || form.phone.length !== 10 || !form.idProofNumber.trim()}
           >
             {create.isPending ? "Saving…" : "Create Guest"}
           </button>
@@ -577,10 +602,13 @@ function FilterChip({
   );
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function Field({ label, required, children }: { label: string; required?: boolean; children: React.ReactNode }) {
   return (
     <div>
-      <label className="label block mb-1">{label}</label>
+      <label className="label block mb-1">
+        {label}
+        {required && <span className="text-danger ml-0.5">*</span>}
+      </label>
       {children}
     </div>
   );

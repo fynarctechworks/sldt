@@ -1050,10 +1050,72 @@ function RoomTypesTab() {
   const [editing, setEditing] = useState<RoomTypeRow | null>(null);
   const [showAdd, setShowAdd] = useState(false);
 
-  const archive = useMutation({
-    mutationFn: (id: string) => api.del(`/settings/room-types/${id}`),
+  // Delete a room type. The API hard-deletes if no rooms reference
+  // the slug, and returns 409 IN_USE with a room count otherwise.
+  // On IN_USE we prompt the user to force-delete (which nulls the
+  // type on every dependent room) — only proceeding if they confirm.
+  const del = useMutation({
+    mutationFn: async (args: { id: string; force?: boolean }) => {
+      const path = `/settings/room-types/${args.id}${args.force ? "?force=true" : ""}`;
+      return api.del(path);
+    },
     onSuccess: () => qc.invalidateQueries({ queryKey: ["room-types"] }),
   });
+
+  // Restore (un-archive) a previously archived type. Same PUT endpoint
+  // the edit form uses, just flipping is_active back to true.
+  const restore = useMutation({
+    mutationFn: (t: RoomTypeRow) =>
+      api.put(`/settings/room-types/${t.id}`, {
+        label: t.label,
+        slug: t.slug,
+        defaultRate: Number(t.defaultRate),
+        maxOccupancy: t.maxOccupancy,
+        description: t.description ?? null,
+        isActive: true,
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["room-types"] }),
+  });
+
+  async function handleDelete(t: RoomTypeRow) {
+    const confirmed = await dialog.confirm({
+      title: `Delete "${t.label}"?`,
+      message:
+        "This permanently removes the room type. Use Archive instead if you want existing rooms to keep the label.",
+      okLabel: "Delete",
+      tone: "danger",
+    });
+    if (!confirmed) return;
+    try {
+      await del.mutateAsync({ id: t.id });
+    } catch (e) {
+      // API returns 409 IN_USE when rooms still reference this slug.
+      // ApiError carries .code + .details; the helper api client throws
+      // an Error with .message containing the API's message string.
+      const msg = e instanceof Error ? e.message : String(e);
+      const looksInUse = /still use|in use|IN_USE/i.test(msg);
+      if (!looksInUse) {
+        await dialog.alert({ title: "Couldn't delete", message: msg });
+        return;
+      }
+      const force = await dialog.confirm({
+        title: `Force-delete "${t.label}"?`,
+        message: `${msg}\n\nForce delete will detach those rooms (their type becomes empty until you edit them).`,
+        okLabel: "Force delete",
+        tone: "danger",
+      });
+      if (force) {
+        try {
+          await del.mutateAsync({ id: t.id, force: true });
+        } catch (e2) {
+          await dialog.alert({
+            title: "Force delete failed",
+            message: e2 instanceof Error ? e2.message : String(e2),
+          });
+        }
+      }
+    }
+  }
 
   return (
     <div className="space-y-4">
@@ -1119,22 +1181,23 @@ function RoomTypesTab() {
                     >
                       Edit
                     </button>
-                    {t.isActive && (
+                    {!t.isActive && (
                       <button
-                        className="text-danger text-xs hover:underline inline-flex items-center gap-1"
-                        onClick={async () => {
-                          const ok = await dialog.confirm({
-                            title: `Archive "${t.label}"?`,
-                            message: "Existing rooms keep the type; it'll be hidden from new-room forms.",
-                            okLabel: "Archive",
-                            tone: "danger",
-                          });
-                          if (ok) archive.mutate(t.id);
-                        }}
+                        className="text-success text-xs hover:underline"
+                        onClick={() => restore.mutate(t)}
+                        disabled={restore.isPending}
+                        title="Make this room type active again"
                       >
-                        <Trash2 className="w-3 h-3" /> Archive
+                        Restore
                       </button>
                     )}
+                    <button
+                      className="text-danger text-xs hover:underline inline-flex items-center gap-1"
+                      onClick={() => handleDelete(t)}
+                      disabled={del.isPending}
+                    >
+                      <Trash2 className="w-3 h-3" /> Delete
+                    </button>
                   </div>
                 </td>
               </tr>

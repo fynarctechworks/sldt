@@ -42,12 +42,13 @@ import {
 import { useDialog } from "@/components/Dialog";
 import { Loader } from "@/components/Loader";
 import { useToast } from "@/components/Toast";
-import { api } from "@/lib/api";
+import { api, getList } from "@/lib/api";
 import { inr } from "@/lib/utils";
 
 type Tab =
   | "occupancy"
   | "revenue"
+  | "invoices"
   | "collections"
   | "gst"
   | "outstanding"
@@ -65,6 +66,7 @@ interface TabDef {
 const TABS: TabDef[] = [
   { id: "occupancy", label: "Occupancy", caption: "Daily room fill rate", Icon: Percent },
   { id: "revenue", label: "Revenue", caption: "Earnings + room-type mix", Icon: TrendingUp },
+  { id: "invoices", label: "Invoices", caption: "Every tax invoice on the property", Icon: Receipt },
   { id: "collections", label: "Collections", caption: "Money received by method", Icon: Coins },
   { id: "gst", label: "GST", caption: "CGST / SGST summary", Icon: Receipt },
   { id: "outstanding", label: "Outstanding", caption: "Unpaid invoices & promises", Icon: AlertTriangle },
@@ -170,6 +172,7 @@ export default function Reports() {
 
       {tab === "occupancy" && <OccupancyTab from={from} to={to} />}
       {tab === "revenue" && <RevenueTab from={from} to={to} />}
+      {tab === "invoices" && <InvoicesTab from={from} to={to} />}
       {tab === "collections" && <CollectionsTab from={from} to={to} />}
       {tab === "gst" && <GstTab from={from} to={to} />}
       {tab === "outstanding" && <OutstandingTab />}
@@ -626,6 +629,281 @@ function RevenueTab({ from, to }: { from: string; to: string }) {
       <div className="flex justify-end">
         <ExportBtn onClick={() => exportCsv(`revenue-${from}-${to}.csv`, data.daily)} />
       </div>
+    </div>
+  );
+}
+
+// Full invoice ledger — every tax invoice on the property within the
+// active date range, plus per-status / per-scope filters and a free-text
+// search that hits invoice #, guest name, GSTIN, and reservation #.
+// Rows link to the reservation detail page so staff can drill in.
+type InvoiceStatusFilter = "all" | "issued" | "partial" | "paid" | "voided";
+type InvoiceScopeFilter = "all" | "room" | "combined" | "partial";
+
+interface InvoiceListRow {
+  id: string;
+  invoiceNumber: string;
+  reservationId: string;
+  reservationNumber: string | null;
+  guestId: string;
+  guestName: string;
+  guestGstin: string | null;
+  subtotal: string;
+  grandTotal: string;
+  totalPaid: string;
+  balanceDue: string;
+  status: "issued" | "partial" | "paid" | "voided";
+  scope: "room" | "combined" | "partial";
+  scopeRoomIds: string[] | null;
+  createdAt: string;
+}
+
+function InvoicesTab({ from, to }: { from: string; to: string }) {
+  const navigate = useNavigate();
+  const [status, setStatus] = useState<InvoiceStatusFilter>("all");
+  const [scope, setScope] = useState<InvoiceScopeFilter>("all");
+  const [q, setQ] = useState("");
+  const [page, setPage] = useState(1);
+  // Reset to page 1 whenever any filter changes — otherwise we'd land on
+  // an empty page after narrowing the result set.
+  useMemo(() => setPage(1), [status, scope, q, from, to]);
+
+  const { data, isLoading } = useQuery({
+    queryKey: ["rpt-invoices", from, to, status, scope, q, page],
+    queryFn: () =>
+      getList<InvoiceListRow>("/invoices", {
+        date_from: from,
+        date_to: to,
+        ...(status !== "all" ? { status } : {}),
+        ...(scope !== "all" ? { scope } : {}),
+        ...(q.trim() ? { q: q.trim() } : {}),
+        page,
+        per_page: 50,
+      }).then((d) => ({ rows: d.data, meta: d.meta })),
+  });
+
+  const rows = data?.rows ?? [];
+  const total = data?.meta?.total ?? 0;
+  const perPage = data?.meta?.per_page ?? 50;
+  const totalPages = Math.max(1, Math.ceil(total / perPage));
+
+  // Summary tiles. Cheap aggregation over the current page — for property-
+  // wide totals across all pages, point staff at the Revenue tab.
+  const sums = rows.reduce(
+    (acc, r) => {
+      acc.gross += Number(r.grandTotal);
+      acc.paid += Number(r.totalPaid);
+      acc.owing += Number(r.balanceDue);
+      return acc;
+    },
+    { gross: 0, paid: 0, owing: 0 },
+  );
+
+  function exportCurrentPage() {
+    const data = rows.map((r) => ({
+      invoice_number: r.invoiceNumber,
+      issued_on: format(new Date(r.createdAt), "yyyy-MM-dd HH:mm"),
+      reservation: r.reservationNumber ?? "",
+      guest: r.guestName,
+      gstin: r.guestGstin ?? "",
+      scope: r.scope,
+      status: r.status,
+      grand_total: r.grandTotal,
+      total_paid: r.totalPaid,
+      balance_due: r.balanceDue,
+    }));
+    const csv = Papa.unparse(data);
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `invoices-${from}-${to}-page-${page}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <Kpi label="Invoices on page" value={rows.length} Icon={Receipt} />
+        <Kpi label="Gross billed" value={inr(sums.gross)} Icon={TrendingUp} />
+        <Kpi label="Collected" value={inr(sums.paid)} Icon={Wallet} tone="success" />
+        <Kpi
+          label="Outstanding"
+          value={inr(sums.owing)}
+          Icon={AlertTriangle}
+          tone={sums.owing > 0.009 ? "danger" : undefined}
+        />
+      </div>
+
+      <div className="card !p-3 flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap gap-1">
+          {(["all", "issued", "partial", "paid", "voided"] as InvoiceStatusFilter[]).map((s) => (
+            <button
+              key={s}
+              onClick={() => setStatus(s)}
+              className={`px-2.5 h-8 text-xs font-semibold rounded-sm border transition-colors capitalize ${
+                status === s
+                  ? "bg-brand-dark text-cream border-brand-dark"
+                  : "border-borderc text-textSecondary hover:border-brand hover:text-brand"
+              }`}
+            >
+              {s}
+            </button>
+          ))}
+        </div>
+        <div className="h-6 w-px bg-borderc mx-1" />
+        <div className="flex flex-wrap gap-1">
+          {(
+            [
+              { id: "all", label: "All scopes" },
+              { id: "combined", label: "Combined" },
+              { id: "room", label: "Per room" },
+              { id: "partial", label: "Partial" },
+            ] as { id: InvoiceScopeFilter; label: string }[]
+          ).map((s) => (
+            <button
+              key={s.id}
+              onClick={() => setScope(s.id)}
+              className={`px-2.5 h-8 text-xs font-semibold rounded-sm border transition-colors ${
+                scope === s.id
+                  ? "bg-brand-dark text-cream border-brand-dark"
+                  : "border-borderc text-textSecondary hover:border-brand hover:text-brand"
+              }`}
+            >
+              {s.label}
+            </button>
+          ))}
+        </div>
+        <div className="flex-1 min-w-[180px]">
+          <input
+            className="input h-8 text-sm"
+            placeholder="Search invoice #, guest, GSTIN, reservation #…"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+          />
+        </div>
+        <ExportBtn onClick={exportCurrentPage} disabled={rows.length === 0} />
+      </div>
+
+      {isLoading ? (
+        <Loader />
+      ) : rows.length === 0 ? (
+        <EmptyState
+          Icon={Inbox}
+          title="No invoices match these filters"
+          hint="Try widening the date range or clearing the status / scope filter."
+        />
+      ) : (
+        <div className="card !p-0 overflow-x-auto">
+          <table className="table-base">
+            <thead>
+              <tr>
+                <th>Invoice #</th>
+                <th>Issued</th>
+                <th>Reservation · Guest</th>
+                <th>Scope</th>
+                <th>Status</th>
+                <th className="!text-right">Grand Total</th>
+                <th className="!text-right">Paid</th>
+                <th className="!text-right">Balance</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((inv) => {
+                const balance = Number(inv.balanceDue);
+                return (
+                  <tr
+                    key={inv.id}
+                    className="cursor-pointer"
+                    onClick={() => navigate(`/reservations/${inv.reservationId}`)}
+                  >
+                    <td className="font-mono font-semibold text-brand-dark">
+                      {inv.invoiceNumber}
+                    </td>
+                    <td className="text-xs text-textSecondary">
+                      {format(new Date(inv.createdAt), "dd MMM yyyy · HH:mm")}
+                    </td>
+                    <td>
+                      <div className="font-mono text-xs text-textSecondary">
+                        {inv.reservationNumber ?? "—"}
+                      </div>
+                      <div className="text-sm font-medium text-brand-dark truncate max-w-[18ch]">
+                        {inv.guestName}
+                      </div>
+                    </td>
+                    <td>
+                      <span
+                        className={`text-[10px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded border ${
+                          inv.scope === "room"
+                            ? "bg-brand-soft text-brand-dark border-brand-dark/30"
+                            : inv.scope === "combined"
+                              ? "bg-accentBlue/10 text-accentBlue border-accentBlue/30"
+                              : "bg-bg text-textSecondary border-borderc"
+                        }`}
+                      >
+                        {inv.scope === "room" ? "Per room" : inv.scope}
+                      </span>
+                    </td>
+                    <td>
+                      <span
+                        className={`text-[10px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded ${
+                          inv.status === "paid"
+                            ? "bg-success/10 text-success"
+                            : inv.status === "partial"
+                              ? "bg-warning/10 text-warning"
+                              : inv.status === "voided"
+                                ? "bg-textSecondary/15 text-textSecondary line-through"
+                                : "bg-danger/10 text-danger"
+                        }`}
+                      >
+                        {inv.status}
+                      </span>
+                    </td>
+                    <td className="text-right font-mono tabular-nums">
+                      {inr(inv.grandTotal)}
+                    </td>
+                    <td className="text-right font-mono tabular-nums text-success">
+                      {inr(inv.totalPaid)}
+                    </td>
+                    <td
+                      className={`text-right font-mono tabular-nums ${
+                        balance > 0.009 ? "text-danger font-semibold" : "text-textSecondary"
+                      }`}
+                    >
+                      {inr(balance)}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {total > perPage && (
+        <div className="flex items-center justify-between text-xs text-textSecondary">
+          <span>
+            Showing {(page - 1) * perPage + 1}–{Math.min(page * perPage, total)} of {total}
+          </span>
+          <div className="flex gap-1">
+            <button
+              className="px-2.5 h-7 rounded-sm border border-borderc disabled:opacity-40"
+              disabled={page === 1}
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+            >
+              Prev
+            </button>
+            <button
+              className="px-2.5 h-7 rounded-sm border border-borderc disabled:opacity-40"
+              disabled={page >= totalPages}
+              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+            >
+              Next
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

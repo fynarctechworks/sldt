@@ -199,42 +199,60 @@ router.put(
 
 router.delete("/room-types/:id", requireAuth, requirePermission("manage_settings"), async (req, res) => {
   const id = req.params.id!;
+  // Two modes:
+  //   - default ("safe delete"): hard-delete only when no rooms still
+  //     reference the slug. If rooms do reference it, return 409 with
+  //     the count so the UI can prompt the operator to reassign first.
+  //   - ?force=true ("force delete"): delete the room type AND null
+  //     out room.room_type on every dependent room. Use with care; the
+  //     orphaned rooms keep an empty type slug until the operator
+  //     edits them.
+  const force = String(req.query.force ?? "").toLowerCase() === "true";
+
   const existing = await db.select().from(roomTypes).where(eq(roomTypes.id, id)).limit(1);
   if (!existing.length) return fail(res, 404, "NOT_FOUND", "Room type not found");
 
-  const inUse = await db
-    .select({ id: rooms.id })
+  const dependentRooms = await db
+    .select({ id: rooms.id, roomNumber: rooms.roomNumber })
     .from(rooms)
-    .where(eq(rooms.roomType, existing[0]!.slug))
-    .limit(1);
+    .where(eq(rooms.roomType, existing[0]!.slug));
 
-  if (inUse.length) {
-    const [archived] = await db
-      .update(roomTypes)
-      .set({ isActive: false, updatedAt: new Date() })
-      .where(eq(roomTypes.id, id))
-      .returning();
-    await logActivity({
-      action: "room_type_archived",
-      entityType: "room_type",
-      entityId: id,
-      description: `Room type archived (in use): ${archived!.label}`,
-      performedBy: req.user!.id,
-      ipAddress: req.ip,
-    });
-    return ok(res, { archived: true, row: archived });
+  if (dependentRooms.length && !force) {
+    return fail(
+      res,
+      409,
+      "IN_USE",
+      `Cannot delete: ${dependentRooms.length} room(s) still use this type. Reassign them to another type first, or pass force=true to detach them automatically.`,
+      {
+        roomCount: dependentRooms.length,
+        rooms: dependentRooms.slice(0, 20).map((r) => r.roomNumber),
+      },
+    );
   }
 
-  await db.delete(roomTypes).where(eq(roomTypes.id, id));
+  // If force=true and rooms reference it, detach them first inside a
+  // transaction so the cascade is atomic with the delete.
+  await db.transaction(async (tx) => {
+    if (dependentRooms.length) {
+      await tx
+        .update(rooms)
+        .set({ roomType: "", updatedAt: new Date() })
+        .where(eq(rooms.roomType, existing[0]!.slug));
+    }
+    await tx.delete(roomTypes).where(eq(roomTypes.id, id));
+  });
   await logActivity({
     action: "room_type_deleted",
     entityType: "room_type",
     entityId: id,
-    description: `Room type deleted: ${existing[0]!.label}`,
+    description: dependentRooms.length
+      ? `Room type force-deleted: ${existing[0]!.label} (${dependentRooms.length} rooms detached)`
+      : `Room type deleted: ${existing[0]!.label}`,
     performedBy: req.user!.id,
     ipAddress: req.ip,
+    metadata: { force, detached: dependentRooms.length },
   });
-  return ok(res, { deleted: true });
+  return ok(res, { deleted: true, detached: dependentRooms.length });
 });
 
 // ============ MESSAGE TEMPLATES ============

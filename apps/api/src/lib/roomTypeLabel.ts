@@ -1,13 +1,11 @@
 // Renders the human-readable room-type label for receipts, invoices and any
-// other customer-facing surface. There are three cases:
+// other customer-facing surface.
 //
-//   1. No sold-as override → show the physical type's label
-//      e.g. "Ac Single Bed Rooms"
-//   2. Sold-as = same as physical → show the physical label (no point
-//      repeating it).
-//   3. Sold-as ≠ physical → show BOTH so the guest sees what they're
-//      paying for and the staff knows what the room actually is:
-//      "Ac Single Bed Rooms booked as Non Ac Bed Rooms"
+// Rule: show whichever label the staff chose to BILL the room as. If they
+// used the "Sell as" picker at booking time, that's the sold-as slug;
+// otherwise it's the physical room's native type. The physical type is
+// never shown on customer-facing surfaces — that nuance lives in the
+// reservation record and the per-room state, not on the guest's bill.
 //
 // `slugToLabel` is a Map of room_types.slug → room_types.label produced
 // from a single SELECT against the room_types table.
@@ -33,8 +31,5 @@ export function combinedRoomTypeLabel(
   soldAsSlug: string | null | undefined,
   map: RoomTypeLabelMap,
 ): string {
-  const physicalLabel = lookup(physicalSlug, map);
-  if (!soldAsSlug || soldAsSlug === physicalSlug) return physicalLabel;
-  const soldAsLabel = lookup(soldAsSlug, map);
-  return `${physicalLabel} booked as ${soldAsLabel}`;
+  return lookup(soldAsSlug ?? physicalSlug, map);
 }

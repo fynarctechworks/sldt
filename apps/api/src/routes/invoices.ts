@@ -15,7 +15,10 @@ import { validate } from "../middleware/validate.js";
 const router = Router();
 
 router.get("/", requireAuth, requirePermission("view_invoices"), async (req, res) => {
-  const { status, date_from, date_to } = req.query as Record<string, string | undefined>;
+  const { status, date_from, date_to, scope, q } = req.query as Record<
+    string,
+    string | undefined
+  >;
   const page = Math.max(1, Number(req.query.page ?? 1));
   const per_page = Math.min(100, Math.max(1, Number(req.query.per_page ?? 25)));
 
@@ -23,19 +26,59 @@ router.get("/", requireAuth, requirePermission("view_invoices"), async (req, res
   if (status) conditions.push(eq(invoices.status, status as never));
   if (date_from) conditions.push(gte(invoices.createdAt, new Date(date_from)));
   if (date_to) conditions.push(lte(invoices.createdAt, new Date(date_to)));
+  if (scope) conditions.push(eq(invoices.scope, scope as never));
+  if (q && q.trim()) {
+    // Match invoice number, billed-to guest name, or guest GSTIN. The
+    // reservation number is fetched via a sub-query so the search hits
+    // common front-desk shorthand like "RES-0042" too.
+    const needle = `%${q.trim()}%`;
+    conditions.push(
+      sql`(
+        ${invoices.invoiceNumber} ILIKE ${needle}
+        OR ${invoices.guestName} ILIKE ${needle}
+        OR COALESCE(${invoices.guestGstin}, '') ILIKE ${needle}
+        OR EXISTS (
+          SELECT 1 FROM ${reservations} r2
+          WHERE r2.id = ${invoices.reservationId}
+            AND r2.reservation_number ILIKE ${needle}
+        )
+      )`,
+    );
+  }
 
+  const where = conditions.length ? and(...conditions) : undefined;
   const [rows, total] = await Promise.all([
     db
-      .select()
+      .select({
+        // Pull the reservation number alongside so the UI can show it
+        // without a per-row round-trip.
+        id: invoices.id,
+        invoiceNumber: invoices.invoiceNumber,
+        reservationId: invoices.reservationId,
+        reservationNumber: reservations.reservationNumber,
+        guestId: invoices.guestId,
+        guestName: invoices.guestName,
+        guestGstin: invoices.guestGstin,
+        subtotal: invoices.subtotal,
+        grandTotal: invoices.grandTotal,
+        totalPaid: invoices.totalPaid,
+        balanceDue: invoices.balanceDue,
+        status: invoices.status,
+        scope: invoices.scope,
+        scopeRoomIds: invoices.scopeRoomIds,
+        createdAt: invoices.createdAt,
+      })
       .from(invoices)
-      .where(conditions.length ? and(...conditions) : undefined)
+      .leftJoin(reservations, eq(reservations.id, invoices.reservationId))
+      .where(where)
       .orderBy(desc(invoices.createdAt))
       .limit(per_page)
       .offset((page - 1) * per_page),
     db
       .select({ count: sql<number>`count(*)::int` })
       .from(invoices)
-      .where(conditions.length ? and(...conditions) : undefined),
+      .leftJoin(reservations, eq(reservations.id, invoices.reservationId))
+      .where(where),
   ]);
 
   return list(res, rows, { total: total[0]?.count ?? 0, page, per_page });

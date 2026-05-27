@@ -48,6 +48,15 @@ export const invoices = pgTable("invoices", {
   reissuedFrom: uuid("reissued_from"),
   voidedReason: text("voided_reason"),
   voidedBy: uuid("voided_by").references(() => profiles.id),
+  // Migration 0017 — per-room invoicing. 'combined' = the full
+  // reservation (legacy behaviour, default). 'room' = covers only the
+  // listed scopeRoomIds. 'partial' is reserved for future use (e.g.
+  // staff issuing an early invoice for one room while others are
+  // still in-house).
+  scope: text("scope", { enum: ["combined", "room", "partial"] as const })
+    .notNull()
+    .default("combined"),
+  scopeRoomIds: uuid("scope_room_ids").array(),
   issuedBy: uuid("issued_by")
     .notNull()
     .references(() => profiles.id),
@@ -115,6 +124,10 @@ export const additionalCharges = pgTable("additional_charges", {
   reservationId: uuid("reservation_id")
     .notNull()
     .references(() => reservations.id, { onDelete: "cascade" }),
+  // Migration 0018 — per-room attribution. NULL = reservation-wide
+  // (lands on whichever invoice covers the booker / last remaining
+  // room). NOT NULL = bill onto that specific room's per-room invoice.
+  roomId: uuid("room_id"),
   description: text("description").notNull(),
   quantity: integer("quantity").notNull().default(1),
   rate: numeric("rate", { precision: 10, scale: 2 }).notNull(),

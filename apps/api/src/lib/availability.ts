@@ -23,6 +23,10 @@ export async function findAvailableRooms(checkIn: string, checkOut: string) {
       ),
     );
 
+  // Dirty rooms remain in the result so the front desk can still
+  // re-let them after acknowledging a quick clean-up. The UI surfaces
+  // a "Mark clean & select" affordance per dirty card. Maintenance is
+  // still hard-blocked.
   const all = await db.select().from(rooms).where(ne(rooms.status, "maintenance"));
   const conflictRows = await conflicts;
   const blocked = new Set(conflictRows.map((r) => r.roomId));

@@ -400,7 +400,27 @@ export default function Login() {
           </button>
 
           <p className="text-center text-xs text-textSecondary">
-            Trouble signing in? Contact your hotel administrator.
+            Trouble signing in?{" "}
+            {import.meta.env.VITE_ADMIN_CONTACT_EMAIL ? (
+              <a
+                // Open Gmail's web compose in a new tab — works in any
+                // browser without needing a system mail handler (which
+                // is often missing on Windows machines without Outlook
+                // configured, which silently breaks mailto: links).
+                href={`https://mail.google.com/mail/?view=cm&fs=1&to=${encodeURIComponent(
+                  import.meta.env.VITE_ADMIN_CONTACT_EMAIL,
+                )}&su=${encodeURIComponent("Hoteldesk login help")}&body=${encodeURIComponent(
+                  `Hi,\n\nI can't sign in to the Hoteldesk workspace.\n\nMy email: ${email || "(fill in)"}\nIssue: (please describe)\n\nThanks.`,
+                )}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-brand-dark font-semibold hover:underline"
+              >
+                Email {import.meta.env.VITE_ADMIN_CONTACT_EMAIL}
+              </a>
+            ) : (
+              "Contact your hotel administrator."
+            )}
           </p>
           </>
           )}

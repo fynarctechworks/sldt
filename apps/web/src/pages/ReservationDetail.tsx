@@ -13,8 +13,8 @@ import {
   Pencil,
   Plus,
   Snowflake,
+  Sparkles,
   Tv,
-  Wallet,
   Wifi,
   ShieldAlert,
   ShieldCheck,
@@ -24,11 +24,9 @@ import {
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useAuth } from "@/auth/AuthContext";
-import { ApplyWalletCreditModal } from "@/components/ApplyWalletCreditModal";
 import { CheckInReceiptModal, type CheckInReceiptData } from "@/components/CheckInReceiptModal";
 import { EarlyCheckInModal } from "@/components/EarlyCheckInModal";
 import { EditInvoiceModal } from "@/components/EditInvoiceModal";
-import { EditReceiptModal } from "@/components/EditReceiptModal";
 import { useDialog } from "@/components/Dialog";
 import { KycModal } from "@/components/KycModal";
 import { PdfPreviewModal } from "@/components/PdfPreviewModal";
@@ -66,6 +64,9 @@ interface Detail {
   balanceDue: string;
   gstRate: string;
   gstAmount: string;
+  // "exclusive" → stored ratePerNight is net, GST added on top.
+  // "inclusive" → stored ratePerNight already contains GST.
+  gstMode?: "exclusive" | "inclusive";
   hotelCheckInTime: string;
   hotelCheckOutTime: string;
   guest: {
@@ -90,6 +91,10 @@ interface Detail {
     hasTv?: boolean;
     hasWifi?: boolean;
     status?: string;
+    // Per-room (migration 0017). Used to know whether a room already has
+    // its own invoice — drives the per_room/combined choice at checkout.
+    roomInvoiceId?: string | null;
+    roomStatus?: "confirmed" | "checked_in" | "checked_out" | "cancelled";
   }[];
   additionalCharges: {
     id: string;
@@ -105,6 +110,20 @@ interface Detail {
     grandTotal: string;
     balanceDue: string;
   } | null;
+  // Migration 0017 — full list of invoices for this reservation. A
+  // multi-room booking may have many: per-room invoices + a combined
+  // invoice for the booker. The legacy `invoice` field above is just
+  // invoices[0] for backwards compatibility.
+  invoices?: {
+    id: string;
+    invoiceNumber: string;
+    status: string;
+    grandTotal: string;
+    balanceDue: string;
+    scope?: "combined" | "room" | "partial";
+    scopeRoomIds?: string[] | null;
+    guestName: string;
+  }[];
   payments: {
     id: string;
     amount: string;
@@ -134,15 +153,21 @@ export default function ReservationDetail() {
   const [showExtend, setShowExtend] = useState(false);
   const [showLate, setShowLate] = useState(false);
   const [showAddRoom, setShowAddRoom] = useState(false);
-  const [showEditDates, setShowEditDates] = useState(false);
   const [showOtp, setShowOtp] = useState(false);
+  const [showCombinedInvoice, setShowCombinedInvoice] = useState(false);
+  // After issuing a combined invoice without collecting payment in the
+  // same shot, we surface a "Collect now?" prompt pre-filled with the new
+  // invoice's balance. Null = no prompt active.
+  const [postIssuePay, setPostIssuePay] = useState<{
+    invoiceId: string;
+    invoiceNumber: string;
+    balanceDue: number;
+  } | null>(null);
   const [showCheckInReceipt, setShowCheckInReceipt] = useState(false);
   // When set, opens the on-screen slip for a specific payment (booking advance
   // or any later payment). Independent from the check-in receipt auto-popup.
   const [slipPaymentId, setSlipPaymentId] = useState<string | null>(null);
-  const [editPaymentId, setEditPaymentId] = useState<string | null>(null);
   const [showEarlyCheckIn, setShowEarlyCheckIn] = useState(false);
-  const [showApplyCredit, setShowApplyCredit] = useState(false);
   const [showInvoiceEdit, setShowInvoiceEdit] = useState(false);
   const [showMakeComp, setShowMakeComp] = useState(false);
   const [pdfPreview, setPdfPreview] = useState<{ url: string; title: string; filename: string } | null>(null);
@@ -506,11 +531,6 @@ export default function ReservationDetail() {
             <BedDouble className="w-4 h-4" /> Add Room
           </button>
         )}
-        {!invoice && (r.status === "checked_in" || r.status === "confirmed") && (
-          <button className="btn-secondary inline-flex items-center gap-2" onClick={() => setShowEditDates(true)}>
-            <Pencil className="w-4 h-4" /> Edit Dates
-          </button>
-        )}
         {r.status === "checked_in" && (
           <button className="btn-secondary inline-flex items-center gap-2" onClick={() => setShowLate(true)}>
             <Clock className="w-4 h-4" /> Late Checkout
@@ -519,15 +539,6 @@ export default function ReservationDetail() {
         {Number(r.balanceDue) > 0.009 && r.status !== "cancelled" && (
           <button className="btn-secondary inline-flex items-center gap-2" onClick={() => setShowPay(true)}>
             <CreditCard className="w-4 h-4" /> Record Payment
-          </button>
-        )}
-        {Number(r.balanceDue) > 0.009 && r.status !== "cancelled" && (
-          <button
-            className="btn-secondary inline-flex items-center gap-2"
-            onClick={() => setShowApplyCredit(true)}
-            title="Apply wallet credit from the guest's balance"
-          >
-            <Wallet className="w-4 h-4" /> Apply Wallet Credit
           </button>
         )}
         {/* Make Complimentary — available on confirmed / checked_in /
@@ -588,7 +599,7 @@ export default function ReservationDetail() {
                 reservationId={r.id}
                 room={room}
                 nights={nights}
-                canEdit={!invoice}
+
                 onSaved={invalidate}
               />
             ))}
@@ -624,35 +635,116 @@ export default function ReservationDetail() {
         </div>
       )}
 
-      {invoice && (
-        <div className="card">
-          <div className="flex justify-between items-start">
-            <div>
-              <div className="label">Invoice</div>
-              <div className="font-mono font-bold text-lg text-navy">{invoice.invoiceNumber}</div>
-              <div className="text-sm">
-                <StatusBadge status={invoice.status} /> · Grand Total{" "}
-                <span className="font-mono">{inr(invoice.grandTotal)}</span>
-              </div>
-            </div>
-            <div className="flex gap-2">
-              <button
-                className="btn-secondary inline-flex items-center gap-2"
-                onClick={() => previewInvoice(invoice.id, invoice.invoiceNumber)}
-              >
-                <FileDown className="w-4 h-4" /> Preview
-              </button>
-              {profile?.role === "admin" && invoice.status !== "voided" && (
+      {/* Invoices list. Per-room (0017) means a multi-room booking can
+          have several. Single-invoice view falls back to the legacy
+          single-card layout; multi-invoice uses a row-per-invoice
+          card with scope and guest visible. */}
+      {(data.invoices ?? (invoice ? [invoice] : [])).length > 0 && (
+        <div className="card p-0">
+          <div className="px-4 py-3 border-b flex items-center justify-between">
+            <strong>Invoices ({(data.invoices ?? [invoice]).filter(Boolean).length})</strong>
+            {/* Combined invoice generator — shown whenever 2+ rooms
+                still have no invoice. A reservation can have more than
+                one combined invoice (e.g. two groups paying separately
+                after some rooms were already settled per-room). With
+                only one un-invoiced room left, the per-room "Issue
+                Invoice" button on the room row is the right path
+                instead. */}
+            {(() => {
+              const uninvoicedRoomCount = (data.rooms ?? []).filter(
+                (rm) => !(rm as { roomInvoiceId?: string | null }).roomInvoiceId,
+              ).length;
+              if (uninvoicedRoomCount < 2) return null;
+              return (
                 <button
-                  className="btn-secondary inline-flex items-center gap-2"
-                  onClick={() => setShowInvoiceEdit(true)}
-                  title="Make a correction to this invoice"
+                  className="btn-secondary !h-8 text-xs inline-flex items-center gap-1"
+                  onClick={() => setShowCombinedInvoice(true)}
                 >
-                  <Pencil className="w-4 h-4" /> Edit
+                  + Combined Invoice
                 </button>
-              )}
-            </div>
+              );
+            })()}
           </div>
+          <ul className="divide-y divide-borderc">
+            {(data.invoices ?? (invoice ? [invoice] : [])).map((inv) => {
+              if (!inv) return null;
+              // The legacy `invoice` object is narrower than the new
+              // `invoices` array entries; widen here to a shared shape.
+              const richInv = inv as {
+                id: string;
+                invoiceNumber: string;
+                status: string;
+                grandTotal: string;
+                balanceDue: string;
+                scope?: "combined" | "room" | "partial";
+                scopeRoomIds?: string[] | null;
+                guestName?: string;
+              };
+              const scope = richInv.scope ?? "combined";
+              const scopeRoomIds = richInv.scopeRoomIds ?? null;
+              const scopedRooms = scopeRoomIds
+                ? (data.rooms ?? []).filter((rm) =>
+                    scopeRoomIds.includes((rm as { id: string }).id),
+                  )
+                : null;
+              return (
+                <li key={inv.id} className="px-4 py-3 flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-mono font-bold text-navy">{richInv.invoiceNumber}</span>
+                      <StatusBadge status={richInv.status} />
+                      <span
+                        className={`text-[10px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded border ${scope === "room" ? "bg-brand-soft text-brand-dark border-brand-dark/30" : "bg-accentBlue/10 text-accentBlue border-accentBlue/30"}`}
+                      >
+                        {scope === "room" ? "Per room" : "Combined"}
+                      </span>
+                    </div>
+                    <div className="text-xs text-textSecondary mt-0.5">
+                      Grand Total{" "}
+                      <span className="font-mono text-brand-dark">{inr(richInv.grandTotal)}</span>
+                      {Number(richInv.balanceDue) > 0.009 && (
+                        <span className="ml-2">
+                          · Balance{" "}
+                          <span className="font-mono text-danger">{inr(richInv.balanceDue)}</span>
+                        </span>
+                      )}
+                      {richInv.guestName && (
+                        <span className="ml-2">· billed to {richInv.guestName}</span>
+                      )}
+                      {scopedRooms && scopedRooms.length > 0 && (
+                        <span className="ml-2">
+                          · room{scopedRooms.length === 1 ? "" : "s"}{" "}
+                          {scopedRooms.map((rm) => (rm as { roomNumber: string }).roomNumber).join(", ")}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="flex gap-2 shrink-0">
+                    {Number(richInv.balanceDue) > 0.009 && richInv.status !== "voided" && (
+                      <button
+                        className="btn-primary !h-8 text-xs inline-flex items-center gap-1"
+                        onClick={() =>
+                          setPostIssuePay({
+                            invoiceId: richInv.id,
+                            invoiceNumber: richInv.invoiceNumber,
+                            balanceDue: Number(richInv.balanceDue),
+                          })
+                        }
+                      >
+                        <CreditCard className="w-3.5 h-3.5" /> Collect {inr(richInv.balanceDue)}
+                      </button>
+                    )}
+                    <button
+                      className="btn-secondary !h-8 text-xs inline-flex items-center gap-1"
+                      onClick={() => previewInvoice(richInv.id, richInv.invoiceNumber)}
+                    >
+                      <FileDown className="w-3.5 h-3.5" /> Preview
+                    </button>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
         </div>
       )}
 
@@ -674,10 +766,8 @@ export default function ReservationDetail() {
                 <PaymentRow
                   key={p.id}
                   payment={p}
-                  isAdmin={profile?.role === "admin"}
                   onSaved={invalidate}
                   onPrintReceipt={() => previewReceipt(p.id, p.receiptNumber)}
-                  onEdit={() => setEditPaymentId(p.id)}
                 />
               ))}
             </tbody>
@@ -712,6 +802,23 @@ export default function ReservationDetail() {
           reservationNumber={r.reservationNumber}
           guestId={r.guestId}
           balance={Number(r.balanceDue)}
+          subtotal={Number(r.subtotal)}
+          totalGst={Number(r.gstAmount)}
+          grandTotal={Number(r.grandTotal)}
+          totalPaid={Number(totalPaid)}
+          remainingRoomCount={r.rooms.filter((rm) => !rm.roomInvoiceId).length}
+          remainingRooms={r.rooms
+            .filter((rm) => !rm.roomInvoiceId)
+            .map((rm) => ({ roomNumber: rm.roomNumber, occupantName: null }))}
+          alreadyInvoicedRooms={r.rooms
+            .filter((rm) => rm.roomInvoiceId)
+            .map((rm) => {
+              const inv = r.invoices?.find((i) => i.id === rm.roomInvoiceId);
+              return {
+                roomNumber: rm.roomNumber,
+                invoiceNumber: inv?.invoiceNumber ?? "—",
+              };
+            })}
           onClose={() => setShowCheckout(false)}
           onDone={() => {
             setShowCheckout(false);
@@ -749,18 +856,6 @@ export default function ReservationDetail() {
             invalidate();
             // Continue straight into the OTP step.
             setShowOtp(true);
-          }}
-        />
-      )}
-
-      {showApplyCredit && (
-        <ApplyWalletCreditModal
-          reservationId={r.id}
-          onClose={() => setShowApplyCredit(false)}
-          onApplied={() => {
-            setShowApplyCredit(false);
-            toast("Wallet credit applied", "success");
-            invalidate();
           }}
         />
       )}
@@ -925,78 +1020,6 @@ export default function ReservationDetail() {
         );
       })()}
 
-      {editPaymentId && settingsQ.data && (() => {
-        const pay = r.payments.find((p) => p.id === editPaymentId);
-        if (!pay) return null;
-        const variant = r.status === "confirmed" ? "booking_advance" : "checkin";
-        return (
-          <EditReceiptModal
-            paymentId={pay.id}
-            variant={variant}
-            initial={{
-              paymentDate: pay.paymentDate,
-              paymentMethod: pay.paymentMethod,
-              notes: pay.notes,
-            }}
-            data={
-              {
-                reservationNumber: r.reservationNumber,
-                checkInDate: r.checkInDate,
-                checkOutDate: r.checkOutDate,
-                checkedInAt: r.checkedInAt,
-                numNights: nights,
-                stayType: r.stayType,
-                durationHours: durationHours || null,
-                numAdults: r.numAdults,
-                numChildren: r.numChildren,
-                guest: {
-                  fullName: r.guest.fullName,
-                  phone: r.guest.phone,
-                  idProofType: r.guest.idProofType,
-                  idProofLast4: r.guest.idProofLast4,
-                  photoUrl: r.guest.photoUrl,
-                },
-                rooms: r.rooms.map((rm) => ({
-                  roomNumber: rm.roomNumber,
-                  roomType: rm.roomType,
-                  ratePerNight: rm.ratePerNight,
-                })),
-                subtotal: r.subtotal,
-                gstRate: r.gstRate,
-                gstAmount: r.gstAmount ?? "",
-                grandTotal: r.grandTotal,
-                advancePaid: r.advancePaid,
-                balanceDue: r.balanceDue,
-                latestPayment: {
-                  id: pay.id,
-                  amount: pay.amount,
-                  paymentMethod: pay.paymentMethod,
-                  receiptNumber: pay.receiptNumber,
-                  paymentDate: pay.paymentDate,
-                },
-                allPayments: r.payments.map((p) => ({
-                  amount: p.amount,
-                  paymentDate: p.paymentDate,
-                  voided: p.voided,
-                  status: p.status,
-                })),
-                hotel: {
-                  name: settingsQ.data.hotelName,
-                  address: settingsQ.data.hotelAddress,
-                  phone: settingsQ.data.hotelPhone,
-                  ownerPhone: settingsQ.data.ownerPhone,
-                  gstin: settingsQ.data.hotelGstin,
-                  logoUrl: settingsQ.data.hotelLogoUrl ?? "/logo.jpg",
-                  checkInTime: settingsQ.data.checkInTime,
-                  checkOutTime: settingsQ.data.checkOutTime,
-                },
-              } satisfies CheckInReceiptData
-            }
-            onClose={() => setEditPaymentId(null)}
-            onSaved={invalidate}
-          />
-        );
-      })()}
 
       {showExtend && (
         <ExtendModal
@@ -1033,14 +1056,51 @@ export default function ReservationDetail() {
           }}
         />
       )}
-      {showEditDates && (
-        <EditDatesModal
+      {showCombinedInvoice && (
+        <CombinedInvoiceModal
           reservationId={r.id}
-          checkInDate={r.checkInDate}
-          checkOutDate={r.checkOutDate}
-          onClose={() => setShowEditDates(false)}
+          uninvoicedRooms={(r.rooms ?? [])
+            .filter((rm) => !rm.roomInvoiceId)
+            .map((rm) => ({
+              id: rm.id,
+              roomNumber: rm.roomNumber,
+              displayType: rm.displayType,
+              ratePerNight: rm.ratePerNight,
+            }))}
+          nights={Number(r.numNights ?? 1)}
+          gstRate={Number(r.gstRate)}
+          gstMode={r.gstMode ?? "exclusive"}
+          stayType={r.stayType ?? "overnight"}
+          onClose={() => setShowCombinedInvoice(false)}
+          onIssued={(inv, meta) => {
+            setShowCombinedInvoice(false);
+            invalidate();
+            // Only chain into Record Payment when the user explicitly
+            // ticked "Collect payment" AND the resulting invoice is
+            // short of the bill (Partial). The other balance-due path
+            // — issuing without collecting — is intentional, so we stay
+            // quiet; the per-invoice Collect button in the list is the
+            // way to collect later.
+            const owed = Number(inv.balanceDue);
+            if (meta.collectIntended && owed > 0.009) {
+              setPostIssuePay({
+                invoiceId: inv.id,
+                invoiceNumber: inv.invoiceNumber,
+                balanceDue: owed,
+              });
+            }
+          }}
+        />
+      )}
+      {postIssuePay && (
+        <PaymentModal
+          reservationId={r.id}
+          balance={postIssuePay.balanceDue}
+          invoiceId={postIssuePay.invoiceId}
+          invoiceNumber={postIssuePay.invoiceNumber}
+          onClose={() => setPostIssuePay(null)}
           onSaved={() => {
-            setShowEditDates(false);
+            setPostIssuePay(null);
             invalidate();
           }}
         />
@@ -1065,27 +1125,52 @@ function RoomRow(props: {
     soldAsType?: string | null;
     displayType?: string;
     ratePerNight: string;
+    // PHYSICAL room status (dirty/clean/inspected/...).
     status?: string;
+    // NEW (migration 0017): per-room reservation state +
+    // occupant. The reservation detail uses these to expose per-
+    // room check-out and per-room invoicing.
+    reservationRoomId?: string;
+    roomStatus?: "confirmed" | "checked_in" | "checked_out" | "cancelled";
+    roomInvoiceId?: string | null;
+    occupant?: { id: string; fullName: string; phone: string; isBooker: boolean } | null;
     hasAc?: boolean;
     hasTv?: boolean;
     hasWifi?: boolean;
   };
   nights: number;
-  canEdit: boolean;
   onSaved: () => void;
 }) {
-  const [editing, setEditing] = useState(false);
-  const [rate, setRate] = useState(Number(props.room.ratePerNight));
-  const save = useMutation({
+  const rate = Number(props.room.ratePerNight);
+  const [perRoomBusy, setPerRoomBusy] = useState<null | "checkout" | "invoice">(null);
+  const [perRoomError, setPerRoomError] = useState<string | null>(null);
+  const [showRoomCheckout, setShowRoomCheckout] = useState(false);
+
+  // Per-room invoice. The API uses migration 0017's invoices.scope='room'.
+  const issueRoomInvoice = useMutation({
     mutationFn: () =>
-      api.patch(`/reservations/${props.reservationId}/rooms/${props.room.id}`, {
-        ratePerNight: rate,
+      api.post(`/reservations/${props.reservationId}/invoice`, {
+        scope: "room",
+        roomId: props.room.id,
       }),
-    onSuccess: () => {
-      setEditing(false);
-      props.onSaved();
+    onMutate: () => {
+      setPerRoomBusy("invoice");
+      setPerRoomError(null);
     },
+    onSuccess: () => props.onSaved(),
+    onError: (e: Error) => setPerRoomError(e.message),
+    onSettled: () => setPerRoomBusy(null),
   });
+
+  // Per-room status pill colours. Maps the new reservation-room
+  // statuses to badge styles (different from physical room status).
+  const roomStatusBadge: Record<string, string> = {
+    confirmed: "bg-brand-soft text-brand-dark border-brand-dark/30",
+    checked_in: "bg-success/15 text-success border-success/30",
+    checked_out: "bg-bg text-textSecondary border-borderc",
+    cancelled: "bg-danger/10 text-danger border-danger/30 line-through",
+  };
+
   const status = props.room.status;
   const isHousekeeping =
     status === "dirty" ||
@@ -1111,16 +1196,39 @@ function RoomRow(props: {
     props.room.hasWifi !== undefined;
 
   return (
+    <>
     <tr>
       <td className="font-mono">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           {props.room.roomNumber}
+          {/* Per-room (0017) reservation state pill. Distinct from
+              the physical-room status pill below; e.g. a room can be
+              checked_out AND dirty at the same time. */}
+          {props.room.roomStatus && (
+            <span
+              className={`text-[9px] uppercase tracking-wide font-semibold px-1.5 py-0.5 rounded border ${roomStatusBadge[props.room.roomStatus]}`}
+            >
+              {props.room.roomStatus.replace("_", " ")}
+            </span>
+          )}
           {statusBadge && (
             <span className={`text-[9px] uppercase tracking-wide font-semibold px-1.5 py-0.5 rounded border ${statusBadge}`}>
               {status}
             </span>
           )}
         </div>
+        {/* Per-room (0017) occupant line. Hidden when this room is
+            occupied by the booker (the common case for single-guest
+            bookings); shown when a multi-room reservation has been
+            split into different occupants. */}
+        {props.room.occupant && !props.room.occupant.isBooker && (
+          <div className="text-[11px] text-textSecondary mt-1">
+            <span className="font-medium text-brand-dark">{props.room.occupant.fullName}</span>
+            {props.room.occupant.phone && (
+              <span className="font-mono ml-1">· {props.room.occupant.phone}</span>
+            )}
+          </div>
+        )}
         {hasAnyAmenity && (
           <div className="flex flex-wrap gap-1 mt-1">
             {props.room.hasAc ? (
@@ -1149,71 +1257,91 @@ function RoomRow(props: {
         {props.room.displayType ?? props.room.roomType.replace(/_/g, " ")}
       </td>
       <td className="font-mono tabular-nums">
-        {editing ? (
-          <input
-            className="input !h-8 !py-0 w-24"
-            type="number"
-            min={0}
-            step="0.01"
-            value={rate}
-            onChange={(e) => setRate(Number(e.target.value))}
-          />
-        ) : (
-          inr(props.room.ratePerNight)
-        )}
+        {inr(props.room.ratePerNight)}
       </td>
       <td className="font-mono tabular-nums">{inr(rate * props.nights)}</td>
       <td className="text-right">
         <div className="inline-flex gap-1 items-center">
-          {isHousekeeping && status && !editing && (
-            <RoomActionPopover
-              roomId={props.room.id}
-              roomNumber={props.room.roomNumber}
-              status={status as "dirty" | "clean" | "inspected" | "available" | "maintenance"}
-              onChanged={props.onSaved}
-              invalidateKeys={[["reservation"], ["dashboard"]]}
-              trigger={
-                <span
-                  className="inline-block !h-7 !px-2 text-xs font-medium rounded-sm border border-borderc bg-surface hover:bg-bg cursor-pointer leading-[1.5rem] capitalize"
-                  title="Change room status"
-                >
-                  Status…
-                </span>
-              }
-            />
-          )}
-          {props.canEdit && !editing && (
+          {/* Hide the housekeeping Status changer once the room is
+              checked out (or cancelled) from this reservation's
+              perspective. A finished room's clean/dirty/available state
+              is managed from the Rooms / Housekeeping pages — letting
+              staff flip it back to "Available" from a closed booking
+              created a confusing "un-check-out" path. */}
+          {isHousekeeping &&
+            status &&
+            props.room.roomStatus !== "checked_out" &&
+            props.room.roomStatus !== "cancelled" && (
+              <RoomActionPopover
+                roomId={props.room.id}
+                roomNumber={props.room.roomNumber}
+                status={status as "dirty" | "clean" | "inspected" | "available" | "maintenance"}
+                onChanged={props.onSaved}
+                invalidateKeys={[["reservation"], ["dashboard"]]}
+                trigger={
+                  <span
+                    className="inline-block !h-7 !px-2 text-xs font-medium rounded-sm border border-borderc bg-surface hover:bg-bg cursor-pointer leading-[1.5rem] capitalize"
+                    title="Change room status"
+                  >
+                    Status…
+                  </span>
+                }
+              />
+            )}
+          {props.room.roomStatus === "checked_in" && (
             <button
-              className="btn-secondary !h-7 !px-2"
-              onClick={() => setEditing(true)}
-              title="Edit rate"
+              className="btn-secondary !h-7 !px-2 text-xs"
+              disabled={perRoomBusy !== null}
+              onClick={() => setShowRoomCheckout(true)}
+              title="Check this guest out & collect payment"
             >
-              <Pencil className="w-3.5 h-3.5" />
+              Check Out
             </button>
           )}
-          {editing && (
-            <>
-              <button
-                className="btn-secondary !h-7 !px-2 text-xs"
-                onClick={() => {
-                  setRate(Number(props.room.ratePerNight));
-                  setEditing(false);
-                }}
-              >
-                Cancel
-              </button>
+          {(props.room.roomStatus === "checked_in" ||
+            props.room.roomStatus === "checked_out") &&
+            !props.room.roomInvoiceId && (
               <button
                 className="btn-primary !h-7 !px-2 text-xs"
-                disabled={save.isPending || rate <= 0}
-                onClick={() => save.mutate()}
+                disabled={perRoomBusy !== null}
+                onClick={() => issueRoomInvoice.mutate()}
+                title="Generate a separate invoice for this room"
               >
-                {save.isPending ? "…" : "Save"}
+                {perRoomBusy === "invoice" ? "…" : "Issue Invoice"}
               </button>
-            </>
+            )}
+          {props.room.roomInvoiceId && (
+            <span
+              className="text-[10px] font-mono text-success px-1.5 py-0.5 rounded bg-success/10 border border-success/30"
+              title="A per-room invoice exists for this room — see Invoices section"
+            >
+              invoiced
+            </span>
           )}
         </div>
+        {perRoomError && (
+          <div className="text-[11px] text-danger mt-1 font-normal">{perRoomError}</div>
+        )}
       </td>
     </tr>
+    {showRoomCheckout && (
+      <PerRoomCheckoutModal
+        reservationId={props.reservationId}
+        roomId={props.room.id}
+        roomNumber={props.room.roomNumber}
+        occupantName={
+          props.room.occupant && !props.room.occupant.isBooker
+            ? props.room.occupant.fullName
+            : null
+        }
+        onClose={() => setShowRoomCheckout(false)}
+        onDone={() => {
+          setShowRoomCheckout(false);
+          props.onSaved();
+        }}
+      />
+    )}
+    </>
   );
 }
 
@@ -1340,10 +1468,8 @@ function PaymentRow(props: {
     voided?: boolean;
     createdAt: string;
   };
-  isAdmin: boolean;
   onSaved: () => void;
   onPrintReceipt: () => void;
-  onEdit: () => void;
 }) {
   const dialog = useDialog();
   const { toast } = useToast();
@@ -1355,9 +1481,6 @@ function PaymentRow(props: {
     onSuccess: props.onSaved,
     onError: (e: Error) => toast(e.message, "error"),
   });
-
-  const within24h =
-    Date.now() - new Date(props.payment.createdAt).getTime() < 24 * 60 * 60 * 1000;
 
   if (props.payment.voided) {
     return (
@@ -1428,84 +1551,14 @@ function PaymentRow(props: {
             >
               <Eye className="w-3.5 h-3.5" />
             </button>
-            {props.isAdmin && within24h && (
-              <button
-                className="btn-secondary !h-7 !px-2"
-                onClick={props.onEdit}
-                title="Edit receipt (within 24h)"
-              >
-                <Pencil className="w-3.5 h-3.5" />
-              </button>
-            )}
-            {/* Per-payment void removed by product decision — use Cancel
-                Reservation if the booking shouldn't have been collected at all.
-                Cancel auto-voids associated payments inside one flow. */}
+            {/* Per-payment edit and void removed by product decision —
+                receipts are an immutable financial trail. To correct
+                an error, void the original by cancelling the
+                reservation (which auto-voids its payments) and
+                re-record. */}
           </div>
       </td>
     </tr>
-  );
-}
-
-function EditDatesModal(props: {
-  reservationId: string;
-  checkInDate: string;
-  checkOutDate: string;
-  onClose: () => void;
-  onSaved: () => void;
-}) {
-  const [checkInDate, setCheckInDate] = useState(props.checkInDate);
-  const [checkOutDate, setCheckOutDate] = useState(props.checkOutDate);
-  const [err, setErr] = useState<string | null>(null);
-
-  const save = useMutation({
-    mutationFn: () =>
-      api.patch(`/reservations/${props.reservationId}/dates`, {
-        checkInDate,
-        checkOutDate,
-      }),
-    onSuccess: props.onSaved,
-    onError: (e: Error) => setErr(e.message),
-  });
-
-  return (
-    <ModalShell title="Edit Reservation Dates" onClose={props.onClose}>
-      <div className="space-y-3">
-        <div className="grid grid-cols-2 gap-3">
-          <div>
-            <label className="label block mb-1">Check-in</label>
-            <input
-              className="input"
-              type="date"
-              value={checkInDate}
-              onChange={(e) => setCheckInDate(e.target.value)}
-            />
-          </div>
-          <div>
-            <label className="label block mb-1">Check-out</label>
-            <input
-              className="input"
-              type="date"
-              value={checkOutDate}
-              onChange={(e) => setCheckOutDate(e.target.value)}
-            />
-          </div>
-        </div>
-        <div className="text-xs text-textSecondary">
-          Changing dates recalculates subtotal, GST, and balance. Rooms must be available for new dates.
-        </div>
-        {err && <div className="text-danger text-sm">{err}</div>}
-        <div className="flex justify-end gap-2">
-          <button className="btn-secondary" onClick={props.onClose}>Cancel</button>
-          <button
-            className="btn-primary"
-            disabled={save.isPending || new Date(checkOutDate) <= new Date(checkInDate)}
-            onClick={() => save.mutate()}
-          >
-            {save.isPending ? "Saving…" : "Update Dates"}
-          </button>
-        </div>
-      </div>
-    </ModalShell>
   );
 }
 
@@ -1520,34 +1573,97 @@ function AddRoomModal(props: {
   const today = new Date().toISOString().slice(0, 10);
   const defaultStart = props.checkInDate > today ? props.checkInDate : today;
   const [startDate, setStartDate] = useState(defaultStart);
-  const [selectedRoomId, setSelectedRoomId] = useState<string>("");
-  const [ratePerNight, setRatePerNight] = useState(0);
+  // Selected rooms keyed by id → chosen rate per night. Adding/removing a
+  // room mutates this map; the rate seeds from the room's base rate but
+  // staff can edit each one independently.
+  const [picked, setPicked] = useState<Record<string, number>>({});
   const [err, setErr] = useState<string | null>(null);
+  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
 
+  const qc = useQueryClient();
+  type AvailRoom = {
+    id: string;
+    roomNumber: string;
+    roomType: string;
+    baseRate: string;
+    status?: "available" | "occupied" | "reserved" | "maintenance" | "dirty" | "clean" | "inspected";
+  };
   const avail = useQuery({
     queryKey: ["availability", startDate, props.checkOutDate],
     queryFn: () =>
-      api.get<{ id: string; roomNumber: string; roomType: string; baseRate: string }[]>(
-        "/rooms/availability",
-        { check_in: startDate, check_out: props.checkOutDate },
-      ),
+      api.get<AvailRoom[]>("/rooms/availability", {
+        check_in: startDate,
+        check_out: props.checkOutDate,
+      }),
     enabled: startDate < props.checkOutDate,
   });
 
-  const available = (avail.data ?? []).filter((r) => !props.existingRoomIds.includes(r.id));
-
-  const save = useMutation({
-    mutationFn: () =>
-      api.post(`/reservations/${props.reservationId}/add-room`, {
-        roomId: selectedRoomId,
-        ratePerNight,
-        startDate,
-      }),
-    onSuccess: props.onSaved,
-    onError: (e: Error) => setErr(e.message),
+  // Marks a dirty room clean so it can be added to the reservation. Same
+  // pattern as the New Reservation page — no silent booking of a dirty room.
+  const markClean = useMutation({
+    mutationFn: (roomId: string) =>
+      api.patch(`/rooms/${roomId}/status`, { status: "clean", reason: "Re-let mid-stay" }),
+    onSuccess: (_data, roomId) => {
+      qc.setQueryData<AvailRoom[]>(
+        ["availability", startDate, props.checkOutDate],
+        (cur) =>
+          cur?.map((r) => (r.id === roomId ? { ...r, status: "clean" as const } : r)) ?? cur,
+      );
+      qc.invalidateQueries({ queryKey: ["rooms"] });
+    },
   });
 
-  const selectedRoom = available.find((r) => r.id === selectedRoomId);
+  const available = (avail.data ?? []).filter((r) => !props.existingRoomIds.includes(r.id));
+  const availableById = new Map(available.map((r) => [r.id, r]));
+  const pickedIds = Object.keys(picked);
+
+  // Nights between the chosen start and the reservation check-out. Used for
+  // the live total preview — does not affect the per-room rate sent to the
+  // API (the server prorates by date itself).
+  const nights = Math.max(
+    0,
+    Math.round(
+      (new Date(props.checkOutDate).getTime() - new Date(startDate).getTime()) / 86400000,
+    ),
+  );
+  const grandPreview = pickedIds.reduce(
+    (sum, id) => sum + (picked[id] ?? 0) * nights,
+    0,
+  );
+
+  const save = useMutation({
+    mutationFn: async () => {
+      // The /add-room endpoint takes one room at a time. Loop sequentially
+      // so a mid-batch failure surfaces with the right room context and
+      // doesn't race the server-side availability check.
+      setProgress({ done: 0, total: pickedIds.length });
+      for (let i = 0; i < pickedIds.length; i++) {
+        const id = pickedIds[i]!;
+        await api.post(`/reservations/${props.reservationId}/add-room`, {
+          roomId: id,
+          ratePerNight: picked[id],
+          startDate,
+        });
+        setProgress({ done: i + 1, total: pickedIds.length });
+      }
+    },
+    onSuccess: props.onSaved,
+    onError: (e: Error) => {
+      setErr(e.message);
+      setProgress(null);
+    },
+  });
+
+  const toggleRoom = (rm: { id: string; baseRate: string }) => {
+    setPicked((cur) => {
+      if (cur[rm.id] !== undefined) {
+        const next = { ...cur };
+        delete next[rm.id];
+        return next;
+      }
+      return { ...cur, [rm.id]: Number(rm.baseRate) };
+    });
+  };
 
   return (
     <ModalShell title="Add Room to Reservation" onClose={props.onClose}>
@@ -1563,7 +1679,7 @@ function AddRoomModal(props: {
               value={startDate}
               onChange={(e) => {
                 setStartDate(e.target.value);
-                setSelectedRoomId("");
+                setPicked({});
               }}
             />
           </div>
@@ -1579,7 +1695,12 @@ function AddRoomModal(props: {
         </div>
 
         <div>
-          <label className="label block mb-1.5">Available Rooms</label>
+          <label className="label block mb-1.5">
+            Available Rooms{" "}
+            <span className="text-xs font-normal text-textSecondary">
+              · tap to add or remove ({pickedIds.length} selected)
+            </span>
+          </label>
           {avail.isLoading ? (
             <div className="text-sm text-textSecondary py-3">Checking availability…</div>
           ) : available.length === 0 ? (
@@ -1589,56 +1710,129 @@ function AddRoomModal(props: {
           ) : (
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 max-h-56 overflow-y-auto pr-1">
               {available.map((rm) => {
-                const active = selectedRoomId === rm.id;
+                const active = picked[rm.id] !== undefined;
+                const isDirty = rm.status === "dirty";
+                const cleanInFlight = markClean.isPending && markClean.variables === rm.id;
                 return (
-                  <button
+                  <div
                     key={rm.id}
-                    type="button"
-                    onClick={() => {
-                      setSelectedRoomId(rm.id);
-                      setRatePerNight(Number(rm.baseRate));
-                    }}
                     className={`p-2.5 rounded-sm border-2 text-left transition-colors ${
                       active
                         ? "border-brand-dark bg-brand-soft"
-                        : "border-borderc hover:border-brand-dark hover:bg-bg"
+                        : isDirty
+                          ? "border-warning/50 bg-warning/5"
+                          : "border-borderc hover:border-brand-dark hover:bg-bg"
                     }`}
                   >
-                    <div className="font-mono font-bold text-brand-dark text-sm leading-tight">
-                      {rm.roomNumber}
-                    </div>
-                    <div className="text-[11px] capitalize text-textSecondary mt-0.5 truncate">
-                      {rm.roomType}
-                    </div>
-                    <div className="text-xs font-mono text-textPrimary mt-1">
-                      ₹{Number(rm.baseRate).toFixed(0)}/n
-                    </div>
-                  </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (isDirty && !active) return;
+                        toggleRoom(rm);
+                      }}
+                      className="text-left w-full"
+                      aria-disabled={isDirty && !active}
+                    >
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <span className="font-mono font-bold text-brand-dark text-sm leading-tight">
+                          {rm.roomNumber}
+                        </span>
+                        {isDirty && (
+                          <span className="inline-flex items-center gap-0.5 px-1 py-0.5 rounded-sm text-[9px] font-semibold bg-warning/15 text-warning">
+                            <Sparkles className="w-2.5 h-2.5" /> DIRTY
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-[11px] capitalize text-textSecondary mt-0.5 truncate">
+                        {rm.roomType}
+                      </div>
+                      <div className="text-xs font-mono text-textPrimary mt-1">
+                        ₹{Number(rm.baseRate).toFixed(0)}/n
+                      </div>
+                    </button>
+                    {isDirty && !active && (
+                      <button
+                        type="button"
+                        disabled={cleanInFlight}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          markClean.mutate(rm.id, {
+                            onSuccess: () => toggleRoom(rm),
+                          });
+                        }}
+                        className="mt-2 w-full inline-flex items-center justify-center gap-1 px-1.5 h-7 rounded-sm border border-warning/50 text-warning hover:bg-warning/10 text-[11px] font-semibold disabled:opacity-50"
+                      >
+                        <Sparkles className="w-3 h-3" />
+                        {cleanInFlight ? "Cleaning…" : "Mark clean & select"}
+                      </button>
+                    )}
+                  </div>
                 );
               })}
             </div>
           )}
         </div>
 
-        {selectedRoom && (
-          <div>
-            <label className="label block mb-1">Rate / night (₹)</label>
-            <input
-              className="input"
-              type="number"
-              min={0}
-              step="0.01"
-              value={ratePerNight || ""}
-              placeholder="0"
-              onChange={(e) => setRatePerNight(Number(e.target.value))}
-            />
-            <div className="text-xs text-textSecondary mt-1">
-              Base rate: ₹{Number(selectedRoom.baseRate).toFixed(0)}/night
+        {pickedIds.length > 0 && (
+          <div className="border border-borderc rounded p-3 bg-bg/40 space-y-2">
+            <div className="text-xs font-semibold uppercase tracking-wider text-textSecondary">
+              Rate per room
+            </div>
+            {pickedIds.map((id) => {
+              const rm = availableById.get(id);
+              if (!rm) return null;
+              const rate = picked[id] ?? 0;
+              return (
+                <div key={id} className="flex items-center gap-3">
+                  <div className="flex-1 min-w-0">
+                    <div className="font-mono font-bold text-brand-dark text-sm">
+                      {rm.roomNumber}
+                    </div>
+                    <div className="text-[11px] text-textSecondary capitalize truncate">
+                      {rm.roomType} · base ₹{Number(rm.baseRate).toFixed(0)}/n
+                    </div>
+                  </div>
+                  <div className="w-32">
+                    <input
+                      className="input"
+                      type="number"
+                      min={0}
+                      step="0.01"
+                      value={rate || ""}
+                      placeholder="0"
+                      onChange={(e) =>
+                        setPicked((cur) => ({ ...cur, [id]: Number(e.target.value) }))
+                      }
+                    />
+                  </div>
+                  <div className="w-24 text-right text-xs font-mono text-textPrimary">
+                    {nights > 0 ? `= ₹${(rate * nights).toFixed(2)}` : ""}
+                  </div>
+                </div>
+              );
+            })}
+            {nights > 0 && (
+              <div className="flex justify-between border-t border-borderc pt-2 mt-2 text-sm">
+                <strong>
+                  {pickedIds.length} room{pickedIds.length === 1 ? "" : "s"} × {nights} night
+                  {nights === 1 ? "" : "s"}
+                </strong>
+                <strong className="font-mono">₹{grandPreview.toFixed(2)}</strong>
+              </div>
+            )}
+            <div className="text-[11px] text-textSecondary">
+              GST is applied on top at invoice time using the property's room GST rate (same as
+              every other room on this reservation).
             </div>
           </div>
         )}
 
         {err && <div className="text-danger text-sm">{err}</div>}
+        {progress && progress.total > 0 && save.isPending && (
+          <div className="text-xs text-textSecondary">
+            Adding room {progress.done + 1} of {progress.total}…
+          </div>
+        )}
         <div className="flex justify-end gap-2 pt-1">
           <button
             className="px-4 h-9 text-sm font-semibold rounded-sm border-2 border-borderc text-textSecondary hover:border-textSecondary hover:text-textPrimary transition-colors"
@@ -1648,10 +1842,21 @@ function AddRoomModal(props: {
           </button>
           <button
             className="px-4 h-9 text-sm font-semibold rounded-sm bg-brand-dark text-cream border-2 border-brand-dark hover:opacity-90 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed"
-            disabled={!selectedRoomId || ratePerNight <= 0 || save.isPending}
-            onClick={() => save.mutate()}
+            disabled={
+              pickedIds.length === 0 ||
+              pickedIds.some((id) => (picked[id] ?? 0) <= 0) ||
+              save.isPending
+            }
+            onClick={() => {
+              setErr(null);
+              save.mutate();
+            }}
           >
-            {save.isPending ? "Adding…" : "Add Room"}
+            {save.isPending
+              ? "Adding…"
+              : pickedIds.length > 1
+                ? `Add ${pickedIds.length} Rooms`
+                : "Add Room"}
           </button>
         </div>
       </div>
@@ -1918,6 +2123,11 @@ function ChargeModal(props: {
 function PaymentModal(props: {
   reservationId: string;
   balance: number;
+  // Optional — when set, the payment is tied to this specific invoice
+  // server-side. Used when the caller already knows which invoice they
+  // want to collect against (e.g. right after issuing a combined invoice).
+  invoiceId?: string;
+  invoiceNumber?: string;
   onClose: () => void;
   onSaved: () => void;
 }) {
@@ -1933,7 +2143,12 @@ function PaymentModal(props: {
     mutationFn: () =>
       api.post(
         `/reservations/${props.reservationId}/payments`,
-        { amount, paymentMethod: method, notes: reference || undefined },
+        {
+          amount,
+          paymentMethod: method,
+          notes: reference || undefined,
+          ...(props.invoiceId ? { invoiceId: props.invoiceId } : {}),
+        },
         { idempotencyKey },
       ),
     onSuccess: props.onSaved,
@@ -1941,7 +2156,12 @@ function PaymentModal(props: {
   });
 
   return (
-    <ModalShell title="Record Payment" onClose={props.onClose}>
+    <ModalShell
+      title={
+        props.invoiceNumber ? `Record Payment · ${props.invoiceNumber}` : "Record Payment"
+      }
+      onClose={props.onClose}
+    >
       <div className="space-y-3">
         <div>
           <label className="label block mb-1">Amount (₹)</label>
@@ -1994,6 +2214,724 @@ function PaymentModal(props: {
   );
 }
 
+// Per-room (migration 0017) checkout flow. Lighter than the full
+// CheckoutModal (no previous-balance carry-over, no wallet credit, no
+// refund handling — those belong on the booker's combined checkout).
+// Shows the room's bill, lets staff collect payment, hits the unified
+// endpoint that does invoice + payment + checkout in one tx.
+function PerRoomCheckoutModal(props: {
+  reservationId: string;
+  roomId: string;
+  roomNumber: string;
+  occupantName: string | null;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const quoteQ = useQuery({
+    queryKey: ["per-room-checkout-quote", props.reservationId, props.roomId],
+    queryFn: () =>
+      api.get<{
+        subtotal: number;
+        gst: number;
+        cgst: number;
+        sgst: number;
+        grandTotal: number;
+        // Remaining unpaid amount on the room's invoice (if already
+        // bound to one) — what staff actually needs to collect now.
+        // For un-invoiced rooms this matches grandTotal.
+        balanceDue: number;
+        totalPaid: number;
+        invoiceNumber?: string;
+        invoiceScope?: "room" | "combined" | "partial";
+        alreadyInvoiced: boolean;
+      }>(`/reservations/${props.reservationId}/rooms/${props.roomId}/checkout-quote`),
+    staleTime: 0,
+  });
+  // "Due now" is the remaining balance on the bound invoice — NOT the
+  // grand total. A room sitting on a fully-paid combined invoice has
+  // due = 0 and the modal lets staff just check out without collecting.
+  const due = quoteQ.data?.balanceDue ?? 0;
+  // Wallet preview tied to the parent reservation. Per-room checkout still
+  // redeems off the same guest wallet — the API caps the redeem at the
+  // reservation's remaining balance, which is fine for our use here.
+  const walletQ = useQuery({
+    queryKey: ["wallet-credit-preview", props.reservationId],
+    queryFn: () =>
+      api.get<{
+        walletBalance: number;
+        maxRedeemable: number;
+      }>(`/reservations/${props.reservationId}/wallet-credit-preview`),
+    staleTime: 0,
+  });
+  const walletBalance = walletQ.data?.walletBalance ?? 0;
+  const [amount, setAmount] = useState<number>(0);
+  const [method, setMethod] = useState<
+    "cash" | "upi" | "card" | "bank_transfer" | "unpaid" | "wallet"
+  >("cash");
+  const [notes, setNotes] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+
+  // Default the amount to whatever's still owed on the bound invoice
+  // (or the full bill when there's no invoice yet).
+  useEffect(() => {
+    if (quoteQ.data && amount === 0) setAmount(quoteQ.data.balanceDue);
+  }, [quoteQ.data, amount]);
+
+  // When the user switches to "wallet", cap the amount at the wallet balance
+  // (and at the bill total). Switching away leaves the amount alone.
+  useEffect(() => {
+    if (method === "wallet") {
+      setAmount(Math.min(due, walletBalance));
+    }
+  }, [method, due, walletBalance]);
+
+  const checkOut = useMutation({
+    mutationFn: async () => {
+      if (method === "wallet") {
+        // Redeem wallet against the parent reservation first; that reduces
+        // the bill to zero (or close to). Then close the room with a
+        // zero-payment check-out so an invoice still gets issued.
+        if (amount > 0.009) {
+          await api.post(
+            `/reservations/${props.reservationId}/apply-wallet-credit`,
+            { amount },
+            { idempotencyKey: newIdempotencyKey() },
+          );
+        }
+        await api.post(
+          `/reservations/${props.reservationId}/rooms/${props.roomId}/check-out`,
+          {
+            paymentAmount: 0,
+            paymentMethod: "unpaid",
+            paymentNotes: `Wallet credit ${inr(amount)} applied`,
+          },
+        );
+        return;
+      }
+      await api.post(`/reservations/${props.reservationId}/rooms/${props.roomId}/check-out`, {
+        paymentAmount: amount,
+        paymentMethod: method,
+        paymentNotes: notes || undefined,
+      });
+    },
+    onSuccess: () => props.onDone(),
+    onError: (e: Error) => setErr(e.message),
+  });
+
+  return (
+    <ModalShell title={`Check out Room ${props.roomNumber}`} onClose={props.onClose}>
+      {quoteQ.isLoading || !quoteQ.data ? (
+        <div className="text-sm text-textSecondary py-6 text-center">Loading bill…</div>
+      ) : (
+        <div className="space-y-4">
+          <div className="text-sm">
+            {quoteQ.data.alreadyInvoiced
+              ? quoteQ.data.balanceDue <= 0.009
+                ? `This room is already billed on ${quoteQ.data.invoiceNumber ?? "an invoice"} and fully paid. Confirming just releases the room and completes check-out.`
+                : `This room is already billed on ${quoteQ.data.invoiceNumber ?? "an invoice"} with ${inr(quoteQ.data.balanceDue)} still owing. Confirming records the remaining payment and checks the room out.`
+              : "Confirming will generate this room's tax invoice, record the payment, and check the room out. Other rooms on this reservation are unaffected."}
+            {props.occupantName && (
+              <> Guest: <strong className="text-brand-dark">{props.occupantName}</strong>.</>
+            )}
+          </div>
+          <div className="border border-borderc rounded p-3 space-y-1 bg-bg/40">
+            <div className="flex justify-between text-sm">
+              <span className="text-textSecondary">Subtotal (room charges + extras, pre-GST)</span>
+              <span className="font-mono">{inr(quoteQ.data.subtotal)}</span>
+            </div>
+            <div className="flex justify-between text-sm">
+              <span className="text-textSecondary">CGST (Central GST, half of total tax)</span>
+              <span className="font-mono">{inr(quoteQ.data.cgst)}</span>
+            </div>
+            <div className="flex justify-between text-sm">
+              <span className="text-textSecondary">SGST (State GST, half of total tax)</span>
+              <span className="font-mono">{inr(quoteQ.data.sgst)}</span>
+            </div>
+            <div className="flex justify-between text-sm">
+              <span className="text-textSecondary">Total GST</span>
+              <span className="font-mono">{inr(quoteQ.data.gst)}</span>
+            </div>
+            <div className="flex justify-between text-sm border-t border-borderc pt-2 mt-2">
+              <span className="text-textSecondary">Grand Total</span>
+              <span className="font-mono">{inr(quoteQ.data.grandTotal)}</span>
+            </div>
+            {quoteQ.data.alreadyInvoiced && quoteQ.data.totalPaid > 0.009 && (
+              <div className="flex justify-between text-sm">
+                <span className="text-textSecondary">Already paid</span>
+                <span className="font-mono">− {inr(quoteQ.data.totalPaid)}</span>
+              </div>
+            )}
+            <div className="flex justify-between border-t border-borderc pt-2 mt-2">
+              <strong>{due <= 0.009 ? "Due now" : "Balance due now"}</strong>
+              <strong className={`font-mono ${due <= 0.009 ? "text-success" : ""}`}>
+                {inr(due)}
+              </strong>
+            </div>
+          </div>
+          {due > 0.009 && (
+            <>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="label block mb-1">Payment amount (₹)</label>
+                  <input
+                    className="input"
+                    type="number"
+                    min={0}
+                    step="0.01"
+                    value={amount}
+                    onChange={(e) => setAmount(Number(e.target.value))}
+                  />
+                  {amount < due - 0.009 && (
+                    <div className="text-[11px] text-textSecondary mt-1">
+                      Short by {inr(due - amount)} — the rest stays on the invoice.
+                    </div>
+                  )}
+                  {amount > due + 0.009 && (
+                    <div className="text-[11px] text-warning mt-1">
+                      Over by {inr(amount - due)} — please collect only what's due, or use the
+                      booker's combined invoice for overpayments / refunds.
+                    </div>
+                  )}
+                </div>
+                <div>
+                  <label className="label block mb-1">Method</label>
+                  <select
+                    className="input"
+                    value={method}
+                    onChange={(e) =>
+                      setMethod(
+                        e.target.value as
+                          | "cash"
+                          | "upi"
+                          | "card"
+                          | "bank_transfer"
+                          | "unpaid"
+                          | "wallet",
+                      )
+                    }
+                  >
+                    <option value="cash">Cash</option>
+                    <option value="upi">UPI</option>
+                    <option value="card">Card</option>
+                    <option value="bank_transfer">Bank transfer</option>
+                    <option value="unpaid">Unpaid · collect later</option>
+                    <option value="wallet" disabled={walletBalance <= 0.009}>
+                      Wallet credit · available {inr(walletBalance)}
+                    </option>
+                  </select>
+                  {method === "wallet" && (
+                    <div className="text-[11px] text-textSecondary mt-1">
+                      Redeems {inr(amount)} from the guest's wallet. Wallet covers up to{" "}
+                      {inr(Math.min(due, walletBalance))} of this bill.
+                    </div>
+                  )}
+                </div>
+              </div>
+              {(method === "unpaid" || (method !== "wallet" && amount < due - 0.009)) && (
+                <div>
+                  <label className="label block mb-1">
+                    Notes {method === "unpaid" ? "(required)" : "(optional)"}
+                  </label>
+                  <textarea
+                    className="input"
+                    rows={2}
+                    value={notes}
+                    onChange={(e) => setNotes(e.target.value)}
+                    placeholder={
+                      method === "unpaid"
+                        ? "Why are we letting this guest leave without paying?"
+                        : "Reason for short payment"
+                    }
+                  />
+                </div>
+              )}
+            </>
+          )}
+          {err && <div className="text-danger text-sm">{err}</div>}
+          <div className="flex justify-end gap-2 pt-2">
+            <button className="btn-secondary" onClick={props.onClose}>
+              Cancel
+            </button>
+            <button
+              className="btn-primary"
+              disabled={
+                checkOut.isPending ||
+                (due > 0.009 && amount <= 0.009) ||
+                (method === "wallet" && amount > walletBalance + 0.009)
+              }
+              onClick={() => {
+                setErr(null);
+                checkOut.mutate();
+              }}
+            >
+              {checkOut.isPending
+                ? "Checking out…"
+                : due <= 0.009
+                  ? "Check Out"
+                  : `Check Out · ${
+                      method === "unpaid"
+                        ? "mark unpaid"
+                        : method === "wallet"
+                          ? "redeem " + inr(amount) + " from wallet"
+                          : "collect " + inr(amount)
+                    }`}
+            </button>
+          </div>
+        </div>
+      )}
+    </ModalShell>
+  );
+}
+
+// Double-check before issuing a combined invoice. Lists the exact rooms
+// rolling onto the one bill, the rooms already invoiced separately (which
+// will NOT be re-billed), and the amount being collected. Renders as a
+// nested modal-style overlay on top of the open Checkout modal.
+// Issue a combined invoice that pools 2+ un-invoiced rooms into one tax
+// bill. The picker lets staff cherry-pick which rooms to combine (default
+// is all of them) and optionally settle the bill in the same call by
+// providing a payment amount + method. The amount is suggested at the
+// live grand total (pre-GST × rooms + GST) but staff can override (short
+// payment leaves the invoice partial / issued).
+function CombinedInvoiceModal({
+  reservationId,
+  uninvoicedRooms,
+  nights,
+  gstRate,
+  gstMode,
+  stayType,
+  onClose,
+  onIssued,
+}: {
+  reservationId: string;
+  uninvoicedRooms: {
+    id: string;
+    roomNumber: string;
+    displayType: string;
+    ratePerNight: string;
+  }[];
+  nights: number;
+  gstRate: number;
+  // "inclusive" → ratePerNight already contains GST; we extract it.
+  // "exclusive" → ratePerNight is net; we add GST on top.
+  gstMode: "exclusive" | "inclusive";
+  stayType: "overnight" | "short_stay";
+  onClose: () => void;
+  // Called after the server returns the newly-issued invoice. The
+  // second arg carries the staff's intent so the parent can decide
+  // whether to chain into the Record Payment modal:
+  //   collectIntended=true  → user ticked "Collect payment with this
+  //                           invoice"; chain only when the invoice
+  //                           landed in 'partial' (short payment) so
+  //                           staff is reminded about the remainder.
+  //   collectIntended=false → user explicitly issued without collecting;
+  //                           DO NOT auto-open the payment modal — they
+  //                           can use the per-invoice Collect button when
+  //                           they're ready.
+  onIssued: (
+    invoice: {
+      id: string;
+      invoiceNumber: string;
+      grandTotal: string;
+      balanceDue: string;
+      status: string;
+    },
+    meta: { collectIntended: boolean },
+  ) => void;
+}) {
+  // Default: every un-invoiced room is selected.
+  const [selected, setSelected] = useState<Set<string>>(
+    () => new Set(uninvoicedRooms.map((r) => r.id)),
+  );
+  const [collectNow, setCollectNow] = useState(false);
+  const [payAmount, setPayAmount] = useState<number>(0);
+  const [method, setMethod] = useState<"cash" | "upi" | "card" | "bank_transfer">("cash");
+  const [notes, setNotes] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+
+  // Client-side estimate of the invoice total. Mirrors the server's
+  // calcGstBreakdown logic — the server recomputes the authoritative
+  // total before issuing, so this is only a preview.
+  //
+  //   exclusive: ratePerNight × units IS the net subtotal; GST goes on top.
+  //   inclusive: ratePerNight × units is the gross (what the guest pays);
+  //              extract the net via gross / (1 + rate/100).
+  // For short_stay the stored rate is already the flat price for the stay.
+  const units = stayType === "short_stay" ? 1 : Math.max(1, nights);
+  const selectedRooms = uninvoicedRooms.filter((r) => selected.has(r.id));
+  const grossSelected = selectedRooms.reduce(
+    (sum, r) => sum + Number(r.ratePerNight) * units,
+    0,
+  );
+  const subtotalEstimate =
+    gstMode === "inclusive"
+      ? +(grossSelected / (1 + gstRate / 100)).toFixed(2)
+      : +grossSelected.toFixed(2);
+  const gstEstimate =
+    gstMode === "inclusive"
+      ? +(grossSelected - subtotalEstimate).toFixed(2)
+      : +(subtotalEstimate * (gstRate / 100)).toFixed(2);
+  const grandEstimate = +(subtotalEstimate + gstEstimate).toFixed(2);
+
+  // Sync the suggested payment amount with the grand total whenever the
+  // room selection changes — unless staff has manually edited it.
+  const [userEdited, setUserEdited] = useState(false);
+  useEffect(() => {
+    if (!userEdited) setPayAmount(grandEstimate);
+  }, [grandEstimate, userEdited]);
+
+  function toggleRoom(id: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  const issue = useMutation({
+    mutationFn: () => {
+      const body: Record<string, unknown> = {
+        scope: "combined",
+        // Send roomIds only when the user narrowed the selection. Omitting
+        // it preserves the legacy "all un-invoiced rooms" default.
+        ...(selected.size === uninvoicedRooms.length
+          ? {}
+          : { roomIds: Array.from(selected) }),
+      };
+      if (collectNow && payAmount > 0.009) {
+        body.payment = {
+          amount: payAmount,
+          paymentMethod: method,
+          paymentNotes: notes.trim() || undefined,
+        };
+      }
+      return api.post<{
+        id: string;
+        invoiceNumber: string;
+        grandTotal: string;
+        balanceDue: string;
+        status: string;
+      }>(`/reservations/${reservationId}/invoice`, body);
+    },
+    onSuccess: (inv) => onIssued(inv, { collectIntended: collectNow }),
+    onError: (e: Error) => setErr(e.message),
+  });
+
+  const cannotSubmit =
+    selected.size === 0 ||
+    issue.isPending ||
+    (collectNow && payAmount <= 0.009);
+
+  return (
+    <ModalShell title="Issue Combined Invoice" onClose={onClose}>
+      <div className="space-y-4">
+        <div className="text-sm text-textSecondary">
+          Pick which un-invoiced rooms to roll into a single tax invoice. Reservation-wide charges
+          (extras with no room attached) attach automatically. Rooms already invoiced separately
+          aren't shown.
+        </div>
+
+        <div>
+          <div className="text-[10px] uppercase tracking-wider text-textSecondary font-semibold mb-1.5">
+            Rooms to combine ({selected.size} of {uninvoicedRooms.length})
+          </div>
+          <div className="space-y-1.5 border border-borderc rounded-sm divide-y divide-borderc">
+            {uninvoicedRooms.map((rm) => {
+              const isOn = selected.has(rm.id);
+              const lineTotal = Number(rm.ratePerNight) * units;
+              return (
+                <label
+                  key={rm.id}
+                  className={`flex items-center gap-3 px-3 py-2 cursor-pointer transition-colors ${
+                    isOn ? "bg-brand-soft/40" : "hover:bg-bg"
+                  }`}
+                >
+                  <input
+                    type="checkbox"
+                    className="accent-brand-dark"
+                    checked={isOn}
+                    onChange={() => {
+                      toggleRoom(rm.id);
+                      setUserEdited(false);
+                    }}
+                  />
+                  <div className="flex-1 min-w-0">
+                    <div className="font-mono font-semibold text-brand-dark text-sm">
+                      {rm.roomNumber}
+                    </div>
+                    <div className="text-[11px] text-textSecondary capitalize truncate">
+                      {rm.displayType} · ₹{Number(rm.ratePerNight).toFixed(0)}/
+                      {stayType === "short_stay" ? "stay" : "n"}
+                      {gstMode === "inclusive" ? " incl. GST" : " + GST"}
+                      {stayType !== "short_stay" && units > 1 && ` × ${units} nights`}
+                    </div>
+                  </div>
+                  <div className="text-xs font-mono text-textPrimary shrink-0">
+                    {inr(lineTotal)}
+                  </div>
+                </label>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="border border-borderc rounded-sm p-3 bg-bg/40 space-y-1 text-sm">
+          <div className="flex justify-between">
+            <span className="text-textSecondary">
+              Subtotal (pre-GST{gstMode === "inclusive" ? ", extracted from rate" : ""})
+            </span>
+            <span className="font-mono">{inr(subtotalEstimate)}</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-textSecondary">
+              GST @ {gstRate}%{gstMode === "inclusive" ? " (already in rate)" : " (added on top)"}
+            </span>
+            <span className="font-mono">{inr(gstEstimate)}</span>
+          </div>
+          <div className="flex justify-between border-t border-borderc pt-1 mt-1">
+            <strong>Estimated total (guest pays)</strong>
+            <strong className="font-mono">{inr(grandEstimate)}</strong>
+          </div>
+          <div className="text-[11px] text-textSecondary mt-1">
+            Server recomputes the authoritative total from the selected rooms + any reservation-wide
+            charges before issuing.
+          </div>
+        </div>
+
+        <div className="border border-borderc rounded-sm p-3 space-y-2">
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              className="accent-brand-dark"
+              checked={collectNow}
+              onChange={(e) => setCollectNow(e.target.checked)}
+            />
+            <span className="text-sm font-medium">Collect payment with this invoice</span>
+          </label>
+          {collectNow && (
+            <div className="grid grid-cols-2 gap-3 pt-1">
+              <div>
+                <label className="label block mb-1">Amount (₹)</label>
+                <input
+                  className="input"
+                  type="number"
+                  min={0}
+                  step="0.01"
+                  value={payAmount || ""}
+                  onChange={(e) => {
+                    setPayAmount(Number(e.target.value));
+                    setUserEdited(true);
+                  }}
+                />
+                {payAmount > 0.009 && payAmount < grandEstimate - 0.009 && (
+                  <div className="text-[11px] text-textSecondary mt-1">
+                    Short of estimate — invoice will be marked Partial.
+                  </div>
+                )}
+              </div>
+              <div>
+                <label className="label block mb-1">Method</label>
+                <select
+                  className="input"
+                  value={method}
+                  onChange={(e) => setMethod(e.target.value as typeof method)}
+                >
+                  <option value="cash">Cash</option>
+                  <option value="upi">UPI</option>
+                  <option value="card">Card</option>
+                  <option value="bank_transfer">Bank transfer</option>
+                </select>
+              </div>
+              <div className="col-span-2">
+                <label className="label block mb-1">Notes (optional)</label>
+                <input
+                  className="input"
+                  value={notes}
+                  onChange={(e) => setNotes(e.target.value)}
+                  placeholder="Reference, payer name, etc."
+                />
+              </div>
+            </div>
+          )}
+        </div>
+
+        {err && <div className="text-danger text-sm">{err}</div>}
+
+        <div className="flex justify-end gap-2">
+          <button className="btn-secondary" onClick={onClose} disabled={issue.isPending}>
+            Cancel
+          </button>
+          <button
+            className="btn-primary"
+            disabled={cannotSubmit}
+            onClick={() => {
+              setErr(null);
+              issue.mutate();
+            }}
+          >
+            {issue.isPending
+              ? "Issuing…"
+              : collectNow && payAmount > 0.009
+                ? `Issue & collect ${inr(payAmount)}`
+                : `Issue invoice for ${selected.size} room${selected.size === 1 ? "" : "s"}`}
+          </button>
+        </div>
+      </div>
+    </ModalShell>
+  );
+}
+
+function CombineConfirmDialog({
+  remainingRooms,
+  alreadyInvoicedRooms,
+  collecting,
+  method,
+  onCancel,
+  onConfirm,
+  submitting,
+}: {
+  remainingRooms: { roomNumber: string; occupantName: string | null }[];
+  alreadyInvoicedRooms: { roomNumber: string; invoiceNumber: string }[];
+  collecting: number;
+  method: string;
+  onCancel: () => void;
+  onConfirm: () => void;
+  submitting: boolean;
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-[60] grid place-items-center bg-brand-dark/50 p-4"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onCancel();
+      }}
+    >
+      <div className="w-full max-w-md bg-surface rounded-md shadow-xl border border-borderc overflow-hidden">
+        <div className="px-5 py-3 border-b border-borderc bg-warning/5 flex items-start gap-2">
+          <ShieldAlert className="w-5 h-5 text-warning mt-0.5 shrink-0" />
+          <div>
+            <div className="font-semibold text-textPrimary">Combine into one invoice?</div>
+            <div className="text-xs text-textSecondary mt-0.5">
+              This rolls every remaining room into a single tax invoice. It can't be split later
+              without voiding and re-issuing.
+            </div>
+          </div>
+        </div>
+
+        <div className="p-5 space-y-3 text-sm">
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-textSecondary font-semibold mb-1.5">
+              Rooms on the combined invoice ({remainingRooms.length})
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {remainingRooms.map((r) => (
+                <span
+                  key={r.roomNumber}
+                  className="inline-flex items-center gap-1 px-2 py-1 rounded-sm bg-brand-soft text-brand-dark text-xs font-mono font-semibold"
+                >
+                  {r.roomNumber}
+                </span>
+              ))}
+            </div>
+          </div>
+
+          {alreadyInvoicedRooms.length > 0 && (
+            <div>
+              <div className="text-[10px] uppercase tracking-wider text-textSecondary font-semibold mb-1.5">
+                Not included · already invoiced separately
+              </div>
+              <ul className="text-xs space-y-0.5">
+                {alreadyInvoicedRooms.map((r) => (
+                  <li key={r.roomNumber} className="text-textSecondary">
+                    Room <span className="font-mono font-semibold text-textPrimary">{r.roomNumber}</span>{" "}
+                    → invoice <span className="font-mono text-textPrimary">{r.invoiceNumber}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          <div className="border-t border-borderc pt-3">
+            <div className="text-[10px] uppercase tracking-wider text-textSecondary font-semibold mb-1.5">
+              Collecting now
+            </div>
+            <div className="flex justify-between text-sm">
+              <span className="text-textSecondary capitalize">{method.replace("_", " ")}</span>
+              <span className="font-mono font-semibold">{inr(collecting)}</span>
+            </div>
+            <div className="text-[11px] text-textSecondary mt-1">
+              The server recomputes the invoice total from the rooms above. Any difference between
+              this amount and the recomputed bill becomes a balance on the invoice (or a refund if
+              over-collected).
+            </div>
+          </div>
+        </div>
+
+        <div className="flex justify-end gap-2 px-5 py-3 border-t border-borderc bg-bg/50">
+          <button className="btn-secondary" onClick={onCancel} disabled={submitting}>
+            Back
+          </button>
+          <button className="btn-primary" onClick={onConfirm} disabled={submitting}>
+            {submitting ? "Issuing…" : "Yes, combine & check out"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function InvoiceModeToggle({
+  value,
+  onChange,
+  count,
+}: {
+  value: boolean;
+  onChange: (next: boolean) => void;
+  count: number;
+}) {
+  return (
+    <div className="rounded-sm border border-borderc bg-bg/40 p-3 space-y-2">
+      <div className="text-xs font-semibold uppercase tracking-wider text-textSecondary">
+        Invoice mode · {count} rooms remaining
+      </div>
+      <label className="flex items-start gap-2 cursor-pointer">
+        <input
+          type="radio"
+          name="invoiceMode"
+          checked={!value}
+          onChange={() => onChange(false)}
+          className="mt-1 accent-brand-dark"
+        />
+        <div className="flex-1 text-sm">
+          <div className="font-medium text-textPrimary">
+            One tax invoice per room <span className="text-success text-xs">· default</span>
+          </div>
+          <div className="text-xs text-textSecondary">
+            Each room gets its own GST invoice — friends sharing a booking can each claim their
+            own tax credit. Payment is split proportionally.
+          </div>
+        </div>
+      </label>
+      <label className="flex items-start gap-2 cursor-pointer">
+        <input
+          type="radio"
+          name="invoiceMode"
+          checked={value}
+          onChange={() => onChange(true)}
+          className="mt-1 accent-brand-dark"
+        />
+        <div className="flex-1 text-sm">
+          <div className="font-medium text-textPrimary">Combine into one invoice</div>
+          <div className="text-xs text-textSecondary">
+            All rooms + extras roll into a single bill addressed to the booker. Use this when one
+            person is paying for everyone.
+          </div>
+        </div>
+      </label>
+    </div>
+  );
+}
+
 function CheckoutModal(props: {
   reservationId: string;
   // Human-readable number (e.g. "SLDT-RES-0019") used in payment notes
@@ -2002,9 +2940,36 @@ function CheckoutModal(props: {
   reservationNumber: string;
   guestId: string;
   balance: number;
+  subtotal: number;
+  totalGst: number;
+  grandTotal: number;
+  totalPaid: number;
+  // How many rooms still need an invoice. When > 1, the default invoice
+  // mode is "per_room" (one tax invoice per room so each guest can claim
+  // their own GST). Single-room reservations skip the choice entirely.
+  remainingRoomCount: number;
+  // The actual rooms that will be billed by this checkout. Used by the
+  // "Combine into one invoice" confirm step so staff can verify which
+  // rooms (and occupants) roll into the single tax invoice before the
+  // money moves.
+  remainingRooms: { roomNumber: string; occupantName: string | null }[];
+  // Rooms that already have their own invoice (and won't be re-billed).
+  // Listed in the confirm step so staff isn't surprised by their absence.
+  alreadyInvoicedRooms: { roomNumber: string; invoiceNumber: string }[];
   onClose: () => void;
   onDone: () => void;
 }) {
+  // Intra-state GST split (same rule used everywhere else in the app).
+  const cgst = +(props.totalGst / 2).toFixed(2);
+  const sgst = +(props.totalGst - cgst).toFixed(2);
+  // Default per-room when there are 2+ remaining rooms. Staff can flip
+  // the checkbox to issue one combined invoice instead.
+  const [combineIntoOne, setCombineIntoOne] = useState(false);
+  // Second-gate confirmation for the combined path. Set when the user
+  // hits Complete Check-out while invoiceMode === "combined" and there
+  // are ≥2 rooms about to roll into one invoice. They must explicitly
+  // accept before the API call goes out.
+  const [pendingCombineConfirm, setPendingCombineConfirm] = useState(false);
   // Pull the guest's previous unpaid balances so we can offer to collect
   // them in the same visit. Two streams:
   //  - `invoices`        : balances on already-issued invoices
@@ -2079,8 +3044,24 @@ function CheckoutModal(props: {
   const previousToCollect = hasPrevious && collectPrevious ? previousTotal : 0;
   const suggestedTotal = +(Math.max(0, props.balance) + previousToCollect).toFixed(2);
 
+  // Guest wallet balance — drives the "Wallet credit" Method option. Loaded
+  // once when the modal mounts; the parent reservation's apply-wallet-credit
+  // preview endpoint already returns walletBalance for us.
+  const walletQ = useQuery({
+    queryKey: ["wallet-credit-preview", props.reservationId],
+    queryFn: () =>
+      api.get<{
+        walletBalance: number;
+        maxRedeemable: number;
+      }>(`/reservations/${props.reservationId}/wallet-credit-preview`),
+    staleTime: 0,
+  });
+  const walletBalance = walletQ.data?.walletBalance ?? 0;
+
   const [finalAmount, setFinalAmount] = useState(suggestedTotal);
-  const [method, setMethod] = useState<"cash" | "card" | "upi" | "bank_transfer" | "unpaid">("cash");
+  const [method, setMethod] = useState<
+    "cash" | "card" | "upi" | "bank_transfer" | "unpaid" | "wallet"
+  >("cash");
   const [paymentNotes, setPaymentNotes] = useState("");
   const [refundMode, setRefundMode] = useState<"cash" | "credit">("credit");
   const [refundNote, setRefundNote] = useState("");
@@ -2095,12 +3076,24 @@ function CheckoutModal(props: {
   }, [suggestedTotal, userEdited]);
 
   const isUnpaid = method === "unpaid";
+  const isWallet = method === "wallet";
   const balanceRemaining = props.balance > 0.009;
   const mightOverpay = props.balance <= 0.009 && !hasPrevious;
+  const currentBillTarget = Math.max(0, props.balance);
+  // Wallet redemption is capped at the current bill's remaining balance —
+  // the API enforces the same rule, but reflecting it in the UI keeps the
+  // amount field truthful. Wallet does NOT cover previous-balance items.
+  const walletRedeemCap = Math.min(currentBillTarget, walletBalance);
+  useEffect(() => {
+    if (isWallet) {
+      setFinalAmount(+walletRedeemCap.toFixed(2));
+      setUserEdited(true);
+    }
+  }, [isWallet, walletRedeemCap]);
+
   // Split the entered amount between current and previous bills.
   // Rule (decided with the user): apply to CURRENT first, then FIFO oldest
   // previous invoices.
-  const currentBillTarget = Math.max(0, props.balance);
   const appliedToCurrent = Math.min(finalAmount, currentBillTarget);
   const remainderForPrevious = Math.max(0, +(finalAmount - appliedToCurrent).toFixed(2));
 
@@ -2110,17 +3103,45 @@ function CheckoutModal(props: {
   //  - Staff turned on "Collect previous" but picked the unpaid method —
   //    a previous payment can't be recorded as unpaid; that money is
   //    real cash coming in. Surfaced as an inline warning below.
+  //  - Wallet method but amount exceeds the wallet balance.
   const collectingPreviousWithUnpaid =
     hasPrevious && collectPrevious && isUnpaid && remainderForPrevious > 0.009;
   const submitDisabled =
     (balanceRemaining && (finalAmount <= 0.009 || (isUnpaid && paymentNotes.trim() === ""))) ||
-    collectingPreviousWithUnpaid;
+    collectingPreviousWithUnpaid ||
+    (isWallet && finalAmount > walletBalance + 0.009);
 
   const act = useMutation({
     mutationFn: async () => {
+      // Wallet method: redeem first via the dedicated endpoint, then close
+      // the stay with a zero-cash payment. The server reduces the
+      // reservation balance inside apply-wallet-credit so the subsequent
+      // /check-out sees the right amount due.
+      // For multi-room reservations, default to per_room invoices. Staff
+      // can opt into a single combined invoice by ticking the checkbox.
+      const invoiceMode =
+        props.remainingRoomCount > 1 && !combineIntoOne ? "per_room" : "combined";
+
+      if (isWallet) {
+        if (finalAmount > 0.009) {
+          await api.post(
+            `/reservations/${props.reservationId}/apply-wallet-credit`,
+            { amount: finalAmount },
+            { idempotencyKey: newIdempotencyKey() },
+          );
+        }
+        const body: Record<string, unknown> = {
+          refundMode,
+          invoiceMode,
+        };
+        if (refundNote.trim()) body.refundNote = refundNote.trim();
+        await api.post(`/reservations/${props.reservationId}/check-out`, body);
+        return;
+      }
+
       // Step 1: check this reservation out. Only the portion that lands
       // against the current bill goes through here.
-      const body: Record<string, unknown> = {};
+      const body: Record<string, unknown> = { invoiceMode };
       if (balanceRemaining && appliedToCurrent > 0) {
         body.finalPayment = appliedToCurrent;
         body.paymentMethod = method;
@@ -2177,11 +3198,17 @@ function CheckoutModal(props: {
             <div>
               <div className="font-semibold text-success">Bill fully paid</div>
               <div className="text-sm text-textPrimary mt-1">
-                Nothing to collect. Closing the stay will generate the final invoice,
-                release the room, and complete check-out.
+                Nothing to collect. Closing the stay will{" "}
+                {props.remainingRoomCount > 1 && !combineIntoOne
+                  ? `issue ${props.remainingRoomCount} per-room invoices`
+                  : "generate the final invoice"}
+                , release the room
+                {props.remainingRoomCount > 1 ? "s" : ""}, and complete check-out.
               </div>
             </div>
           </div>
+
+          {props.remainingRoomCount > 1 && <InvoiceModeToggle value={combineIntoOne} onChange={setCombineIntoOne} count={props.remainingRoomCount} />}
 
           {err && <div className="text-danger text-sm">{err}</div>}
           <div className="flex justify-end gap-2">
@@ -2205,9 +3232,48 @@ function CheckoutModal(props: {
     <ModalShell title="Check Out & Generate Invoice" onClose={props.onClose}>
       <div className="space-y-3">
         <div className="text-sm">
-          Generating invoice will finalize all charges and close this stay. Balance before final
-          payment: <strong>{inr(props.balance)}</strong>
+          Confirming will generate the final tax invoice for this stay, record the payment, and
+          release every room on this reservation.
         </div>
+
+        <div className="border border-borderc rounded p-3 space-y-1 bg-bg/40">
+          <div className="flex justify-between text-sm">
+            <span className="text-textSecondary">Subtotal (room charges + extras, pre-GST)</span>
+            <span className="font-mono">{inr(props.subtotal)}</span>
+          </div>
+          <div className="flex justify-between text-sm">
+            <span className="text-textSecondary">CGST (Central GST, half of total tax)</span>
+            <span className="font-mono">{inr(cgst)}</span>
+          </div>
+          <div className="flex justify-between text-sm">
+            <span className="text-textSecondary">SGST (State GST, half of total tax)</span>
+            <span className="font-mono">{inr(sgst)}</span>
+          </div>
+          <div className="flex justify-between text-sm">
+            <span className="text-textSecondary">Total GST</span>
+            <span className="font-mono">{inr(props.totalGst)}</span>
+          </div>
+          <div className="flex justify-between text-sm border-t border-borderc pt-2 mt-2">
+            <span className="text-textSecondary">Grand Total (bill for this stay)</span>
+            <span className="font-mono">{inr(props.grandTotal)}</span>
+          </div>
+          <div className="flex justify-between text-sm">
+            <span className="text-textSecondary">Already paid</span>
+            <span className="font-mono">− {inr(props.totalPaid)}</span>
+          </div>
+          <div className="flex justify-between border-t border-borderc pt-2 mt-2">
+            <strong>Balance before final payment</strong>
+            <strong className="font-mono">{inr(props.balance)}</strong>
+          </div>
+        </div>
+
+        {props.remainingRoomCount > 1 && (
+          <InvoiceModeToggle
+            value={combineIntoOne}
+            onChange={setCombineIntoOne}
+            count={props.remainingRoomCount}
+          />
+        )}
 
         {hasPrevious && (
           <div className="rounded-sm border-2 border-danger/40 bg-danger/5 p-3 space-y-2">
@@ -2272,9 +3338,9 @@ function CheckoutModal(props: {
                 setFinalAmount(Number(e.target.value));
                 setUserEdited(true);
               }}
-              disabled={!balanceRemaining && !hasPrevious}
+              disabled={(!balanceRemaining && !hasPrevious) || isWallet}
             />
-            {hasPrevious && collectPrevious && finalAmount > 0.009 && (
+            {hasPrevious && collectPrevious && finalAmount > 0.009 && !isWallet && (
               <div className="text-[11px] text-textSecondary mt-1 leading-tight">
                 Apply: <span className="font-mono">{inr(appliedToCurrent)}</span> to this bill
                 {remainderForPrevious > 0.009 && (
@@ -2300,7 +3366,19 @@ function CheckoutModal(props: {
               <option value="card">Card</option>
               <option value="bank_transfer">Bank Transfer</option>
               <option value="unpaid">Unpaid · Collect later</option>
+              <option value="wallet" disabled={walletBalance <= 0.009 || !balanceRemaining}>
+                Wallet credit · available {inr(walletBalance)}
+              </option>
             </select>
+            {isWallet && (
+              <div className="text-[11px] text-textSecondary mt-1 leading-tight">
+                Redeems from the guest's wallet only. Covers up to{" "}
+                <span className="font-mono">{inr(walletRedeemCap)}</span> of this bill.
+                {hasPrevious && (
+                  <> Previous-balance items aren't collected with this method.</>
+                )}
+              </div>
+            )}
           </div>
         </div>
         {collectingPreviousWithUnpaid && (
@@ -2381,13 +3459,36 @@ function CheckoutModal(props: {
           <button className="btn-secondary" onClick={props.onClose}>Cancel</button>
           <button
             className="btn-primary"
-            onClick={() => act.mutate()}
+            onClick={() => {
+              // Combining ≥2 rooms into one invoice is a one-way action
+              // (you'd need to void + re-issue to undo), so gate it
+              // behind an explicit confirm step.
+              if (combineIntoOne && props.remainingRoomCount > 1) {
+                setPendingCombineConfirm(true);
+                return;
+              }
+              act.mutate();
+            }}
             disabled={act.isPending || submitDisabled}
           >
             {act.isPending ? "Processing…" : "Complete Check-out"}
           </button>
         </div>
       </div>
+      {pendingCombineConfirm && (
+        <CombineConfirmDialog
+          remainingRooms={props.remainingRooms}
+          alreadyInvoicedRooms={props.alreadyInvoicedRooms}
+          collecting={finalAmount}
+          method={method}
+          onCancel={() => setPendingCombineConfirm(false)}
+          onConfirm={() => {
+            setPendingCombineConfirm(false);
+            act.mutate();
+          }}
+          submitting={act.isPending}
+        />
+      )}
     </ModalShell>
   );
 }

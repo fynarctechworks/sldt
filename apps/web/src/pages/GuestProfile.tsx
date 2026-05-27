@@ -1,11 +1,16 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { format } from "date-fns";
-import { Bell, CalendarPlus, CheckCircle2, ExternalLink, FileImage, Pencil, Plus, ShieldCheck, Tag as TagIcon, Trash2, Upload, Wallet, X } from "lucide-react";
+import { BedDouble, Bell, CalendarPlus, CheckCircle2, ExternalLink, FileImage, Pencil, Plus, ShieldCheck, Tag as TagIcon, Trash2, Upload, Wallet, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { useDialog } from "@/components/Dialog";
 import { KycModal } from "@/components/KycModal";
 import { Loader } from "@/components/Loader";
+import { Combobox } from "@/components/Combobox";
+import { EmailInput } from "@/components/EmailInput";
 import { api } from "@/lib/api";
+import { citiesForState } from "@/lib/indianCities";
+import { INDIAN_STATES, INDIAN_UNION_TERRITORIES } from "@/lib/indianStates";
 import { invalidateReservationData } from "@/lib/invalidate";
 import { inr } from "@/lib/utils";
 import { GUEST_TAGS } from "@hoteldesk/shared";
@@ -66,7 +71,30 @@ interface FollowUp {
   completedAt: string | null;
 }
 
-type Tab = "profile" | "notes" | "followups";
+type Tab = "profile" | "stays" | "notes" | "followups";
+
+interface GuestReservation {
+  id: string;
+  reservationNumber: string;
+  status: string;
+  bookingSource: string;
+  stayType: "overnight" | "short_stay";
+  checkInDate: string;
+  checkOutDate: string;
+  numNights: number;
+  grandTotal: string;
+  balanceDue: string;
+  role: "booker" | "occupant";
+  rooms: {
+    id: string;
+    roomNumber: string;
+    roomType: string;
+    soldAsType: string | null;
+    ratePerNight: string;
+    status: string;
+    isThisGuest: boolean;
+  }[];
+}
 
 export default function GuestProfile() {
   const { id } = useParams();
@@ -140,10 +168,14 @@ export default function GuestProfile() {
       </div>
 
       {data.stats && <StatsRow stats={data.stats} />}
+      {data.stats && data.stats.balanceDue > 0.009 && <BalanceBreakdown guestId={data.id} />}
 
       <div className="flex gap-1 border-b border-borderc">
         <TabBtn active={tab === "profile"} onClick={() => setTab("profile")}>
           Profile
+        </TabBtn>
+        <TabBtn active={tab === "stays"} onClick={() => setTab("stays")}>
+          Stays {data.stats && data.stats.totalStays > 0 ? `(${data.stats.totalStays})` : ""}
         </TabBtn>
         <TabBtn active={tab === "notes"} onClick={() => setTab("notes")}>
           Notes
@@ -154,6 +186,7 @@ export default function GuestProfile() {
       </div>
 
       {tab === "profile" && <ProfileTab g={data} />}
+      {tab === "stays" && <StaysTab guestId={data.id} />}
       {tab === "notes" && <NotesTab guestId={data.id} />}
       {tab === "followups" && <FollowUpsTab guestId={data.id} />}
 
@@ -242,12 +275,9 @@ function EditGuestModal({ guest, onClose }: { guest: Guest; onClose: () => void 
               />
             </Field>
             <Field label="Email">
-              <input
-                className="input"
-                type="email"
+              <EmailInput
                 value={form.email}
-                placeholder="guest@example.com"
-                onChange={(e) => set("email", e.target.value)}
+                onChange={(v) => set("email", v)}
               />
             </Field>
             <Field label="Date of Birth">
@@ -277,18 +307,35 @@ function EditGuestModal({ guest, onClose }: { guest: Guest; onClose: () => void 
               />
             </Field>
             <div className="grid grid-cols-2 gap-3">
-              <Field label="City">
-                <input
-                  className="input"
-                  value={form.city}
-                  onChange={(e) => set("city", e.target.value)}
+              <Field label="State">
+                <Combobox
+                  value={form.state}
+                  onChange={(v) =>
+                    setForm((prev) => ({
+                      ...prev,
+                      state: v,
+                      // Clear city when state changes so the dropdown
+                      // doesn't keep a city tied to the previous state.
+                      city: prev.state === v ? prev.city : "",
+                    }))
+                  }
+                  groups={[
+                    { label: "States", options: INDIAN_STATES },
+                    { label: "Union Territories", options: INDIAN_UNION_TERRITORIES },
+                  ]}
+                  placeholder="Type to search or pick from list…"
                 />
               </Field>
-              <Field label="State">
-                <input
-                  className="input"
-                  value={form.state}
-                  onChange={(e) => set("state", e.target.value)}
+              <Field label="City">
+                <Combobox
+                  value={form.city}
+                  onChange={(v) => set("city", v)}
+                  options={citiesForState(form.state)}
+                  placeholder={
+                    form.state
+                      ? `Type to search ${form.state} cities…`
+                      : "Pick a state first, or type any city…"
+                  }
                 />
               </Field>
             </div>
@@ -388,6 +435,105 @@ function StatsRow({ stats }: { stats: GuestStats }) {
         mono
         tone={stats.balanceDue > 0 ? "danger" : "success"}
       />
+    </div>
+  );
+}
+
+interface OutstandingResponse {
+  total: number;
+  count: number;
+  pendingPromiseCount: number;
+  invoices: {
+    invoiceId: string;
+    invoiceNumber: string;
+    reservationId: string;
+    reservationNumber: string;
+    balanceDue: number;
+    issuedAt: string;
+  }[];
+  preInvoiceReservations: {
+    reservationId: string;
+    reservationNumber: string;
+    balanceDue: number;
+    createdAt: string;
+  }[];
+}
+
+function BalanceBreakdown({ guestId }: { guestId: string }) {
+  const navigate = useNavigate();
+  const { data, isLoading } = useQuery({
+    queryKey: ["guest-outstanding", guestId],
+    queryFn: () => api.get<OutstandingResponse>(`/guests/${guestId}/outstanding`),
+    staleTime: 30_000,
+  });
+
+  if (isLoading || !data) return null;
+  if (data.total <= 0.009) return null;
+
+  const items: {
+    key: string;
+    label: string;
+    sub: string;
+    amount: number;
+    href: string;
+  }[] = [
+    ...data.invoices.map((i) => ({
+      key: `inv-${i.invoiceId}`,
+      label: i.invoiceNumber,
+      sub: `Issued ${format(new Date(i.issuedAt), "dd MMM yyyy")} · ${i.reservationNumber}`,
+      amount: i.balanceDue,
+      href: `/reservations/${i.reservationId}`,
+    })),
+    ...data.preInvoiceReservations.map((r) => ({
+      key: `pre-${r.reservationId}`,
+      label: r.reservationNumber,
+      sub: `Advance pending · stay still open since ${format(new Date(r.createdAt), "dd MMM yyyy")}`,
+      amount: r.balanceDue,
+      href: `/reservations/${r.reservationId}`,
+    })),
+  ].sort((a, b) => b.amount - a.amount);
+
+  return (
+    <div className="card border-danger/30">
+      <div className="flex items-center justify-between mb-3 pb-2 border-b border-borderc">
+        <div className="text-[10px] uppercase tracking-[0.18em] text-danger font-bold">
+          Balance due · breakdown
+        </div>
+        <div className="text-xs text-textSecondary">
+          {data.count} unpaid item{data.count === 1 ? "" : "s"}
+          {data.pendingPromiseCount > 0 && (
+            <> · {data.pendingPromiseCount} payment promise{data.pendingPromiseCount === 1 ? "" : "s"} pending</>
+          )}
+        </div>
+      </div>
+
+      <div className="space-y-1.5">
+        {items.map((it) => (
+          <button
+            key={it.key}
+            onClick={() => navigate(it.href)}
+            className="w-full flex items-center justify-between gap-3 py-2 px-2 -mx-2 rounded-sm hover:bg-bg text-left transition-colors"
+          >
+            <div className="min-w-0 flex-1">
+              <div className="font-mono font-semibold text-brand-dark text-sm">{it.label}</div>
+              <div className="text-xs text-textSecondary truncate">{it.sub}</div>
+            </div>
+            <div className="font-mono font-bold text-danger text-sm shrink-0">
+              {inr(it.amount)}
+            </div>
+          </button>
+        ))}
+      </div>
+
+      <div className="flex items-center justify-between mt-2 pt-2 border-t border-borderc text-sm">
+        <strong>Total outstanding</strong>
+        <strong className="font-mono text-danger">{inr(data.total)}</strong>
+      </div>
+
+      <div className="text-[11px] text-textSecondary mt-2 leading-tight">
+        Collect alongside this guest's next check-out — the modal offers a "Collect previous
+        balance" toggle that applies to these items in oldest-first order.
+      </div>
     </div>
   );
 }
@@ -496,6 +642,7 @@ interface KycStatus {
 
 function KycSection({ guestId, idProofType }: { guestId: string; idProofType: string }) {
   const qc = useQueryClient();
+  const dialog = useDialog();
   const [showUpload, setShowUpload] = useState(false);
   const [preview, setPreview] = useState<{ url: string; label: string } | null>(null);
 
@@ -503,6 +650,19 @@ function KycSection({ guestId, idProofType }: { guestId: string; idProofType: st
     queryKey: ["kyc", guestId],
     queryFn: () => api.get<KycStatus>(`/guests/${guestId}/kyc`),
   });
+
+  async function removeFile(field: "photo" | "front" | "back", label: string) {
+    const ok = await dialog.confirm({
+      title: `Remove ${label}?`,
+      message: "This will permanently delete the uploaded file. You can re-upload a new one anytime.",
+      okLabel: "Remove",
+      cancelLabel: "Keep",
+    });
+    if (!ok) return;
+    await api.del(`/guests/${guestId}/kyc/${field}`);
+    qc.invalidateQueries({ queryKey: ["kyc", guestId] });
+    qc.invalidateQueries({ queryKey: ["guest", guestId] });
+  }
 
   const proofLabel = idProofType.replace("_", " ");
 
@@ -549,6 +709,7 @@ function KycSection({ guestId, idProofType }: { guestId: string; idProofType: st
               data.photoUrl && setPreview({ url: data.photoUrl, label: "Customer Photo" })
             }
             onReplace={() => setShowUpload(true)}
+            onRemove={() => removeFile("photo", "Customer Photo")}
           />
           <KycThumb
             label={`${proofLabel} · Front`}
@@ -558,6 +719,7 @@ function KycSection({ guestId, idProofType }: { guestId: string; idProofType: st
               setPreview({ url: data.frontUrl, label: `${proofLabel} · Front` })
             }
             onReplace={() => setShowUpload(true)}
+            onRemove={() => removeFile("front", `${proofLabel} · Front`)}
           />
           <KycThumb
             label={`${proofLabel} · Back`}
@@ -566,6 +728,7 @@ function KycSection({ guestId, idProofType }: { guestId: string; idProofType: st
               data.backUrl && setPreview({ url: data.backUrl, label: `${proofLabel} · Back` })
             }
             onReplace={() => setShowUpload(true)}
+            onRemove={() => removeFile("back", `${proofLabel} · Back`)}
           />
         </div>
       )}
@@ -604,11 +767,13 @@ function KycThumb({
   url,
   onPreview,
   onReplace,
+  onRemove,
 }: {
   label: string;
   url: string | null;
   onPreview: () => void;
   onReplace: () => void;
+  onRemove?: () => void;
 }) {
   if (!url) {
     return (
@@ -639,16 +804,30 @@ function KycThumb({
           {label}
         </div>
       </button>
-      <button
-        onClick={(e) => {
-          e.stopPropagation();
-          onReplace();
-        }}
-        className="absolute top-1.5 right-1.5 inline-flex items-center gap-1 text-[10px] font-semibold px-2 h-6 rounded-sm bg-brand-dark/90 text-cream backdrop-blur-sm hover:bg-brand-dark opacity-0 group-hover:opacity-100 transition-opacity"
-        title="Replace this document"
-      >
-        <Pencil className="w-3 h-3" /> Edit
-      </button>
+      <div className="absolute top-1.5 right-1.5 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+        {onRemove && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onRemove();
+            }}
+            className="inline-flex items-center justify-center w-6 h-6 rounded-sm bg-danger/90 text-white backdrop-blur-sm hover:bg-danger"
+            title="Remove this document"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        )}
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onReplace();
+          }}
+          className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 h-6 rounded-sm bg-brand-dark/90 text-cream backdrop-blur-sm hover:bg-brand-dark"
+          title="Replace this document"
+        >
+          <Pencil className="w-3 h-3" /> Edit
+        </button>
+      </div>
     </div>
   );
 }
@@ -1014,6 +1193,132 @@ function TagsEditor({ guestId, tags }: { guestId: string; tags: string[] }) {
         </button>
       </div>
     </div>
+  );
+}
+
+function StaysTab({ guestId }: { guestId: string }) {
+  const navigate = useNavigate();
+  const { data, isLoading } = useQuery({
+    queryKey: ["guest-reservations", guestId],
+    queryFn: () => api.get<GuestReservation[]>(`/guests/${guestId}/reservations`),
+  });
+
+  if (isLoading) return <Loader />;
+  if (!data || data.length === 0) {
+    return (
+      <div className="card text-textSecondary text-sm flex items-center gap-3 py-6">
+        <BedDouble className="w-8 h-8 opacity-40 shrink-0" />
+        <div>
+          <div className="font-medium text-textPrimary">No bookings yet</div>
+          <div className="text-xs mt-0.5">
+            Reservations this guest is on will appear here once they're created.
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      {data.map((r) => (
+        <StayCard key={r.id} r={r} onOpen={() => navigate(`/reservations/${r.id}`)} />
+      ))}
+    </div>
+  );
+}
+
+function StayCard({ r, onOpen }: { r: GuestReservation; onOpen: () => void }) {
+  const statusTone =
+    r.status === "checked_in"
+      ? "bg-success/10 text-success"
+      : r.status === "checked_out"
+        ? "bg-textSecondary/15 text-textSecondary"
+        : r.status === "cancelled" || r.status === "no_show"
+          ? "bg-danger/10 text-danger"
+          : "bg-brand/10 text-brand-dark";
+  const balance = Number(r.balanceDue);
+
+  return (
+    <button
+      onClick={onOpen}
+      className="card w-full text-left hover:border-brand-dark transition-colors"
+    >
+      <div className="flex items-center justify-between gap-3 mb-3 pb-2 border-b border-borderc">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="font-mono font-bold text-brand-dark">{r.reservationNumber}</span>
+          <span
+            className={`text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded-sm ${statusTone}`}
+          >
+            {r.status.replace("_", " ")}
+          </span>
+          {r.bookingSource === "complimentary" && (
+            <span className="text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded-sm bg-brass/10 text-brass">
+              Complimentary
+            </span>
+          )}
+          {r.role === "occupant" && (
+            <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-sm bg-bg text-textSecondary">
+              Stayed in room
+            </span>
+          )}
+        </div>
+        <ExternalLink className="w-4 h-4 text-textSecondary shrink-0" />
+      </div>
+
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm">
+        <div>
+          <div className="label">Check-in</div>
+          <div className="font-medium text-textPrimary mt-0.5">
+            {format(new Date(r.checkInDate), "dd MMM yyyy")}
+          </div>
+        </div>
+        <div>
+          <div className="label">Check-out</div>
+          <div className="font-medium text-textPrimary mt-0.5">
+            {format(new Date(r.checkOutDate), "dd MMM yyyy")}
+          </div>
+        </div>
+        <div>
+          <div className="label">{r.stayType === "short_stay" ? "Duration" : "Nights"}</div>
+          <div className="font-medium text-textPrimary mt-0.5">
+            {r.stayType === "short_stay" ? "Day use" : `${r.numNights} night${r.numNights === 1 ? "" : "s"}`}
+          </div>
+        </div>
+        <div>
+          <div className="label">Total · balance</div>
+          <div className="font-mono font-medium text-textPrimary mt-0.5">
+            {inr(Number(r.grandTotal))}{" "}
+            {balance > 0.009 ? (
+              <span className="text-danger">· {inr(balance)} due</span>
+            ) : (
+              <span className="text-success">· paid</span>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-3 pt-3 border-t border-borderc">
+        <div className="label mb-1.5">Rooms</div>
+        <div className="flex flex-wrap gap-2">
+          {r.rooms.map((rm) => (
+            <span
+              key={rm.id}
+              className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-sm text-xs border ${
+                rm.isThisGuest
+                  ? "border-brand-dark bg-brand-soft text-brand-dark font-semibold"
+                  : "border-borderc bg-bg text-textSecondary"
+              }`}
+              title={rm.isThisGuest ? "This guest stayed here" : "Another occupant"}
+            >
+              <BedDouble className="w-3 h-3" />
+              <span className="font-mono">{rm.roomNumber}</span>
+              <span className="capitalize">· {(rm.soldAsType ?? rm.roomType).replace(/_/g, " ")}</span>
+              <span className="font-mono text-textSecondary">· ₹{Number(rm.ratePerNight).toFixed(0)}/n</span>
+            </span>
+          ))}
+        </div>
+      </div>
+    </button>
   );
 }
 

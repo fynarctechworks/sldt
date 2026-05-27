@@ -12,6 +12,7 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { addDays, format } from "date-fns";
 import { Check, Hotel, ShieldCheck } from "lucide-react";
+import { EmailInput } from "@/components/EmailInput";
 import { useState } from "react";
 import { useParams } from "react-router-dom";
 
@@ -297,12 +298,10 @@ export default function PublicBookingPage() {
                 inputMode="numeric"
                 maxLength={10}
               />
-              <input
-                type="email"
+              <EmailInput
                 value={email}
-                onChange={(e) => setEmail(e.target.value)}
+                onChange={setEmail}
                 placeholder="Email (optional)"
-                className="input"
               />
             </div>
 

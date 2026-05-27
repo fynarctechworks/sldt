@@ -107,6 +107,23 @@ export const reservations = pgTable(
   }),
 );
 
+// Per-room state lives here. Each row carries its own occupant guest,
+// status, and check-in/check-out timestamps so a multi-room reservation
+// can have rooms in different states (e.g. 202 checked-out, 203 still
+// checked-in). The PARENT reservation's status is a roll-up: it
+// becomes 'checked_out' only when every non-cancelled room has
+// checked out.
+//
+// Per-room status enum is a subset of the reservation enum (no
+// inquiry/hold/pending_payment); inherits from parent at create time.
+export const RESERVATION_ROOM_STATUSES = [
+  "confirmed",
+  "checked_in",
+  "checked_out",
+  "cancelled",
+] as const;
+export type ReservationRoomStatus = (typeof RESERVATION_ROOM_STATUSES)[number];
+
 export const reservationRooms = pgTable("reservation_rooms", {
   id: uuid("id").primaryKey().defaultRandom(),
   reservationId: uuid("reservation_id")
@@ -117,6 +134,20 @@ export const reservationRooms = pgTable("reservation_rooms", {
     .references(() => rooms.id),
   ratePerNight: numeric("rate_per_night", { precision: 10, scale: 2 }).notNull(),
   soldAsType: text("sold_as_type"),
+  // Migration 0017 — per-room state.
+  guestId: uuid("guest_id")
+    .notNull()
+    .references(() => guests.id),
+  status: text("status", { enum: RESERVATION_ROOM_STATUSES })
+    .notNull()
+    .default("confirmed"),
+  checkedInAt: timestamp("checked_in_at", { withTimezone: true }),
+  checkedInBy: uuid("checked_in_by").references(() => profiles.id),
+  checkedOutAt: timestamp("checked_out_at", { withTimezone: true }),
+  checkedOutBy: uuid("checked_out_by").references(() => profiles.id),
+  // The per-room invoice, once issued. NULL while still chargeable to
+  // the combined / pending invoice.
+  invoiceId: uuid("invoice_id"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
