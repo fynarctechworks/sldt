@@ -58,8 +58,11 @@ export default function Login() {
   // still owes a second factor (mfaPending) must stay here for the
   // challenge step.
   if (session && !mfaPending) {
+    // After a successful login, land on /dashboard by default. If the
+    // user was bounced to /login from a protected route (e.g. their
+    // session expired mid-navigation), send them back to that route.
     const from =
-      (location.state as { from?: { pathname: string } } | null)?.from?.pathname ?? "/";
+      (location.state as { from?: { pathname: string } } | null)?.from?.pathname ?? "/dashboard";
     return <Navigate to={from} replace />;
   }
 
