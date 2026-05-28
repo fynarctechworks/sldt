@@ -599,8 +599,14 @@ export default function ReservationDetail() {
                 reservationId={r.id}
                 room={room}
                 nights={nights}
-
                 onSaved={invalidate}
+                onInvoiceIssuedNeedsPayment={(inv) =>
+                  setPostIssuePay({
+                    invoiceId: inv.id,
+                    invoiceNumber: inv.invoiceNumber,
+                    balanceDue: inv.balanceDue,
+                  })
+                }
               />
             ))}
           </tbody>
@@ -1140,7 +1146,16 @@ function RoomRow(props: {
   };
   nights: number;
   onSaved: () => void;
+  // Called when a per-room invoice was just issued AND it still has a
+  // balance to collect. The parent uses this to surface the Record
+  // Payment modal (same flow as the combined-invoice issue path).
+  onInvoiceIssuedNeedsPayment?: (inv: {
+    id: string;
+    invoiceNumber: string;
+    balanceDue: number;
+  }) => void;
 }) {
+  const dialog = useDialog();
   const rate = Number(props.room.ratePerNight);
   const [perRoomBusy, setPerRoomBusy] = useState<null | "checkout" | "invoice">(null);
   const [perRoomError, setPerRoomError] = useState<string | null>(null);
@@ -1149,7 +1164,13 @@ function RoomRow(props: {
   // Per-room invoice. The API uses migration 0017's invoices.scope='room'.
   const issueRoomInvoice = useMutation({
     mutationFn: () =>
-      api.post(`/reservations/${props.reservationId}/invoice`, {
+      api.post<{
+        id: string;
+        invoiceNumber: string;
+        grandTotal: string;
+        balanceDue: string;
+        status: string;
+      }>(`/reservations/${props.reservationId}/invoice`, {
         scope: "room",
         roomId: props.room.id,
       }),
@@ -1157,10 +1178,38 @@ function RoomRow(props: {
       setPerRoomBusy("invoice");
       setPerRoomError(null);
     },
-    onSuccess: () => props.onSaved(),
+    onSuccess: (inv) => {
+      props.onSaved();
+      const owed = Number(inv.balanceDue);
+      if (owed > 0.009 && props.onInvoiceIssuedNeedsPayment) {
+        props.onInvoiceIssuedNeedsPayment({
+          id: inv.id,
+          invoiceNumber: inv.invoiceNumber,
+          balanceDue: owed,
+        });
+      }
+    },
     onError: (e: Error) => setPerRoomError(e.message),
     onSettled: () => setPerRoomBusy(null),
   });
+
+  // Two-step confirmation before issuing a per-room invoice. Once issued,
+  // editing the bill means voiding + re-issuing — a destructive workflow —
+  // so we make staff explicitly confirm to avoid accidental clicks.
+  async function confirmAndIssueInvoice() {
+    const lineTotal = rate * Math.max(1, props.nights);
+    const ok = await dialog.confirm({
+      title: `Issue invoice for Room ${props.room.roomNumber}?`,
+      message: `A separate tax invoice will be generated for this room (${
+        props.room.displayType ?? props.room.roomType.replace(/_/g, " ")
+      } · ₹${rate.toFixed(0)}/night × ${props.nights} night${
+        props.nights === 1 ? "" : "s"
+      } ≈ ₹${lineTotal.toFixed(2)} + GST). This action issues the invoice immediately — to change anything later you'll need to void & re-issue.`,
+      okLabel: "Issue invoice",
+      cancelLabel: "Cancel",
+    });
+    if (ok) issueRoomInvoice.mutate();
+  }
 
   // Per-room status pill colours. Maps the new reservation-room
   // statuses to badge styles (different from physical room status).
@@ -1304,7 +1353,7 @@ function RoomRow(props: {
               <button
                 className="btn-primary !h-7 !px-2 text-xs"
                 disabled={perRoomBusy !== null}
-                onClick={() => issueRoomInvoice.mutate()}
+                onClick={confirmAndIssueInvoice}
                 title="Generate a separate invoice for this room"
               >
                 {perRoomBusy === "invoice" ? "…" : "Issue Invoice"}
