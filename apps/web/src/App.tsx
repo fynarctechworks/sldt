@@ -49,8 +49,22 @@ export default function App() {
             URL can land here; the API enforces "is enabled". */}
         <Route path="/book/:propertyCode" element={<PublicBooking />} />
 
+        {/* Dashboard is mounted at both / and /dashboard so the URL is
+            explicit when staff types or bookmarks the dashboard. Both
+            paths render the same component — no redirect, no
+            additional fetch cost. */}
         <Route
           path="/"
+          element={
+            <ProtectedRoute>
+              <AppShell>
+                <Dashboard />
+              </AppShell>
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/dashboard"
           element={
             <ProtectedRoute>
               <AppShell>

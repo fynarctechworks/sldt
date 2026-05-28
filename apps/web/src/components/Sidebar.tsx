@@ -42,7 +42,7 @@ interface NavItem {
 
 // Each item declares the permission key required. Admin (god mode) sees everything.
 const NAV: NavItem[] = [
-  { to: "/", label: "Dashboard", icon: LayoutDashboard, permission: "view_dashboard" },
+  { to: "/dashboard", label: "Dashboard", icon: LayoutDashboard, permission: "view_dashboard" },
   { to: "/rooms", label: "Rooms", icon: DoorOpen, permission: "view_rooms" },
   { to: "/calendar", label: "Calendar", icon: CalendarDays, permission: "view_reservations" },
   { to: "/reservations", label: "Reservations", icon: CalendarCheck, permission: "view_reservations" },
@@ -190,17 +190,22 @@ export function Sidebar({
             <NavLink
               key={item.to}
               to={item.to}
-              end={item.to === "/"}
+              end={item.to === "/dashboard"}
               title={collapsed ? item.label : undefined}
-              className={({ isActive }) =>
-                cn(
+              className={({ isActive }) => {
+                // Dashboard lives at both / and /dashboard — highlight
+                // the Dashboard nav item for either URL.
+                const onRootDashboard =
+                  item.to === "/dashboard" && window.location.pathname === "/";
+                const active = isActive || onRootDashboard;
+                return cn(
                   "flex items-center gap-3 py-2.5 text-sm transition-colors",
                   collapsed ? "px-0 justify-center" : "px-5",
-                  isActive
+                  active
                     ? "bg-brand-mid/30 text-cream border-l-2 border-brass"
                     : "text-cream/70 hover:bg-cream/5 hover:text-cream border-l-2 border-transparent",
-                )
-              }
+                );
+              }}
             >
               <Icon className="w-4 h-4 shrink-0" />
               {!collapsed && <span className="flex-1">{item.label}</span>}
