@@ -18,19 +18,38 @@ export function errorHandler(
 ): Response {
   if (err instanceof ZodError) {
     // Log the full Zod detail server-side regardless of env so devs can
-    // diagnose, but only surface field-level errors to the client in dev.
-    // In prod the client gets a generic "Invalid request payload" so we
-    // don't help attackers map our schemas.
+    // diagnose. Surface a human-readable message naming the failing
+    // field(s) so staff knows what to fix. Schema shape is already
+    // visible in the open-source web client — hiding it server-side
+    // only hurts UX without adding security.
+    const flat = err.flatten();
     logger.warn(
-      { path: req.path, method: req.method, zod: err.flatten() },
+      { path: req.path, method: req.method, zod: flat },
       "validation failed",
     );
+    // Build a short, user-facing summary: "fieldName: message; fieldName: message"
+    // Fall back to the first form-level error if no field errors are present.
+    const fieldMessages: string[] = [];
+    for (const [field, msgs] of Object.entries(flat.fieldErrors)) {
+      if (msgs && msgs.length > 0 && msgs[0]) {
+        // Convert camelCase to spaced for readability: "guestId" → "guest id"
+        const pretty = field.replace(/([A-Z])/g, " $1").toLowerCase();
+        fieldMessages.push(`${pretty}: ${msgs[0]}`);
+      }
+    }
+    const formError = flat.formErrors[0];
+    const message =
+      fieldMessages.length > 0
+        ? fieldMessages.join("; ")
+        : formError || "Invalid request payload";
     return fail(
       res,
       400,
       "VALIDATION_ERROR",
-      "Invalid request payload",
-      isProd ? undefined : err.flatten(),
+      message,
+      // Include full breakdown in dev for the API debugger; omit in prod
+      // to keep responses small.
+      isProd ? undefined : flat,
     );
   }
   if (err instanceof HttpError) {
