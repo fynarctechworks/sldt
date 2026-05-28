@@ -22,11 +22,6 @@ import { db } from "../db/client.js";
 import { additionalCharges, invoiceLineItems, invoices, payments } from "../db/schema/invoices.js";
 import { reservationRooms, reservations } from "../db/schema/reservations.js";
 import { rooms } from "../db/schema/rooms.js";
-import {
-  DEFAULT_TASK_STEPS,
-  housekeepingTaskSteps,
-  housekeepingTasks,
-} from "../db/schema/housekeepingTasks.js";
 import { roomTypes } from "../db/schema/settings.js";
 import { combinedRoomTypeLabel, type RoomTypeLabelMap } from "../lib/roomTypeLabel.js";
 import { logActivity } from "../lib/activity.js";
@@ -40,12 +35,9 @@ import {
 } from "../lib/availability.js";
 import { getGuestBalance } from "../lib/ledger.js";
 import { resolveCurrentPropertyId } from "../lib/currentProperty.js";
-import { resolveAverageRate } from "../lib/ratePlanResolve.js";
 import { calcGstBreakdown, getGstRate } from "../lib/gst.js";
 import { buildInvoice, selectChargesForScope } from "../lib/invoiceBuilder.js";
 import { PAYMENT_METHODS } from "../db/schema/enums.js";
-import { ratePlans } from "../db/schema/ratePlans.js";
-import { companies } from "../db/schema/companies.js";
 import { invoiceNumber, reservationNumber } from "../lib/numbers.js";
 import { hashOtp } from "../lib/otp.js";
 import { renderInvoicePdf, renderReceiptPdf } from "../lib/pdf.js";
@@ -405,72 +397,6 @@ router.post(
       }
     }
 
-    // Phase 2: if the caller supplied a ratePlanId, look up its code
-    // (snapshotted onto the reservation) and recompute each room's
-    // per-night rate from the rate calendar. Overnight stays only —
-    // day-use carries its own flat-price band system and is not
-    // touched. Short-stay's input rate is left as the source of truth.
-    let ratePlanCode: string | null = null;
-    if (input.ratePlanId && !isShortStay) {
-      const [plan] = await db
-        .select({ code: ratePlans.code, propertyId: ratePlans.propertyId, isActive: ratePlans.isActive })
-        .from(ratePlans)
-        .where(eq(ratePlans.id, input.ratePlanId))
-        .limit(1);
-      if (!plan) {
-        return fail(res, 404, "RATE_PLAN_NOT_FOUND", "Rate plan not found");
-      }
-      if (!plan.isActive) {
-        return fail(res, 409, "RATE_PLAN_INACTIVE", "Rate plan is inactive");
-      }
-      if (plan.propertyId !== propertyId) {
-        return fail(res, 403, "CROSS_PROPERTY", "Rate plan belongs to a different property");
-      }
-      ratePlanCode = plan.code;
-      // Override each room's ratePerNight in-place via the resolver.
-      // resolveAverageRate handles the "stay straddles a weekend
-      // surcharge" case correctly by averaging across nights, AND
-      // applies Phase 3 pricing rules on top (occupancy, LOS, etc.).
-      for (const r of input.rooms) {
-        const [roomRow] = await db
-          .select({ roomType: rooms.roomType })
-          .from(rooms)
-          .where(eq(rooms.id, r.roomId))
-          .limit(1);
-        if (!roomRow) continue;
-        const avg = await resolveAverageRate({
-          propertyId,
-          ratePlanId: input.ratePlanId,
-          roomId: r.roomId,
-          roomType: roomRow.roomType,
-          checkInDate: input.checkInDate,
-          checkOutDate: input.checkOutDate,
-        });
-        r.ratePerNight = avg;
-      }
-    }
-
-    // Phase 2: optional company snapshot. Same property scoping check
-    // as the rate plan above.
-    let companyCode: string | null = null;
-    if (input.companyId) {
-      const [cmp] = await db
-        .select({
-          code: companies.code,
-          propertyId: companies.propertyId,
-          isActive: companies.isActive,
-        })
-        .from(companies)
-        .where(eq(companies.id, input.companyId))
-        .limit(1);
-      if (!cmp) return fail(res, 404, "COMPANY_NOT_FOUND", "Company not found");
-      if (!cmp.isActive) return fail(res, 409, "COMPANY_ARCHIVED", "Company is archived");
-      if (cmp.propertyId !== propertyId) {
-        return fail(res, 403, "CROSS_PROPERTY", "Company belongs to a different property");
-      }
-      companyCode = cmp.code;
-    }
-
     // The user-typed rate is the grand-total amount per room when the
     // property is in 'inclusive' mode (GST already baked in) and the net
     // amount per room when in 'exclusive' mode (GST added on top).
@@ -602,12 +528,6 @@ router.post(
             bookingSource: input.bookingSource ?? "walkin",
             creditNotes: input.creditNotes ?? null,
             specialRequests: composedSpecial,
-            // Phase 2 — rate plan / company / group attribution.
-            ratePlanId: input.ratePlanId ?? null,
-            ratePlanCode,
-            companyId: input.companyId ?? null,
-            companyCode,
-            groupBlockId: input.groupBlockId ?? null,
             createdBy: req.user!.id,
           })
           .returning();
@@ -1606,31 +1526,6 @@ async function handlePerRoomCheckout(args: {
       .update(rooms)
       .set({ status: "dirty", updatedAt: new Date() })
       .where(inArray(rooms.id, checkoutRoomIds));
-
-    // Housekeeping task per vacated room (matches the combined path).
-    for (const roomId of checkoutRoomIds) {
-      const [hkTask] = await tx
-        .insert(housekeepingTasks)
-        .values({
-          propertyId: r.propertyId,
-          roomId,
-          reservationId: id,
-          taskType: "checkout_clean",
-          status: "pending",
-          priority: 70,
-          createdBy: req.user!.id,
-        })
-        .returning({ id: housekeepingTasks.id });
-      if (hkTask) {
-        await tx.insert(housekeepingTaskSteps).values(
-          DEFAULT_TASK_STEPS.checkout_clean.map((label, idx) => ({
-            taskId: hkTask.id,
-            label,
-            sortOrder: (idx + 1) * 10,
-          })),
-        );
-      }
-    }
   });
 
   // Fire-and-forget post-checkout work — PDFs per invoice, owner +
@@ -2066,34 +1961,6 @@ router.post(
             inArray(reservationRooms.status, ["confirmed", "checked_in"] as const),
           ),
         );
-
-      // Phase 2: auto-create a checkout-clean housekeeping task per
-      // vacated room with the default checklist. Inside the same tx so
-      // the task only exists if checkout actually committed. Idempotent
-      // per (reservation, room) — a re-run won't duplicate.
-      for (const roomId of checkoutRoomIds) {
-        const [hkTask] = await tx
-          .insert(housekeepingTasks)
-          .values({
-            propertyId: r[0]!.propertyId,
-            roomId,
-            reservationId: id,
-            taskType: "checkout_clean",
-            status: "pending",
-            priority: 70,
-            createdBy: req.user!.id,
-          })
-          .returning({ id: housekeepingTasks.id });
-        if (hkTask) {
-          await tx.insert(housekeepingTaskSteps).values(
-            DEFAULT_TASK_STEPS.checkout_clean.map((label, i) => ({
-              taskId: hkTask.id,
-              label,
-              sortOrder: (i + 1) * 10,
-            })),
-          );
-        }
-      }
 
       return inv!;
     });
@@ -4001,30 +3868,7 @@ router.post(
         .set({ status: "dirty", updatedAt: now })
         .where(eq(rooms.id, roomId));
 
-      // 5. Auto-create the checkout-clean HK task.
-      const [hkTask] = await tx
-        .insert(housekeepingTasks)
-        .values({
-          propertyId: resv.propertyId,
-          roomId,
-          reservationId: id,
-          taskType: "checkout_clean",
-          status: "pending",
-          priority: 70,
-          createdBy: req.user!.id,
-        })
-        .returning({ id: housekeepingTasks.id });
-      if (hkTask) {
-        await tx.insert(housekeepingTaskSteps).values(
-          DEFAULT_TASK_STEPS.checkout_clean.map((label, i) => ({
-            taskId: hkTask.id,
-            label,
-            sortOrder: (i + 1) * 10,
-          })),
-        );
-      }
-
-      // 6. Roll up the parent reservation. If every non-cancelled
+      // 5. Roll up the parent reservation. If every non-cancelled
       //    room is now checked_out, flip the reservation to
       //    checked_out and accumulate the per-room invoice totals
       //    into the reservation's balance_due.

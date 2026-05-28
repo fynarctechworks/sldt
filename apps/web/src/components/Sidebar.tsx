@@ -4,28 +4,18 @@ import {
   BadgeIndianRupee,
   BarChart3,
   Bell,
-  Briefcase,
   CalendarCheck,
   CalendarDays,
   ChevronLeft,
   ChevronRight,
-  ClipboardList,
   DoorOpen,
-  Globe,
-  ListChecks,
-  ScrollText,
-  ShieldCheck,
-  TrendingUp,
   LayoutDashboard,
   LogOut,
   MessageSquare,
   Settings,
   Sparkles,
-  Tags,
   Users,
-  UsersRound,
   Wallet,
-  Wrench,
 } from "lucide-react";
 import { NavLink } from "react-router-dom";
 import { useAuth } from "@/auth/AuthContext";
@@ -48,26 +38,12 @@ const NAV: NavItem[] = [
   { to: "/reservations", label: "Reservations", icon: CalendarCheck, permission: "view_reservations" },
   { to: "/guests", label: "Guests", icon: Users, permission: "view_guests" },
   { to: "/housekeeping", label: "Housekeeping", icon: Sparkles, permission: "view_housekeeping" },
-  { to: "/housekeeping-tasks", label: "HK Tasks", icon: ClipboardList, permission: "view_housekeeping_tasks" },
-  { to: "/maintenance", label: "Maintenance", icon: Wrench, permission: "view_maintenance" },
-  { to: "/rate-plans", label: "Rate Plans", icon: Tags, permission: "view_rate_plans" },
-  { to: "/pricing-rules", label: "Pricing Rules", icon: TrendingUp, permission: "view_pricing_rules" },
-  { to: "/companies", label: "Companies", icon: Briefcase, permission: "view_companies" },
-  { to: "/group-bookings", label: "Groups", icon: UsersRound, permission: "view_groups" },
-  { to: "/booking-engine", label: "Booking Engine", icon: Globe, permission: "configure_booking_engine" },
   { to: "/messages", label: "Messages", icon: MessageSquare, permission: "view_messages" },
-  // Both pages surface aggregate financial totals — gate behind
-  // `view_revenue` so only admin (god-mode) and explicitly-granted roles
-  // see them in the nav. `view_collections` still controls collection
-  // workflows elsewhere (per-payment record etc.).
   { to: "/collections", label: "Collections", icon: Wallet, permission: "view_revenue" },
   { to: "/credits", label: "Credits", icon: BadgeIndianRupee, permission: "view_revenue" },
   { to: "/notifications", label: "Notifications", icon: Bell, permission: "view_notifications" },
   { to: "/activity", label: "Activity", icon: Activity, permission: "view_activity" },
   { to: "/reports", label: "Reports", icon: BarChart3, permission: "view_reports" },
-  { to: "/operations", label: "Operations", icon: ListChecks, permission: "view_reports" },
-  { to: "/gst-returns", label: "GST Returns", icon: ScrollText, permission: "export_gstr" },
-  { to: "/dpdp", label: "DPDP", icon: ShieldCheck, permission: "view_dpdp" },
   { to: "/settings", label: "Settings", icon: Settings, permission: "manage_settings" },
 ];
 

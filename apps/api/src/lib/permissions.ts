@@ -77,49 +77,6 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   { key: "manage_roles", area: "Admin", label: "Manage roles & permissions" },
   { key: "manage_settings", area: "Admin", label: "Manage hotel settings" },
   { key: "manage_templates", area: "Admin", label: "Manage message templates" },
-
-  // Phase 2 — Rate plans
-  { key: "view_rate_plans",   area: "Rates", label: "View rate plans & calendar",
-    description: "See pricing strategies and the rate calendar." },
-  { key: "manage_rate_plans", area: "Rates", label: "Manage rate plans & calendar",
-    description: "Create/edit rate plans, edit per-day prices, define seasons." },
-
-  // Phase 2 — Housekeeping tasks (separate from the simple room status)
-  { key: "view_housekeeping_tasks",     area: "Housekeeping", label: "View housekeeping tasks" },
-  { key: "assign_housekeeping_tasks",   area: "Housekeeping", label: "Assign housekeeping tasks" },
-  { key: "complete_housekeeping_tasks", area: "Housekeeping", label: "Complete housekeeping tasks",
-    description: "Tick off task steps and mark tasks done." },
-
-  // Phase 2 — Maintenance tickets
-  { key: "view_maintenance",   area: "Maintenance", label: "View maintenance tickets" },
-  { key: "create_maintenance", area: "Maintenance", label: "Create maintenance tickets" },
-  { key: "edit_maintenance",   area: "Maintenance", label: "Edit maintenance tickets" },
-  { key: "close_maintenance",  area: "Maintenance", label: "Close maintenance tickets" },
-
-  // Phase 2 — Revenue & Operations
-  { key: "view_companies",   area: "Companies",  label: "View companies" },
-  { key: "manage_companies", area: "Companies",  label: "Manage companies",
-    description: "Create / edit / archive corporate accounts and credit policies." },
-  { key: "view_groups",      area: "Groups",     label: "View group bookings" },
-  { key: "manage_groups",    area: "Groups",     label: "Manage group bookings",
-    description: "Create / edit / cancel group blocks; build rooming lists." },
-  { key: "split_folios",     area: "Billing",    label: "Split folios on a reservation",
-    description: "Create extra folios, move charges, settle per payer." },
-  { key: "run_night_audit",  area: "Operations", label: "Run night audit" },
-  { key: "view_night_audit", area: "Operations", label: "View night audit runs" },
-
-  // Phase 3 — Booking Engine + Pricing Rules
-  { key: "view_pricing_rules",       area: "Rates",       label: "View pricing rules" },
-  { key: "manage_pricing_rules",     area: "Rates",       label: "Manage pricing rules",
-    description: "Create / edit / archive dynamic pricing rules." },
-  { key: "configure_booking_engine", area: "Bookings",    label: "Configure public booking engine" },
-  { key: "review_pending_bookings",  area: "Bookings",    label: "Review inbound public bookings" },
-
-  // Phase 4 — Compliance
-  { key: "view_dpdp",     area: "Compliance", label: "View DPDP requests log" },
-  { key: "process_dpdp",  area: "Compliance", label: "Process DPDP requests",
-    description: "Fulfil data-export and data-deletion requests on behalf of guests." },
-  { key: "export_gstr",   area: "Compliance", label: "Export GSTR returns" },
 ];
 
 export const PERMISSION_KEYS = PERMISSION_CATALOG.map((p) => p.key);

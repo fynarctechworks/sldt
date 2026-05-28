@@ -16,18 +16,6 @@ const ReservationDetail = lazy(() => import("@/pages/ReservationDetail"));
 const Guests = lazy(() => import("@/pages/Guests"));
 const GuestProfile = lazy(() => import("@/pages/GuestProfile"));
 const Housekeeping = lazy(() => import("@/pages/Housekeeping"));
-const HousekeepingTasks = lazy(() => import("@/pages/HousekeepingTasks"));
-const Maintenance = lazy(() => import("@/pages/Maintenance"));
-const RatePlans = lazy(() => import("@/pages/RatePlans"));
-const Companies = lazy(() => import("@/pages/Companies"));
-const GroupBookings = lazy(() => import("@/pages/GroupBookings"));
-const ReservationFolios = lazy(() => import("@/pages/ReservationFolios"));
-const Operations = lazy(() => import("@/pages/Operations"));
-const PricingRules = lazy(() => import("@/pages/PricingRules"));
-const BookingEngineSettings = lazy(() => import("@/pages/BookingEngineSettings"));
-const DpdpRequests = lazy(() => import("@/pages/DpdpRequests"));
-const GstReturns = lazy(() => import("@/pages/GstReturns"));
-const PublicBooking = lazy(() => import("@/pages/PublicBooking"));
 const Activity = lazy(() => import("@/pages/Activity"));
 const Reports = lazy(() => import("@/pages/Reports"));
 const Settings = lazy(() => import("@/pages/Settings"));
@@ -45,9 +33,6 @@ export default function App() {
             arrives from the recovery email link with a token in the URL
             hash. No AppShell. */}
         <Route path="/reset-password" element={<ResetPassword />} />
-        {/* Public booking widget. No auth, no AppShell. Anyone with the
-            URL can land here; the API enforces "is enabled". */}
-        <Route path="/book/:propertyCode" element={<PublicBooking />} />
 
         {/* Dashboard is mounted at both / and /dashboard so the URL is
             explicit when staff types or bookmarks the dashboard. Both
@@ -180,138 +165,6 @@ export default function App() {
               <AppShell>
                 <PermissionGuard any={["view_housekeeping"]}>
                   <Housekeeping />
-                </PermissionGuard>
-              </AppShell>
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/housekeeping-tasks"
-          element={
-            <ProtectedRoute>
-              <AppShell>
-                <PermissionGuard any={["view_housekeeping_tasks"]}>
-                  <HousekeepingTasks />
-                </PermissionGuard>
-              </AppShell>
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/maintenance"
-          element={
-            <ProtectedRoute>
-              <AppShell>
-                <PermissionGuard any={["view_maintenance"]}>
-                  <Maintenance />
-                </PermissionGuard>
-              </AppShell>
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/companies"
-          element={
-            <ProtectedRoute>
-              <AppShell>
-                <PermissionGuard any={["view_companies"]}>
-                  <Companies />
-                </PermissionGuard>
-              </AppShell>
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/group-bookings"
-          element={
-            <ProtectedRoute>
-              <AppShell>
-                <PermissionGuard any={["view_groups"]}>
-                  <GroupBookings />
-                </PermissionGuard>
-              </AppShell>
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/reservations/:id/folios"
-          element={
-            <ProtectedRoute>
-              <AppShell>
-                <PermissionGuard any={["view_reservations"]}>
-                  <ReservationFolios />
-                </PermissionGuard>
-              </AppShell>
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/operations"
-          element={
-            <ProtectedRoute>
-              <AppShell>
-                <PermissionGuard any={["view_reports", "view_night_audit"]}>
-                  <Operations />
-                </PermissionGuard>
-              </AppShell>
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/pricing-rules"
-          element={
-            <ProtectedRoute>
-              <AppShell>
-                <PermissionGuard any={["view_pricing_rules"]}>
-                  <PricingRules />
-                </PermissionGuard>
-              </AppShell>
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/booking-engine"
-          element={
-            <ProtectedRoute>
-              <AppShell>
-                <PermissionGuard any={["configure_booking_engine", "review_pending_bookings"]}>
-                  <BookingEngineSettings />
-                </PermissionGuard>
-              </AppShell>
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/dpdp"
-          element={
-            <ProtectedRoute>
-              <AppShell>
-                <PermissionGuard any={["view_dpdp"]}>
-                  <DpdpRequests />
-                </PermissionGuard>
-              </AppShell>
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/gst-returns"
-          element={
-            <ProtectedRoute>
-              <AppShell>
-                <PermissionGuard any={["export_gstr"]}>
-                  <GstReturns />
-                </PermissionGuard>
-              </AppShell>
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/rate-plans"
-          element={
-            <ProtectedRoute>
-              <AppShell>
-                <PermissionGuard any={["view_rate_plans"]}>
-                  <RatePlans />
                 </PermissionGuard>
               </AppShell>
             </ProtectedRoute>
