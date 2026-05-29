@@ -12,6 +12,12 @@ type Exec = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 const BLOCKING_STATUSES = [...RESERVATION_BLOCKING_STATUSES];
 
 export async function findAvailableRooms(checkIn: string, checkOut: string) {
+  // Two-tier conflict check:
+  //  - overnight bookings → standard half-open daterange overlap.
+  //  - short_stay (day-use) bookings → checkInDate == checkOutDate,
+  //    which collapses to an empty Postgres range and would silently
+  //    miss the overlap. Treat them as conflicts when their stay date
+  //    falls within the probe window [checkIn, checkOut).
   const conflicts = db
     .select({ roomId: reservationRooms.roomId })
     .from(reservationRooms)
@@ -19,15 +25,31 @@ export async function findAvailableRooms(checkIn: string, checkOut: string) {
     .where(
       and(
         inArray(reservations.status, BLOCKING_STATUSES),
-        sql`daterange(${reservations.checkInDate}, ${reservations.checkOutDate}, '[)') && daterange(${checkIn}::date, ${checkOut}::date, '[)')`,
+        or(
+          sql`${reservations.stayType} = 'overnight' AND daterange(${reservations.checkInDate}, ${reservations.checkOutDate}, '[)') && daterange(${checkIn}::date, ${checkOut}::date, '[)')`,
+          sql`${reservations.stayType} = 'short_stay' AND ${reservations.checkInDate} >= ${checkIn}::date AND ${reservations.checkInDate} < ${checkOut}::date`,
+        ),
       ),
     );
 
-  // Dirty rooms remain in the result so the front desk can still
-  // re-let them after acknowledging a quick clean-up. The UI surfaces
-  // a "Mark clean & select" affordance per dirty card. Maintenance is
-  // still hard-blocked.
-  const all = await db.select().from(rooms).where(ne(rooms.status, "maintenance"));
+  // Hard-block any room that is currently occupied, reserved, or under
+  // maintenance — these can never be re-let until the underlying state
+  // changes. Dirty rooms remain in the result so the front desk can
+  // re-let them after acknowledging a quick clean-up (the UI surfaces
+  // a "Mark clean & select" affordance per dirty card).
+  const all = await db
+    .select()
+    .from(rooms)
+    .where(sql`${rooms.status} NOT IN ('maintenance', 'occupied', 'reserved')`)
+    // Order by floor then room number so the picker reads as a
+    // natural floor-by-floor list (101, 102, 201, 202, 301, ...).
+    // room_number is text — cast to int when it's purely numeric so
+    // 10 sorts after 9, not after 1.
+    .orderBy(
+      sql`${rooms.floor} ASC NULLS LAST`,
+      sql`CASE WHEN ${rooms.roomNumber} ~ '^[0-9]+$' THEN ${rooms.roomNumber}::int END ASC NULLS LAST`,
+      sql`${rooms.roomNumber} ASC`,
+    );
   const conflictRows = await conflicts;
   const blocked = new Set(conflictRows.map((r) => r.roomId));
   return all.filter((r) => !blocked.has(r.id));
@@ -43,7 +65,13 @@ export async function isRoomAvailable(
   const overlap = and(
     eq(reservationRooms.roomId, roomId),
     inArray(reservations.status, BLOCKING_STATUSES),
-    sql`daterange(${reservations.checkInDate}, ${reservations.checkOutDate}, '[)') && daterange(${checkIn}::date, ${checkOut}::date, '[)')`,
+    // Mirror the findAvailableRooms split — overnight uses daterange,
+    // short_stay (day-use) collapses to an empty range and needs an
+    // explicit single-day check against the probe window.
+    or(
+      sql`${reservations.stayType} = 'overnight' AND daterange(${reservations.checkInDate}, ${reservations.checkOutDate}, '[)') && daterange(${checkIn}::date, ${checkOut}::date, '[)')`,
+      sql`${reservations.stayType} = 'short_stay' AND ${reservations.checkInDate} >= ${checkIn}::date AND ${reservations.checkInDate} < ${checkOut}::date`,
+    ),
     excludeReservationId ? ne(reservations.id, excludeReservationId) : undefined,
   );
   const rows = await exec

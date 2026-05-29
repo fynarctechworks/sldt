@@ -9,6 +9,7 @@ import {
   editDatesSchema,
   editRoomRateSchema,
   extendReservationSchema,
+  extendSplitSchema,
   lateCheckoutSchema,
   reservationCreateSchema,
   reservationListQuerySchema,
@@ -2590,6 +2591,296 @@ router.post(
   },
 );
 
+// Partial-room extend (split). When only SOME rooms on a multi-room
+// reservation want to stay longer, this endpoint:
+//   1. Creates a brand-new reservation (new SLDT-RES-XXXX number) that
+//      copies the source's guest, dates (check-in = source check-in,
+//      check-out = the extended date), rate config, and GST mode.
+//   2. Moves the picked reservation_rooms rows from the source to the
+//      new reservation in the same tx.
+//   3. Recomputes totals on BOTH reservations: the source now has
+//      fewer rooms, the new one has the picked rooms over the extended
+//      window.
+//   4. Optionally adds a "Stay extension" charge on the NEW reservation
+//      when a different rate-per-night was agreed for the new nights.
+// Invoiced rooms, cancelled rooms, and "extend all rooms" callers are
+// rejected with friendly errors pointing them at the right endpoint.
+router.post(
+  "/:id/extend-split",
+  requireAuth,
+  requirePermission("view_reservations"),
+  idempotent("reservations.extendSplit"),
+  validate(extendSplitSchema),
+  async (req, res) => {
+    const id = req.params.id!;
+    const input = req.body as {
+      newCheckOutDate: string;
+      roomIds: string[];
+      ratePerNight?: number;
+    };
+
+    const [current] = await db
+      .select()
+      .from(reservations)
+      .where(eq(reservations.id, id))
+      .limit(1);
+    if (!current) return fail(res, 404, "NOT_FOUND", "Reservation not found");
+    if (current.status !== "confirmed" && current.status !== "checked_in") {
+      return fail(
+        res,
+        400,
+        "INVALID_STATE",
+        "Only confirmed or checked-in reservations can be extended",
+      );
+    }
+    if (current.stayType === "short_stay") {
+      return fail(
+        res,
+        400,
+        "SHORT_STAY_NOT_EXTENDABLE",
+        "Short-stay (day-use) bookings can't be extended. Create a new reservation instead.",
+      );
+    }
+    if (new Date(input.newCheckOutDate) <= new Date(current.checkOutDate)) {
+      return fail(res, 400, "INVALID_DATES", "New check-out must be after current check-out");
+    }
+
+    const allRooms = await db
+      .select()
+      .from(reservationRooms)
+      .where(eq(reservationRooms.reservationId, id));
+    const pickedSet = new Set(input.roomIds);
+    const picked = allRooms.filter((r) => pickedSet.has(r.roomId));
+    if (picked.length === 0) {
+      return fail(
+        res,
+        400,
+        "NO_ROOMS_PICKED",
+        "Pick at least one room to extend onto a new reservation",
+      );
+    }
+    if (picked.length !== input.roomIds.length) {
+      return fail(
+        res,
+        404,
+        "ROOM_NOT_ON_RESERVATION",
+        "One or more selected rooms aren't on this reservation",
+      );
+    }
+    if (picked.length === allRooms.length) {
+      return fail(
+        res,
+        400,
+        "USE_FULL_EXTEND",
+        "All rooms picked — use POST /extend (full-reservation extension) instead of split",
+      );
+    }
+    // Block split when any picked room is already on an invoice — its
+    // bill is locked and cannot be moved to a new reservation.
+    const invoiced = picked.find((r) => r.invoiceId);
+    if (invoiced) {
+      return fail(
+        res,
+        409,
+        "ROOM_ALREADY_INVOICED",
+        "A picked room already has an invoice. Void it first or pick rooms without invoices.",
+        { roomId: invoiced.roomId },
+      );
+    }
+    // Block cancelled per-room rows — moving a cancelled-status row to
+    // a fresh reservation would silently revive it.
+    const stale = picked.find(
+      (r) => r.status === "cancelled" || r.status === "checked_out",
+    );
+    if (stale) {
+      return fail(
+        res,
+        409,
+        "ROOM_INACTIVE",
+        `Picked room is ${stale.status}; only active rooms can be moved to a new reservation`,
+        { roomId: stale.roomId },
+      );
+    }
+
+    // Availability for each picked room over the EXTENSION window only.
+    // The current window [checkIn, checkOutDate) is unchanged on the new
+    // reservation; the conflict probe runs against [oldCheckOut, newCheckOut).
+    for (const rm of picked) {
+      const ok = await isRoomAvailable(
+        rm.roomId,
+        current.checkOutDate,
+        input.newCheckOutDate,
+        id,
+      );
+      if (!ok) {
+        return fail(
+          res,
+          409,
+          "ROOM_UNAVAILABLE",
+          "Picked room is not available for the extended period",
+          { roomId: rm.roomId },
+        );
+      }
+    }
+
+    const settings = await getSettings();
+    const reservationGstMode = current.gstMode ?? "exclusive";
+
+    let newReservationId = "";
+    let newReservationNumber = "";
+    await db.transaction(async (tx) => {
+      const seq = await nextDailySequence(`SLDT-RES-%`, tx);
+      newReservationNumber = reservationNumber(seq);
+
+      // Snapshot a starter row. totals/grandTotal/balance get rewritten
+      // by recalcReservation in a moment; we just need a valid initial
+      // row (notNull columns + sane defaults).
+      const composedSpecial = current.specialRequests
+        ? `Split from ${current.reservationNumber} — extended to ${input.newCheckOutDate}. Original notes: ${current.specialRequests}`
+        : `Split from ${current.reservationNumber} — extended to ${input.newCheckOutDate}`;
+      const [created] = await tx
+        .insert(reservations)
+        .values({
+          reservationNumber: newReservationNumber,
+          propertyId: current.propertyId,
+          guestId: current.guestId,
+          checkInDate: current.checkInDate,
+          checkOutDate: input.newCheckOutDate,
+          stayType: current.stayType,
+          numAdults: current.numAdults,
+          numChildren: current.numChildren,
+          ratePerNight: current.ratePerNight,
+          subtotal: "0",
+          gstRate: current.gstRate,
+          gstAmount: "0",
+          grandTotal: "0",
+          gstMode: reservationGstMode,
+          // Money stays with the source reservation. The new
+          // reservation starts with zero advance / wallet credit —
+          // staff collects what's owed on it through its own check-out.
+          advancePaid: "0",
+          walletCreditApplied: "0",
+          balanceDue: "0",
+          status: current.status,
+          bookingSource: current.bookingSource,
+          specialRequests: composedSpecial,
+          checkedInAt: current.status === "checked_in" ? current.checkedInAt : null,
+          checkedInBy: current.status === "checked_in" ? current.checkedInBy : null,
+          createdBy: req.user!.id,
+        })
+        .returning();
+      newReservationId = created!.id;
+
+      // Move the picked reservation_rooms rows to the new reservation.
+      const pickedRowIds = picked.map((r) => r.id);
+      await tx
+        .update(reservationRooms)
+        .set({ reservationId: newReservationId })
+        .where(inArray(reservationRooms.id, pickedRowIds));
+
+      // Optional rate-delta charge on the NEW reservation only — the
+      // source's billing is untouched. Mirrors the existing /extend
+      // logic but scoped to the new reservation.
+      if (input.ratePerNight && picked.length > 0) {
+        const extraNights = differenceInCalendarDays(
+          new Date(input.newCheckOutDate),
+          new Date(current.checkOutDate),
+        );
+        let deltaAmount = 0;
+        for (const rm of picked) {
+          const delta = (input.ratePerNight - Number(rm.ratePerNight)) * extraNights;
+          deltaAmount += delta;
+        }
+        deltaAmount = +deltaAmount.toFixed(2);
+        if (Math.abs(deltaAmount) > 0.009) {
+          const gstRate = getGstRate(input.ratePerNight, {
+            exemptBelow: Number(settings.gstSlabExemptBelow),
+            lowRate: Number(settings.gstSlabLowRate),
+            lowMax: Number(settings.gstSlabLowMax),
+            highRate: Number(settings.gstSlabHighRate),
+          });
+          const storedAmount =
+            reservationGstMode === "inclusive"
+              ? calcGstBreakdown(deltaAmount, gstRate, "inclusive").subtotal
+              : deltaAmount;
+          const nightWord = extraNights === 1 ? "night" : "nights";
+          await tx.insert(additionalCharges).values({
+            reservationId: newReservationId,
+            description: `Stay extension — ${extraNights} ${nightWord} @ ₹${input.ratePerNight.toFixed(2)}/night${reservationGstMode === "inclusive" ? " (incl. GST)" : ""}`,
+            quantity: 1,
+            rate: String(storedAmount.toFixed(2)),
+            amount: String(storedAmount.toFixed(2)),
+            gstRate: String(gstRate),
+            addedBy: req.user!.id,
+          });
+        }
+      }
+    });
+
+    // Recompute totals on BOTH reservations now that rooms have moved.
+    // recalcReservation reads the current reservation_rooms rows, so the
+    // source loses the picked rooms and the new one gains them.
+    await recalcReservation(id);
+    await recalcReservation(newReservationId);
+
+    const [refreshedSource] = await db
+      .select()
+      .from(reservations)
+      .where(eq(reservations.id, id))
+      .limit(1);
+    const [refreshedNew] = await db
+      .select()
+      .from(reservations)
+      .where(eq(reservations.id, newReservationId))
+      .limit(1);
+
+    const extraNights = differenceInCalendarDays(
+      new Date(input.newCheckOutDate),
+      new Date(current.checkOutDate),
+    );
+
+    // Audit log on both — staff can trace which split created which
+    // pair, and the source's history shows where the rooms went.
+    await logActivity({
+      action: "reservation_extended_split",
+      entityType: "reservation",
+      entityId: id,
+      description: `${current.reservationNumber} split: ${picked.length} room${picked.length === 1 ? "" : "s"} moved to ${newReservationNumber} (extended to ${input.newCheckOutDate}, +${extraNights} night${extraNights === 1 ? "" : "s"})`,
+      performedBy: req.user!.id,
+      ipAddress: req.ip,
+      metadata: {
+        sourceReservationId: id,
+        sourceReservationNumber: current.reservationNumber,
+        newReservationId,
+        newReservationNumber,
+        movedRoomIds: picked.map((r) => r.roomId),
+        oldCheckOut: current.checkOutDate,
+        newCheckOut: input.newCheckOutDate,
+        extraNights,
+        extensionRate: input.ratePerNight ?? null,
+      },
+    });
+    await logActivity({
+      action: "reservation_created_from_split",
+      entityType: "reservation",
+      entityId: newReservationId,
+      description: `${newReservationNumber} created from split of ${current.reservationNumber}`,
+      performedBy: req.user!.id,
+      ipAddress: req.ip,
+      metadata: {
+        sourceReservationId: id,
+        sourceReservationNumber: current.reservationNumber,
+      },
+    });
+
+    await invalidateDashboard();
+    return ok(res, {
+      source: refreshedSource,
+      created: refreshedNew,
+    });
+  },
+);
+
 router.post(
   "/:id/late-checkout",
   requireAuth,
@@ -2698,22 +2989,44 @@ router.post(
     }
 
     const today = format(new Date(), "yyyy-MM-dd");
-    const startDate = input.startDate ?? (current.checkInDate > today ? current.checkInDate : today);
-    if (startDate >= current.checkOutDate) {
+    const isShortStay = current.stayType === "short_stay";
+    // For day-use (short_stay): check-in == check-out, so "nights"
+    // math is meaningless. The room is added at a flat rate equal to
+    // the parent's short-stay price. Availability is probed against a
+    // [d, d+1) window so the conflict check sees the day-use overlap
+    // (mirrors the findAvailableRooms split on stayType).
+    const startDate = isShortStay
+      ? current.checkInDate
+      : input.startDate ?? (current.checkInDate > today ? current.checkInDate : today);
+    if (!isShortStay && startDate >= current.checkOutDate) {
       return fail(res, 400, "INVALID_DATES", "Start date must be before check-out date");
     }
 
-    const ok2 = await isRoomAvailable(input.roomId, startDate, current.checkOutDate, id);
+    // Probe window. Overnight uses [start, checkOut). Day-use widens
+    // the end by one day so the empty-range corner case in
+    // isRoomAvailable's daterange overlap is avoided.
+    const probeEnd = isShortStay
+      ? format(
+          new Date(new Date(current.checkInDate).getTime() + 86400000),
+          "yyyy-MM-dd",
+        )
+      : current.checkOutDate;
+    const ok2 = await isRoomAvailable(input.roomId, startDate, probeEnd, id);
     if (!ok2) {
       return fail(res, 409, "ROOM_UNAVAILABLE", "Room is not available for the selected period", {
         roomId: input.roomId,
       });
     }
 
-    const addedNights = differenceInCalendarDays(
-      new Date(current.checkOutDate),
-      new Date(startDate),
-    );
+    // Day-use rooms bill at one FLAT charge (input.ratePerNight is the
+    // agreed total for the duration). Overnight rooms multiply by the
+    // remaining nights.
+    const addedNights = isShortStay
+      ? 1
+      : differenceInCalendarDays(
+          new Date(current.checkOutDate),
+          new Date(startDate),
+        );
     const addedRoomAmount = +(input.ratePerNight * addedNights).toFixed(2);
 
     const settings = await getSettings();

@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { format } from "date-fns";
 import {
+  AlertTriangle,
   BedDouble,
   CalendarPlus,
   CheckCircle2,
@@ -69,6 +70,11 @@ interface Detail {
   gstMode?: "exclusive" | "inclusive";
   hotelCheckInTime: string;
   hotelCheckOutTime: string;
+  // Extra hours granted via Late Checkout, shifting the effective
+  // check-out moment forward. Numeric in DB; serialised as a decimal
+  // string. Used by the "X min late" warning so a grant of 2 hours
+  // doesn't show the room as overdue 2 hours too early.
+  lateCheckoutHours?: string;
   guest: {
     id: string;
     fullName: string;
@@ -350,6 +356,37 @@ export default function ReservationDetail() {
     const diff = Math.floor((today.getTime() - out.getTime()) / 86400000);
     return Math.max(0, diff);
   })();
+
+  // Minute-granularity overdue check. Covers two cases the day-only
+  // overdueDays misses:
+  //   - day-use (short_stay): check-in == check-out date, "overdue"
+  //     means we're past checkInAt + durationHours.
+  //   - overnight: we're past checkOutDate + hotelCheckOutTime, plus
+  //     any granted lateCheckoutHours.
+  // Returns 0 when not overdue. Updates on every render so navigating
+  // away and back picks up the current clock — good enough; nothing
+  // depends on a per-minute refresh.
+  const minutesOverdue = (() => {
+    if (r.status !== "checked_in") return 0;
+    const isShortStay = r.stayType === "short_stay";
+    let effectiveOut: Date;
+    if (isShortStay) {
+      const checkedInAt = r.checkedInAt ? new Date(r.checkedInAt) : null;
+      const durationH = Number(r.durationHours ?? 0);
+      if (!checkedInAt || !durationH) return 0;
+      effectiveOut = new Date(checkedInAt.getTime() + durationH * 3600_000);
+    } else {
+      const [hh = "11", mm = "00"] = (r.hotelCheckOutTime ?? "11:00").split(":");
+      effectiveOut = new Date(`${r.checkOutDate}T${hh.padStart(2, "0")}:${mm.padStart(2, "0")}:00`);
+    }
+    const grantHours = Number(r.lateCheckoutHours ?? 0);
+    if (grantHours > 0) {
+      effectiveOut = new Date(effectiveOut.getTime() + grantHours * 3600_000);
+    }
+    const diffMs = Date.now() - effectiveOut.getTime();
+    return diffMs > 0 ? Math.floor(diffMs / 60_000) : 0;
+  })();
+  const isOverdue = minutesOverdue > 0;
 
   return (
     <div className="space-y-4">
@@ -784,6 +821,12 @@ export default function ReservationDetail() {
       {showCharge && (
         <ChargeModal
           reservationId={r.id}
+          rooms={r.rooms.map((rm) => ({
+            id: rm.id,
+            roomNumber: rm.roomNumber,
+            invoiced: !!rm.roomInvoiceId,
+          }))}
+          minutesOverdue={minutesOverdue}
           onClose={() => setShowCharge(false)}
           onSaved={() => {
             setShowCharge(false);
@@ -1032,10 +1075,26 @@ export default function ReservationDetail() {
           reservationId={r.id}
           currentCheckOut={r.checkOutDate}
           currentRate={rooms[0]?.ratePerNight ?? "0"}
+          rooms={r.rooms.map((rm) => ({
+            id: rm.id,
+            roomNumber: rm.roomNumber,
+            invoiced: !!rm.roomInvoiceId,
+            status: rm.roomStatus,
+          }))}
+          minutesOverdue={minutesOverdue}
           onClose={() => setShowExtend(false)}
           onSaved={() => {
             setShowExtend(false);
             invalidate();
+          }}
+          onSplit={(created) => {
+            setShowExtend(false);
+            invalidate();
+            toast(
+              `Split off ${created.reservationNumber} — opening it now`,
+              "success",
+            );
+            navigate(`/reservations/${created.id}`);
           }}
         />
       )}
@@ -1054,7 +1113,9 @@ export default function ReservationDetail() {
           reservationId={r.id}
           checkInDate={r.checkInDate}
           checkOutDate={r.checkOutDate}
+          stayType={r.stayType ?? "overnight"}
           existingRoomIds={rooms.map((rm) => rm.id)}
+          minutesOverdue={minutesOverdue}
           onClose={() => setShowAddRoom(false)}
           onSaved={() => {
             setShowAddRoom(false);
@@ -1615,13 +1676,31 @@ function AddRoomModal(props: {
   reservationId: string;
   checkInDate: string;
   checkOutDate: string;
+  stayType: "overnight" | "short_stay";
   existingRoomIds: string[];
+  minutesOverdue?: number;
   onClose: () => void;
   onSaved: () => void;
 }) {
   const today = new Date().toISOString().slice(0, 10);
-  const defaultStart = props.checkInDate > today ? props.checkInDate : today;
+  const isShortStay = props.stayType === "short_stay";
+  // Day-use: start = the booking's single date, no separate start
+  // picker. Overnight: default start = max(today, checkInDate) so the
+  // mid-stay add only bills the remaining nights.
+  const defaultStart = isShortStay
+    ? props.checkInDate
+    : props.checkInDate > today
+      ? props.checkInDate
+      : today;
   const [startDate, setStartDate] = useState(defaultStart);
+  // Probe window. For day-use we widen to [d, d+1) so the API's
+  // daterange overlap check actually fires (a same-day [d, d) range
+  // is empty in Postgres and silently matches nothing).
+  const probeEnd = isShortStay
+    ? new Date(new Date(props.checkInDate).getTime() + 86400000)
+        .toISOString()
+        .slice(0, 10)
+    : props.checkOutDate;
   // Selected rooms keyed by id → chosen rate per night. Adding/removing a
   // room mutates this map; the rate seeds from the room's base rate but
   // staff can edit each one independently.
@@ -1634,17 +1713,20 @@ function AddRoomModal(props: {
     id: string;
     roomNumber: string;
     roomType: string;
+    floor?: number;
     baseRate: string;
     status?: "available" | "occupied" | "reserved" | "maintenance" | "dirty" | "clean" | "inspected";
   };
   const avail = useQuery({
-    queryKey: ["availability", startDate, props.checkOutDate],
+    queryKey: ["availability", startDate, probeEnd],
     queryFn: () =>
       api.get<AvailRoom[]>("/rooms/availability", {
         check_in: startDate,
-        check_out: props.checkOutDate,
+        check_out: probeEnd,
       }),
-    enabled: startDate < props.checkOutDate,
+    // Overnight needs a strict start < end. Day-use always sends a valid
+    // [d, d+1) so the query always runs.
+    enabled: isShortStay || startDate < probeEnd,
   });
 
   // Marks a dirty room clean so it can be added to the reservation. Same
@@ -1654,7 +1736,7 @@ function AddRoomModal(props: {
       api.patch(`/rooms/${roomId}/status`, { status: "clean", reason: "Re-let mid-stay" }),
     onSuccess: (_data, roomId) => {
       qc.setQueryData<AvailRoom[]>(
-        ["availability", startDate, props.checkOutDate],
+        ["availability", startDate, probeEnd],
         (cur) =>
           cur?.map((r) => (r.id === roomId ? { ...r, status: "clean" as const } : r)) ?? cur,
       );
@@ -1666,15 +1748,18 @@ function AddRoomModal(props: {
   const availableById = new Map(available.map((r) => [r.id, r]));
   const pickedIds = Object.keys(picked);
 
-  // Nights between the chosen start and the reservation check-out. Used for
-  // the live total preview — does not affect the per-room rate sent to the
-  // API (the server prorates by date itself).
-  const nights = Math.max(
-    0,
-    Math.round(
-      (new Date(props.checkOutDate).getTime() - new Date(startDate).getTime()) / 86400000,
-    ),
-  );
+  // For overnight: count the nights from chosen start to check-out.
+  // For day-use: a single flat charge — units stays at 1 so the
+  // preview reads "1 × ₹rate" instead of "0 nights × ₹rate".
+  const nights = isShortStay
+    ? 1
+    : Math.max(
+        0,
+        Math.round(
+          (new Date(props.checkOutDate).getTime() - new Date(startDate).getTime()) /
+            86400000,
+        ),
+      );
   const grandPreview = pickedIds.reduce(
     (sum, id) => sum + (picked[id] ?? 0) * nights,
     0,
@@ -1715,33 +1800,42 @@ function AddRoomModal(props: {
   };
 
   return (
-    <ModalShell title="Add Room to Reservation" onClose={props.onClose}>
+    <ModalShell title="Add Room to Reservation" onClose={props.onClose} size="lg">
       <div className="space-y-4">
-        <div className="grid grid-cols-2 gap-3">
-          <div>
-            <label className="label block mb-1">Start Date</label>
-            <input
-              className="input"
-              type="date"
-              min={today < props.checkInDate ? props.checkInDate : today}
-              max={props.checkOutDate}
-              value={startDate}
-              onChange={(e) => {
-                setStartDate(e.target.value);
-                setPicked({});
-              }}
-            />
+        <OverdueWarning minutesOverdue={props.minutesOverdue ?? 0} />
+        {isShortStay ? (
+          <div className="text-xs text-textSecondary rounded-sm bg-bg/60 border border-borderc px-3 py-2">
+            Day-use booking — the added room covers the same date (
+            <strong>{format(new Date(props.checkInDate), "dd MMM yyyy")}</strong>) at a
+            flat rate. Date pickers don't apply.
           </div>
-          <div>
-            <label className="label block mb-1">End Date (check-out)</label>
-            <input
-              className="input bg-bg/50 cursor-not-allowed"
-              type="date"
-              value={props.checkOutDate}
-              disabled
-            />
+        ) : (
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="label block mb-1">Start Date</label>
+              <input
+                className="input"
+                type="date"
+                min={today < props.checkInDate ? props.checkInDate : today}
+                max={props.checkOutDate}
+                value={startDate}
+                onChange={(e) => {
+                  setStartDate(e.target.value);
+                  setPicked({});
+                }}
+              />
+            </div>
+            <div>
+              <label className="label block mb-1">End Date (check-out)</label>
+              <input
+                className="input bg-bg/50 cursor-not-allowed"
+                type="date"
+                value={props.checkOutDate}
+                disabled
+              />
+            </div>
           </div>
-        </div>
+        )}
 
         <div>
           <label className="label block mb-1.5">
@@ -1757,68 +1851,102 @@ function AddRoomModal(props: {
               No rooms available for this range.
             </div>
           ) : (
-            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 max-h-56 overflow-y-auto pr-1">
-              {available.map((rm) => {
-                const active = picked[rm.id] !== undefined;
-                const isDirty = rm.status === "dirty";
-                const cleanInFlight = markClean.isPending && markClean.variables === rm.id;
-                return (
-                  <div
-                    key={rm.id}
-                    className={`p-2.5 rounded-sm border-2 text-left transition-colors ${
-                      active
-                        ? "border-brand-dark bg-brand-soft"
-                        : isDirty
-                          ? "border-warning/50 bg-warning/5"
-                          : "border-borderc hover:border-brand-dark hover:bg-bg"
-                    }`}
-                  >
-                    <button
-                      type="button"
-                      onClick={() => {
-                        if (isDirty && !active) return;
-                        toggleRoom(rm);
-                      }}
-                      className="text-left w-full"
-                      aria-disabled={isDirty && !active}
-                    >
-                      <div className="flex items-center gap-1.5 flex-wrap">
-                        <span className="font-mono font-bold text-brand-dark text-sm leading-tight">
-                          {rm.roomNumber}
+            // Group by floor so the picker reads as Floor 1 → Floor 2
+            // → ... sections rather than one flat scroll. The API
+            // already orders by (floor, roomNumber) so each bucket is
+            // already room-number-sorted.
+            (() => {
+              const byFloor = new Map<number | "?", typeof available>();
+              for (const rm of available) {
+                const key: number | "?" = rm.floor ?? "?";
+                const arr = byFloor.get(key) ?? [];
+                arr.push(rm);
+                byFloor.set(key, arr);
+              }
+              const floors = Array.from(byFloor.keys()).sort((a, b) => {
+                if (a === "?") return 1;
+                if (b === "?") return -1;
+                return (a as number) - (b as number);
+              });
+              return (
+                <div className="space-y-3">
+                  {floors.map((floor) => (
+                    <div key={String(floor)}>
+                      <div className="text-[10px] uppercase tracking-wider text-textSecondary font-semibold mb-1.5">
+                        {floor === "?" ? "Other" : `Floor ${floor}`}{" "}
+                        <span className="text-textSecondary/70">
+                          · {byFloor.get(floor)!.length} room
+                          {byFloor.get(floor)!.length === 1 ? "" : "s"}
                         </span>
-                        {isDirty && (
-                          <span className="inline-flex items-center gap-0.5 px-1 py-0.5 rounded-sm text-[9px] font-semibold bg-warning/15 text-warning">
-                            <Sparkles className="w-2.5 h-2.5" /> DIRTY
-                          </span>
-                        )}
                       </div>
-                      <div className="text-[11px] capitalize text-textSecondary mt-0.5 truncate">
-                        {rm.roomType}
+                      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">
+                        {byFloor.get(floor)!.map((rm) => {
+                          const active = picked[rm.id] !== undefined;
+                          const isDirty = rm.status === "dirty";
+                          const cleanInFlight =
+                            markClean.isPending && markClean.variables === rm.id;
+                          return (
+                            <div
+                              key={rm.id}
+                              className={`p-2.5 rounded-sm border-2 text-left transition-colors ${
+                                active
+                                  ? "border-brand-dark bg-brand-soft"
+                                  : isDirty
+                                    ? "border-warning/50 bg-warning/5"
+                                    : "border-borderc hover:border-brand-dark hover:bg-bg"
+                              }`}
+                            >
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (isDirty && !active) return;
+                                  toggleRoom(rm);
+                                }}
+                                className="text-left w-full"
+                                aria-disabled={isDirty && !active}
+                              >
+                                <div className="flex items-center gap-1.5 flex-wrap">
+                                  <span className="font-mono font-bold text-brand-dark text-sm leading-tight">
+                                    {rm.roomNumber}
+                                  </span>
+                                  {isDirty && (
+                                    <span className="inline-flex items-center gap-0.5 px-1 py-0.5 rounded-sm text-[9px] font-semibold bg-warning/15 text-warning">
+                                      <Sparkles className="w-2.5 h-2.5" /> DIRTY
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="text-[11px] capitalize text-textSecondary mt-0.5 truncate">
+                                  {rm.roomType}
+                                </div>
+                                <div className="text-xs font-mono text-textPrimary mt-1">
+                                  ₹{Number(rm.baseRate).toFixed(0)}/n
+                                </div>
+                              </button>
+                              {isDirty && !active && (
+                                <button
+                                  type="button"
+                                  disabled={cleanInFlight}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    markClean.mutate(rm.id, {
+                                      onSuccess: () => toggleRoom(rm),
+                                    });
+                                  }}
+                                  className="mt-2 w-full inline-flex items-center justify-center gap-1 px-1.5 h-7 rounded-sm border border-warning/50 text-warning hover:bg-warning/10 text-[11px] font-semibold disabled:opacity-50"
+                                >
+                                  <Sparkles className="w-3 h-3" />
+                                  {cleanInFlight ? "Cleaning…" : "Mark clean & select"}
+                                </button>
+                              )}
+                            </div>
+                          );
+                        })}
                       </div>
-                      <div className="text-xs font-mono text-textPrimary mt-1">
-                        ₹{Number(rm.baseRate).toFixed(0)}/n
-                      </div>
-                    </button>
-                    {isDirty && !active && (
-                      <button
-                        type="button"
-                        disabled={cleanInFlight}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          markClean.mutate(rm.id, {
-                            onSuccess: () => toggleRoom(rm),
-                          });
-                        }}
-                        className="mt-2 w-full inline-flex items-center justify-center gap-1 px-1.5 h-7 rounded-sm border border-warning/50 text-warning hover:bg-warning/10 text-[11px] font-semibold disabled:opacity-50"
-                      >
-                        <Sparkles className="w-3 h-3" />
-                        {cleanInFlight ? "Cleaning…" : "Mark clean & select"}
-                      </button>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
+                    </div>
+                  ))}
+                </div>
+              );
+            })()
           )}
         </div>
 
@@ -1838,7 +1966,11 @@ function AddRoomModal(props: {
                       {rm.roomNumber}
                     </div>
                     <div className="text-[11px] text-textSecondary capitalize truncate">
-                      {rm.roomType} · base ₹{Number(rm.baseRate).toFixed(0)}/n
+                      {rm.roomType}
+                      {rm.floor !== undefined && (
+                        <span> · Floor {rm.floor}</span>
+                      )}
+                      <span> · base ₹{Number(rm.baseRate).toFixed(0)}/n</span>
                     </div>
                   </div>
                   <div className="w-32">
@@ -1863,8 +1995,10 @@ function AddRoomModal(props: {
             {nights > 0 && (
               <div className="flex justify-between border-t border-borderc pt-2 mt-2 text-sm">
                 <strong>
-                  {pickedIds.length} room{pickedIds.length === 1 ? "" : "s"} × {nights} night
-                  {nights === 1 ? "" : "s"}
+                  {pickedIds.length} room{pickedIds.length === 1 ? "" : "s"}
+                  {isShortStay
+                    ? " · day-use"
+                    : ` × ${nights} night${nights === 1 ? "" : "s"}`}
                 </strong>
                 <strong className="font-mono">₹{grandPreview.toFixed(2)}</strong>
               </div>
@@ -1917,8 +2051,19 @@ function ExtendModal(props: {
   reservationId: string;
   currentCheckOut: string;
   currentRate: string;
+  rooms: {
+    id: string;
+    roomNumber: string;
+    invoiced: boolean;
+    status?: "confirmed" | "checked_in" | "checked_out" | "cancelled";
+  }[];
+  minutesOverdue?: number;
   onClose: () => void;
+  // Called for the all-rooms extend path. Just invalidates and closes.
   onSaved: () => void;
+  // Called for the subset (split) path. Receives the new reservation
+  // info so the parent can show a toast / offer to navigate.
+  onSplit?: (newReservation: { id: string; reservationNumber: string }) => void;
 }) {
   const minDate = new Date(new Date(props.currentCheckOut).getTime() + 24 * 60 * 60 * 1000)
     .toISOString()
@@ -1928,19 +2073,66 @@ function ExtendModal(props: {
   const [ratePerNight, setRatePerNight] = useState(Number(props.currentRate));
   const [err, setErr] = useState<string | null>(null);
 
+  // Default to all billable rooms picked = behaves like the original
+  // "extend all" flow. Untick any to split that subset off into a new
+  // reservation with the extended dates.
+  const billable = props.rooms.filter(
+    (r) => !r.invoiced && r.status !== "cancelled" && r.status !== "checked_out",
+  );
+  const [pickedRooms, setPickedRooms] = useState<Set<string>>(
+    () => new Set(billable.map((r) => r.id)),
+  );
+  const isMultiRoom = props.rooms.length > 1;
+  const allBillablePicked =
+    billable.length > 0 && billable.every((r) => pickedRooms.has(r.id));
+  const willSplit = isMultiRoom && pickedRooms.size > 0 && !allBillablePicked;
+
+  function toggleRoom(roomId: string) {
+    setPickedRooms((prev) => {
+      const next = new Set(prev);
+      if (next.has(roomId)) next.delete(roomId);
+      else next.add(roomId);
+      return next;
+    });
+  }
+
   const save = useMutation({
-    mutationFn: () =>
-      api.post(`/reservations/${props.reservationId}/extend`, {
+    mutationFn: async () => {
+      if (willSplit) {
+        // Subset: split the reservation. The API creates a new
+        // reservation with the picked rooms + extended dates, leaves
+        // the source intact with its original dates.
+        return await api.post<{
+          source: { id: string; reservationNumber: string };
+          created: { id: string; reservationNumber: string };
+        }>(`/reservations/${props.reservationId}/extend-split`, {
+          newCheckOutDate,
+          roomIds: Array.from(pickedRooms),
+          ratePerNight: overrideRate ? ratePerNight : undefined,
+        });
+      }
+      // All rooms (or single-room reservation): use the original
+      // /extend endpoint that bumps the source's check-out in place.
+      await api.post(`/reservations/${props.reservationId}/extend`, {
         newCheckOutDate,
         ratePerNight: overrideRate ? ratePerNight : undefined,
-      }),
-    onSuccess: props.onSaved,
+      });
+      return null;
+    },
+    onSuccess: (data) => {
+      if (data?.created && props.onSplit) {
+        props.onSplit(data.created);
+      } else {
+        props.onSaved();
+      }
+    },
     onError: (e: Error) => setErr(e.message),
   });
 
   return (
     <ModalShell title="Extend Stay" onClose={props.onClose}>
       <div className="space-y-3">
+        <OverdueWarning minutesOverdue={props.minutesOverdue ?? 0} />
         <div className="text-sm text-textSecondary">
           Current check-out: <strong>{format(new Date(props.currentCheckOut), "dd MMM yyyy")}</strong>
         </div>
@@ -1954,6 +2146,73 @@ function ExtendModal(props: {
             onChange={(e) => setNewCheckOutDate(e.target.value)}
           />
         </div>
+
+        {isMultiRoom && (
+          <div>
+            <label className="label block mb-1">
+              Rooms to extend{" "}
+              <span className="text-textSecondary font-normal">
+                · {pickedRooms.size} of {props.rooms.length}
+              </span>
+            </label>
+            <div className="border border-borderc rounded-sm divide-y divide-borderc">
+              {props.rooms.map((rm) => {
+                const isOn = pickedRooms.has(rm.id);
+                const disabled =
+                  rm.invoiced ||
+                  rm.status === "cancelled" ||
+                  rm.status === "checked_out";
+                const reason = rm.invoiced
+                  ? "already invoiced"
+                  : rm.status === "cancelled"
+                    ? "cancelled"
+                    : rm.status === "checked_out"
+                      ? "checked out"
+                      : null;
+                return (
+                  <label
+                    key={rm.id}
+                    className={`flex items-center gap-2 px-3 py-2 text-sm ${
+                      disabled
+                        ? "opacity-50 cursor-not-allowed"
+                        : isOn
+                          ? "bg-brand-soft/40 cursor-pointer"
+                          : "hover:bg-bg cursor-pointer"
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      className="accent-brand-dark"
+                      checked={isOn}
+                      disabled={disabled}
+                      onChange={() => toggleRoom(rm.id)}
+                    />
+                    <span className="font-mono font-semibold text-brand-dark">
+                      Room {rm.roomNumber}
+                    </span>
+                    {reason && (
+                      <span className="text-[11px] text-textSecondary ml-auto">
+                        {reason}
+                      </span>
+                    )}
+                  </label>
+                );
+              })}
+            </div>
+            <div className="text-[11px] text-textSecondary mt-1 leading-tight">
+              {willSplit ? (
+                <>
+                  <span className="font-semibold text-warning">Split:</span> picked
+                  rooms move to a NEW reservation with the new check-out date. The
+                  un-picked rooms stay on this reservation unchanged.
+                </>
+              ) : (
+                <>All rooms extend together — same reservation, new check-out date.</>
+              )}
+            </div>
+          </div>
+        )}
+
         <div className="flex items-center gap-2">
           <input
             type="checkbox"
@@ -2004,10 +2263,16 @@ function ExtendModal(props: {
           <button className="btn-secondary" onClick={props.onClose}>Cancel</button>
           <button
             className="btn-primary"
-            disabled={!newCheckOutDate || save.isPending}
+            disabled={!newCheckOutDate || save.isPending || pickedRooms.size === 0}
             onClick={() => save.mutate()}
           >
-            {save.isPending ? "Extending…" : "Extend"}
+            {save.isPending
+              ? willSplit
+                ? "Splitting…"
+                : "Extending…"
+              : willSplit
+                ? `Split ${pickedRooms.size} room${pickedRooms.size === 1 ? "" : "s"} into new reservation`
+                : "Extend"}
           </button>
         </div>
       </div>
@@ -2095,29 +2360,89 @@ function LateCheckoutModal(props: {
 
 function ChargeModal(props: {
   reservationId: string;
+  rooms: { id: string; roomNumber: string; invoiced: boolean }[];
+  minutesOverdue?: number;
   onClose: () => void;
   onSaved: () => void;
 }) {
   const [description, setDescription] = useState("");
   const [amount, setAmount] = useState(0);
-  const [gstRate, setGstRate] = useState(18);
+  // Default to 0% so an "extra bed" or one-off charge doesn't silently
+  // add 18% GST. Staff picks 5% / 18% only when the line item is
+  // actually GST-applicable (restaurant, laundry, etc.).
+  const [gstRate, setGstRate] = useState(0);
+  // Charge attribution. Empty set = "All rooms / reservation-wide"
+  // — the charge will land on the combined invoice (or the booker's
+  // share when the reservation is split into per-room invoices). Any
+  // non-empty selection scopes the charge to those rooms only; the
+  // total amount entered is split evenly across them.
+  const [pickedRooms, setPickedRooms] = useState<Set<string>>(new Set());
   const [err, setErr] = useState<string | null>(null);
+  // Filter out already-invoiced rooms — staff can't add charges to a
+  // bill that's been closed.
+  const billableRooms = props.rooms.filter((r) => !r.invoiced);
+  const selectedCount = pickedRooms.size;
+  const perRoomAmount =
+    selectedCount > 0 ? +(amount / selectedCount).toFixed(2) : amount;
   const idempotencyKey = useMemo(() => newIdempotencyKey(), []);
 
   const save = useMutation({
-    mutationFn: () =>
-      api.post(
-        `/reservations/${props.reservationId}/charges`,
-        { description, quantity: 1, rate: amount, gstRate },
-        { idempotencyKey },
-      ),
+    mutationFn: async () => {
+      // Reservation-wide charge: one POST with no roomId.
+      if (pickedRooms.size === 0) {
+        await api.post(
+          `/reservations/${props.reservationId}/charges`,
+          { description, quantity: 1, rate: amount, gstRate },
+          { idempotencyKey },
+        );
+        return;
+      }
+      // Per-room split: one POST per selected room with an equal share.
+      // The last room absorbs the rounding remainder so the line items
+      // sum exactly to the entered total.
+      const ids = Array.from(pickedRooms);
+      const baseShare = +(amount / ids.length).toFixed(2);
+      let runningTotal = 0;
+      for (let i = 0; i < ids.length; i++) {
+        const isLast = i === ids.length - 1;
+        const share = isLast ? +(amount - runningTotal).toFixed(2) : baseShare;
+        runningTotal = +(runningTotal + share).toFixed(2);
+        await api.post(
+          `/reservations/${props.reservationId}/charges`,
+          {
+            description:
+              ids.length > 1
+                ? `${description} (${i + 1} of ${ids.length})`
+                : description,
+            quantity: 1,
+            rate: share,
+            gstRate,
+            roomId: ids[i]!,
+          },
+          // Each leg needs its own idempotency key — re-using one key
+          // would make the server replay the first response for legs
+          // 2..N instead of inserting separate charges.
+          { idempotencyKey: newIdempotencyKey() },
+        );
+      }
+    },
     onSuccess: props.onSaved,
     onError: (e: Error) => setErr(e.message),
   });
 
+  function toggleRoom(roomId: string) {
+    setPickedRooms((prev) => {
+      const next = new Set(prev);
+      if (next.has(roomId)) next.delete(roomId);
+      else next.add(roomId);
+      return next;
+    });
+  }
+
   return (
     <ModalShell title="Add Charge" onClose={props.onClose}>
       <div className="space-y-3">
+        <OverdueWarning minutesOverdue={props.minutesOverdue ?? 0} />
         <div>
           <label className="label block mb-1">Description</label>
           <input
@@ -2127,6 +2452,56 @@ function ChargeModal(props: {
             placeholder="Laundry, restaurant, extra bed…"
           />
         </div>
+        {props.rooms.length > 1 && (
+          <div>
+            <label className="label block mb-1">
+              Attribute to rooms{" "}
+              <span className="text-textSecondary font-normal">
+                · {selectedCount === 0 ? "all rooms" : `${selectedCount} selected`}
+              </span>
+            </label>
+            <div className="border border-borderc rounded-sm divide-y divide-borderc">
+              {props.rooms.map((rm) => {
+                const isOn = pickedRooms.has(rm.id);
+                return (
+                  <label
+                    key={rm.id}
+                    className={`flex items-center gap-2 px-3 py-2 text-sm cursor-pointer ${
+                      rm.invoiced
+                        ? "opacity-50 cursor-not-allowed"
+                        : isOn
+                          ? "bg-brand-soft/40"
+                          : "hover:bg-bg"
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      className="accent-brand-dark"
+                      checked={isOn}
+                      disabled={rm.invoiced}
+                      onChange={() => toggleRoom(rm.id)}
+                    />
+                    <span className="font-mono font-semibold text-brand-dark">
+                      Room {rm.roomNumber}
+                    </span>
+                    {rm.invoiced && (
+                      <span className="text-[11px] text-textSecondary ml-auto">
+                        already invoiced
+                      </span>
+                    )}
+                  </label>
+                );
+              })}
+            </div>
+            <div className="text-[11px] text-textSecondary mt-1 leading-tight">
+              {selectedCount === 0
+                ? "No rooms picked — charge lands on whichever invoice covers the last remaining rooms (reservation-wide)."
+                : selectedCount === 1
+                  ? "Bills only on this room's invoice."
+                  : `Total amount will be split evenly across ${selectedCount} rooms (${inr(perRoomAmount)} each).`}
+            </div>
+          </div>
+        )}
         <div className="grid grid-cols-2 gap-3">
           <div>
             <label className="label block mb-1">Amount (₹)</label>
@@ -2158,10 +2533,24 @@ function ChargeModal(props: {
           <button className="btn-secondary" onClick={props.onClose}>Cancel</button>
           <button
             className="btn-primary"
-            disabled={!description || amount <= 0 || save.isPending}
+            disabled={
+              !description ||
+              amount <= 0 ||
+              save.isPending ||
+              // Block submit if every billable room is already invoiced
+              // AND no reservation-wide fallback is meaningful (i.e. the
+              // user explicitly picked rooms — but their picks are all
+              // disabled now). Reservation-wide submit (no picks) is
+              // always allowed when the form is otherwise valid.
+              (selectedCount > 0 && billableRooms.length === 0)
+            }
             onClick={() => save.mutate()}
           >
-            {save.isPending ? "Saving…" : "Add Charge"}
+            {save.isPending
+              ? "Saving…"
+              : selectedCount > 1
+                ? `Add ${selectedCount} charges · ${inr(perRoomAmount)} each`
+                : "Add Charge"}
           </button>
         </div>
       </div>
@@ -3629,22 +4018,55 @@ function MakeCompModal(props: {
   );
 }
 
+// Shared inline banner shown at the top of mutation modals (Add Room,
+// Extend Stay, Add Charge) when the reservation is past its effective
+// check-out time. The user can still proceed — staff might be adding
+// a last-minute incidental or extending a guest who's been chatting at
+// the desk — but they're warned so they consider Late Checkout first.
+function OverdueWarning({ minutesOverdue }: { minutesOverdue: number }) {
+  if (minutesOverdue <= 0) return null;
+  const h = Math.floor(minutesOverdue / 60);
+  const m = minutesOverdue % 60;
+  const lateText =
+    h > 0 ? `${h}h ${m}m` : `${m} min`;
+  return (
+    <div className="rounded-sm border border-warning/40 bg-warning/10 text-warning text-xs px-3 py-2 flex items-start gap-2">
+      <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+      <div>
+        <strong>{lateText} past check-out time.</strong> Consider using{" "}
+        <strong>Late Checkout</strong> to formally extend (and bill the late
+        fee if applicable) instead of treating this booking as still open.
+      </div>
+    </div>
+  );
+}
+
 function ModalShell({
   title,
   onClose,
   children,
+  size = "md",
 }: {
   title: string;
   onClose: () => void;
   children: React.ReactNode;
+  // md (default ~512px) for narrow forms; lg for content-heavy modals
+  // like Add Room with floor sections; xl for grids.
+  size?: "md" | "lg" | "xl";
 }) {
+  const widthCls =
+    size === "xl"
+      ? "max-w-4xl"
+      : size === "lg"
+        ? "max-w-3xl"
+        : "max-w-lg";
   return (
     <div
-      className="fixed inset-0 bg-black/50 flex items-center justify-center z-50"
+      className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
       onClick={onClose}
     >
       <div
-        className="bg-surface rounded-md w-full max-w-lg p-5"
+        className={`bg-surface rounded-md w-full ${widthCls} p-5 max-h-[90vh] overflow-y-auto`}
         onClick={(e) => e.stopPropagation()}
       >
         <h2 className="text-lg font-semibold text-navy mb-3">{title}</h2>

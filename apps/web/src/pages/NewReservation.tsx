@@ -118,7 +118,17 @@ export default function NewReservation() {
   const [useNewGuest, setUseNewGuest] = useState(false);
 
   const [selectedRooms, setSelectedRooms] = useState<
-    { roomId: string; ratePerNight: number; roomNumber: string; soldAsType: string | null; nativeType: string }[]
+    {
+      roomId: string;
+      ratePerNight: number;
+      roomNumber: string;
+      soldAsType: string | null;
+      nativeType: string;
+      // Original native base rate captured when the room was first
+      // picked. Used to revert the price when staff switches "Sell as"
+      // back to the native option.
+      nativeBaseRate: number;
+    }[]
   >([]);
   const [kycFront, setKycFront] = useState<File | null>(null);
   const [kycBack, setKycBack] = useState<File | null>(null);
@@ -346,6 +356,7 @@ export default function NewReservation() {
               roomNumber: room.roomNumber,
               soldAsType: null,
               nativeType: room.roomType,
+              nativeBaseRate: Number(room.baseRate),
             },
           ],
     );
@@ -706,6 +717,7 @@ export default function NewReservation() {
           roomNumber: room.roomNumber,
           soldAsType: null,
           nativeType: room.roomType,
+          nativeBaseRate: Number(room.baseRate),
         },
       ];
     });
@@ -717,9 +729,24 @@ export default function NewReservation() {
 
   function updateSoldAs(roomId: string, slug: string | null, rate: number | null) {
     setSelectedRooms((prev) =>
-      prev.map((r) =>
-        r.roomId === roomId ? { ...r, soldAsType: slug, ratePerNight: rate ?? r.ratePerNight } : r,
-      ),
+      prev.map((r) => {
+        if (r.roomId !== roomId) return r;
+        // Decide the new rate:
+        //  - explicit rate from the picked sold-as type → use it
+        //  - slug=null (reverting to native) → snap back to the native
+        //    base rate the room was first picked at (or the native
+        //    short-stay band for day-use)
+        //  - otherwise leave the rate untouched
+        let nextRate = r.ratePerNight;
+        if (rate !== null) {
+          nextRate = rate;
+        } else if (slug === null) {
+          nextRate = isShortStay
+            ? shortStayRateForType(r.nativeType).rate || r.nativeBaseRate
+            : r.nativeBaseRate;
+        }
+        return { ...r, soldAsType: slug, ratePerNight: nextRate };
+      }),
     );
   }
 
@@ -1273,12 +1300,41 @@ export default function NewReservation() {
         ) : !availRooms.data?.length ? (
           <div className="text-danger text-sm">No rooms available for these dates.</div>
         ) : (
-          <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
-            {availRooms.data
-              .filter((r) =>
-                acFilter === "all" ? true : acFilter === "ac" ? r.hasAc : !r.hasAc,
-              )
-              .map((r) => {
+          // Group rooms by floor so the grid reads as Floor 1 → Floor 2
+          // → Floor 3 sections instead of a flat 9-card wall. The API
+          // already orders by (floor ASC, roomNumber ASC) so iteration
+          // order is meaningful; we just split by the floor boundary.
+          (() => {
+            const filtered = availRooms.data.filter((r) =>
+              acFilter === "all" ? true : acFilter === "ac" ? r.hasAc : !r.hasAc,
+            );
+            const byFloor = new Map<number, typeof filtered>();
+            for (const room of filtered) {
+              const arr = byFloor.get(room.floor) ?? [];
+              arr.push(room);
+              byFloor.set(room.floor, arr);
+            }
+            const floors = Array.from(byFloor.keys()).sort((a, b) => a - b);
+            if (floors.length === 0) {
+              return (
+                <div className="text-textSecondary text-sm">
+                  No rooms match the current AC filter.
+                </div>
+              );
+            }
+            return (
+              <div className="space-y-4">
+                {floors.map((floor) => (
+                  <div key={floor}>
+                    <div className="text-[10px] uppercase tracking-wider text-textSecondary font-semibold mb-2">
+                      Floor {floor}{" "}
+                      <span className="text-textSecondary/70">
+                        · {byFloor.get(floor)!.length} room
+                        {byFloor.get(floor)!.length === 1 ? "" : "s"}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                      {byFloor.get(floor)!.map((r) => {
               const selected = selectedRooms.find((s) => s.roomId === r.id);
               const isDirty = r.status === "dirty";
               const cleanInFlight =
@@ -1334,7 +1390,14 @@ export default function NewReservation() {
                         {r.roomType.replace(/_/g, " ")} · Floor {r.floor}
                       </div>
                     </div>
-                    <div className="text-sm font-mono">{inr(r.baseRate)}</div>
+                    <div className="text-sm font-mono">
+                      {/* Once a room is selected, show what the guest
+                          will actually be billed (effective rate). Falls
+                          back to the room's native base rate before the
+                          card is selected so the price is still visible
+                          in the picker grid. */}
+                      {selected ? inr(selected.ratePerNight) : inr(r.baseRate)}
+                    </div>
                   </div>
 
                   {isDirty && !selected && (
@@ -1406,7 +1469,12 @@ export default function NewReservation() {
                 </div>
               );
             })}
-          </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            );
+          })()
         )}
       </div>
 

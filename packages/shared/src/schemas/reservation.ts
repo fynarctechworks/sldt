@@ -163,6 +163,18 @@ export const extendReservationSchema = z.object({
   ratePerNight: z.coerce.number().positive().optional(),
 });
 
+// Partial-room extend. Splits the reservation: the picked roomIds move
+// to a brand-new reservation with the extended check-out date; the
+// remaining rooms stay on the original reservation with the original
+// dates. Use this when only SOME of the rooms on a multi-room booking
+// want to stay longer. For the all-rooms case, call the standard
+// extendReservationSchema endpoint.
+export const extendSplitSchema = z.object({
+  newCheckOutDate: z.string().date(),
+  roomIds: z.array(z.string().uuid()).min(1),
+  ratePerNight: z.coerce.number().positive().optional(),
+});
+
 export const lateCheckoutSchema = z.object({
   hours: z.coerce.number().positive().max(24),
   fee: z.coerce.number().min(0).default(0),
