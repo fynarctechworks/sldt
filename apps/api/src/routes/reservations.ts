@@ -14,7 +14,9 @@ import {
   reservationCreateSchema,
   reservationListQuerySchema,
   swapRoomSchema,
+  swapRoomSegmentSchema,
 } from "@hoteldesk/shared";
+import { randomUUID } from "node:crypto";
 import { differenceInCalendarDays, format } from "date-fns";
 import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lte, sql } from "drizzle-orm";
 import { Router } from "express";
@@ -266,6 +268,13 @@ router.get("/:id", requireAuth, requirePermission("view_reservations"), async (r
           roomCheckedInAt: x.rr.checkedInAt,
           roomCheckedOutAt: x.rr.checkedOutAt,
           roomInvoiceId: x.rr.invoiceId,
+          // Per-row segment columns (0019 mid-stay swap). NULL on either
+          // bound means the row covers the entire parent stay (legacy
+          // / unsegmented). swapId links sibling segments.
+          effectiveFrom: x.rr.effectiveFrom,
+          effectiveTo: x.rr.effectiveTo,
+          swapId: x.rr.swapId,
+          swapReason: x.rr.swapReason,
           occupant: occ
             ? {
                 id: occ.id,
@@ -2386,6 +2395,162 @@ router.post(
     });
     await invalidateDashboard();
     return ok(res, { success: true });
+  },
+);
+
+// Mid-stay room swap. Closes the current reservation_rooms row at the
+// effective date and inserts a new row pointing at the new room for the
+// remainder of the stay. Charges, GST, advance, invoice — none of it
+// moves. Both rows share a swap_id so reports can show them as one
+// event ("Guest moved 201 → 305 on 01 Jun"). The vacated room's
+// status is set to `markOldRoomStatus` (defaults to maintenance).
+router.post(
+  "/:id/swap-room-segment",
+  requireAuth,
+  requirePermission("view_reservations"),
+  idempotent("reservations.swapRoomSegment"),
+  validate(swapRoomSegmentSchema),
+  async (req, res) => {
+    const id = req.params.id!;
+    const input = req.body as z.infer<typeof swapRoomSegmentSchema>;
+
+    const r = await db.select().from(reservations).where(eq(reservations.id, id)).limit(1);
+    if (!r.length) return fail(res, 404, "NOT_FOUND", "Reservation not found");
+    const reservation = r[0]!;
+    if (reservation.status !== "checked_in") {
+      return fail(
+        res,
+        409,
+        "INVALID_STATUS",
+        `Room swap is only valid for a checked-in reservation (status: ${reservation.status})`,
+      );
+    }
+    if (reservation.stayType === "short_stay") {
+      return fail(
+        res,
+        409,
+        "SHORT_STAY_NOT_SUPPORTED",
+        "Mid-stay swap is not available for day-use bookings",
+      );
+    }
+
+    const segs = await db
+      .select()
+      .from(reservationRooms)
+      .where(eq(reservationRooms.id, input.fromReservationRoomId));
+    if (!segs.length || segs[0]!.reservationId !== id) {
+      return fail(res, 404, "SEGMENT_NOT_FOUND", "Source room segment not found on this reservation");
+    }
+    const seg = segs[0]!;
+    if (seg.status !== "checked_in") {
+      return fail(
+        res,
+        409,
+        "ROOM_NOT_CHECKED_IN",
+        `That room slot is ${seg.status}, can't swap`,
+      );
+    }
+    if (seg.invoiceId) {
+      return fail(
+        res,
+        409,
+        "ROOM_INVOICED",
+        "That room is already invoiced — issue a credit note instead of swapping",
+      );
+    }
+    if (seg.roomId === input.toRoomId) {
+      return fail(res, 400, "SAME_ROOM", "Target room is the same as the current room");
+    }
+
+    const segFrom = seg.effectiveFrom ?? reservation.checkInDate;
+    const segTo = seg.effectiveTo ?? reservation.checkOutDate;
+    // Effective date must fall strictly inside the current segment —
+    // not on either boundary (a swap on the check-in date is just an
+    // edit; a swap on the check-out date is a no-op).
+    if (input.effectiveDate <= segFrom || input.effectiveDate >= segTo) {
+      return fail(
+        res,
+        400,
+        "EFFECTIVE_OUT_OF_RANGE",
+        `Effective date must be between ${segFrom} and ${segTo} (exclusive)`,
+      );
+    }
+
+    // The new room must be free for [effectiveDate, segTo).
+    const available = await isRoomAvailable(
+      input.toRoomId,
+      input.effectiveDate,
+      segTo,
+      id,
+    );
+    if (!available) {
+      return fail(res, 409, "ROOM_UNAVAILABLE", "Target room is not available for the remainder of the stay");
+    }
+
+    const swapId = randomUUID();
+    const now = new Date();
+
+    await db.transaction(async (tx) => {
+      // 1. Close the old segment at the swap date.
+      await tx
+        .update(reservationRooms)
+        .set({
+          effectiveFrom: segFrom,
+          effectiveTo: input.effectiveDate,
+          swapId,
+          swapReason: input.reason,
+        })
+        .where(eq(reservationRooms.id, seg.id));
+
+      // 2. Insert a new segment for the remainder of the stay.
+      // Same rate / guest / invoice — only room_id and dates change.
+      await tx.insert(reservationRooms).values({
+        reservationId: id,
+        roomId: input.toRoomId,
+        ratePerNight: seg.ratePerNight,
+        soldAsType: seg.soldAsType,
+        guestId: seg.guestId,
+        status: "checked_in",
+        checkedInAt: now,
+        checkedInBy: req.user!.id,
+        invoiceId: seg.invoiceId,
+        effectiveFrom: input.effectiveDate,
+        effectiveTo: segTo,
+        swapId,
+        swapReason: input.reason,
+      });
+
+      // 3. Vacated room → markOldRoomStatus (defaults to maintenance).
+      await tx
+        .update(rooms)
+        .set({ status: input.markOldRoomStatus, updatedAt: now })
+        .where(eq(rooms.id, seg.roomId));
+
+      // 4. New room → occupied.
+      await tx
+        .update(rooms)
+        .set({ status: "occupied", updatedAt: now })
+        .where(eq(rooms.id, input.toRoomId));
+    });
+
+    await logActivity({
+      action: "room_swap_segment",
+      entityType: "reservation",
+      entityId: id,
+      description: `${reservation.reservationNumber}: room swapped on ${input.effectiveDate} (${input.reason})`,
+      performedBy: req.user!.id,
+      ipAddress: req.ip,
+      metadata: {
+        swapId,
+        fromRoomId: seg.roomId,
+        toRoomId: input.toRoomId,
+        effectiveDate: input.effectiveDate,
+        reason: input.reason,
+        markOldRoomStatus: input.markOldRoomStatus,
+      },
+    });
+    await invalidateDashboard();
+    return ok(res, { success: true, swapId });
   },
 );
 

@@ -134,6 +134,16 @@ export const reservationRooms = pgTable("reservation_rooms", {
   // The per-room invoice, once issued. NULL while still chargeable to
   // the combined / pending invoice.
   invoiceId: uuid("invoice_id"),
+  // Migration 0019 — segment columns for mid-stay room swap.
+  // NULL on either bound means "for the whole stay" (legacy / unsegmented row).
+  // When a swap happens, the original row's effective_to is set to the swap
+  // date, and a new row is inserted with effective_from = swap date and the
+  // new room_id. Both rows share a swap_id so reports can reconstruct the
+  // swap event as a single thing.
+  effectiveFrom: date("effective_from"),
+  effectiveTo: date("effective_to"),
+  swapId: uuid("swap_id"),
+  swapReason: text("swap_reason"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 

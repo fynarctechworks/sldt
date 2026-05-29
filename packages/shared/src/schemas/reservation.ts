@@ -130,6 +130,30 @@ export const swapRoomSchema = z.object({
   newRoomId: z.string().uuid(),
 });
 
+// Mid-stay room swap. Closes the current reservation_rooms row at
+// `effectiveDate` and inserts a new row pointing at `toRoomId` for the
+// remainder of the stay. Charges, rate, GST, advance — none of it moves;
+// only the physical room (and its housekeeping state).
+//
+// - fromReservationRoomId: the reservation_rooms.id currently holding the
+//   room being vacated (so we can target the right row on a multi-room
+//   booking).
+// - effectiveDate: the date from which the guest occupies the new room.
+//   Must lie strictly inside the current segment's effective window.
+// - markOldRoomStatus: what to set the vacated room's status to. Defaults
+//   to "maintenance" because that's the most common reason for a mid-stay
+//   swap. "dirty" if the room just needs cleaning before re-let.
+export const swapRoomSegmentSchema = z.object({
+  fromReservationRoomId: z.string().uuid(),
+  toRoomId: z.string().uuid(),
+  effectiveDate: z.string().date(),
+  reason: z.string().min(1).max(500),
+  markOldRoomStatus: z
+    .enum(["maintenance", "dirty", "available"])
+    .optional()
+    .default("maintenance"),
+});
+
 export const additionalChargeSchema = z.object({
   description: z.string().min(1).max(200),
   quantity: z.coerce.number().int().min(1).default(1),

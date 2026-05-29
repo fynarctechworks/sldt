@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { format } from "date-fns";
+import { differenceInCalendarDays, format } from "date-fns";
 import {
   AlertTriangle,
   BedDouble,
@@ -101,6 +101,13 @@ interface Detail {
     // its own invoice — drives the per_room/combined choice at checkout.
     roomInvoiceId?: string | null;
     roomStatus?: "confirmed" | "checked_in" | "checked_out" | "cancelled";
+    reservationRoomId?: string;
+    // Per-room segment columns (0019 mid-stay swap). NULL on either
+    // bound means the row covers the whole stay (unsegmented).
+    effectiveFrom?: string | null;
+    effectiveTo?: string | null;
+    swapId?: string | null;
+    swapReason?: string | null;
   }[];
   additionalCharges: {
     id: string;
@@ -635,6 +642,8 @@ export default function ReservationDetail() {
                 key={room.id}
                 reservationId={r.id}
                 room={room}
+                reservationCheckIn={r.checkInDate}
+                reservationCheckOut={r.checkOutDate}
                 nights={nights}
                 onSaved={invalidate}
                 onInvoiceIssuedNeedsPayment={(inv) =>
@@ -1204,7 +1213,17 @@ function RoomRow(props: {
     hasAc?: boolean;
     hasTv?: boolean;
     hasWifi?: boolean;
+    // Per-row segment columns (0019 mid-stay swap).
+    effectiveFrom?: string | null;
+    effectiveTo?: string | null;
+    swapId?: string | null;
+    swapReason?: string | null;
   };
+  // Reservation-level window — used as the fallback bound when the row's
+  // effective_from / effective_to are NULL, and so the swap modal can
+  // constrain the effective date picker.
+  reservationCheckIn: string;
+  reservationCheckOut: string;
   nights: number;
   onSaved: () => void;
   // Called when a per-room invoice was just issued AND it still has a
@@ -1221,6 +1240,13 @@ function RoomRow(props: {
   const [perRoomBusy, setPerRoomBusy] = useState<null | "checkout" | "invoice">(null);
   const [perRoomError, setPerRoomError] = useState<string | null>(null);
   const [showRoomCheckout, setShowRoomCheckout] = useState(false);
+  const [showSwap, setShowSwap] = useState(false);
+
+  // Effective window for this row. Falls back to the parent reservation
+  // window when the row is unsegmented (legacy / never swapped).
+  const segFrom = props.room.effectiveFrom ?? props.reservationCheckIn;
+  const segTo = props.room.effectiveTo ?? props.reservationCheckOut;
+  const isSegmented = !!(props.room.effectiveFrom || props.room.effectiveTo);
 
   // Per-room invoice. The API uses migration 0017's invoices.scope='room'.
   const issueRoomInvoice = useMutation({
@@ -1339,6 +1365,18 @@ function RoomRow(props: {
             )}
           </div>
         )}
+        {/* Segment timeline (0019). Shown when the row covers only a
+            sub-range of the parent reservation (i.e. a swap happened
+            and this row is one half of it). */}
+        {isSegmented && (
+          <div className="text-[11px] text-textSecondary mt-1 font-mono">
+            {format(new Date(segFrom), "dd MMM")} →{" "}
+            {format(new Date(segTo), "dd MMM")}
+            {props.room.swapReason && (
+              <span className="ml-1 italic">· {props.room.swapReason}</span>
+            )}
+          </div>
+        )}
         {hasAnyAmenity && (
           <div className="flex flex-wrap gap-1 mt-1">
             {props.room.hasAc ? (
@@ -1398,6 +1436,18 @@ function RoomRow(props: {
                 }
               />
             )}
+          {props.room.roomStatus === "checked_in" &&
+            !props.room.roomInvoiceId &&
+            // Need at least one full night left in the segment to swap.
+            differenceInCalendarDays(new Date(segTo), new Date(segFrom)) > 1 && (
+              <button
+                className="btn-secondary !h-7 !px-2 text-xs"
+                onClick={() => setShowSwap(true)}
+                title="Move this guest to a different room for the remainder of the stay"
+              >
+                Swap
+              </button>
+            )}
           {props.room.roomStatus === "checked_in" && (
             <button
               className="btn-secondary !h-7 !px-2 text-xs"
@@ -1451,7 +1501,256 @@ function RoomRow(props: {
         }}
       />
     )}
+    {showSwap && props.room.reservationRoomId && (
+      <SwapRoomModal
+        reservationId={props.reservationId}
+        fromReservationRoomId={props.room.reservationRoomId}
+        fromRoomNumber={props.room.roomNumber}
+        segmentFrom={segFrom}
+        segmentTo={segTo}
+        onClose={() => setShowSwap(false)}
+        onDone={() => {
+          setShowSwap(false);
+          props.onSaved();
+        }}
+      />
+    )}
     </>
+  );
+}
+
+function SwapRoomModal(props: {
+  reservationId: string;
+  fromReservationRoomId: string;
+  fromRoomNumber: string;
+  segmentFrom: string;
+  segmentTo: string;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  // Effective date must lie strictly inside the segment.
+  // Default to "tomorrow inside the segment" — most swaps are
+  // "starting tonight / next check-in".
+  const minEffective = (() => {
+    const d = new Date(props.segmentFrom);
+    d.setDate(d.getDate() + 1);
+    return d.toISOString().slice(0, 10);
+  })();
+  const maxEffective = (() => {
+    const d = new Date(props.segmentTo);
+    d.setDate(d.getDate() - 1);
+    return d.toISOString().slice(0, 10);
+  })();
+  const today = new Date().toISOString().slice(0, 10);
+  const defaultEffective =
+    today >= minEffective && today <= maxEffective ? today : minEffective;
+
+  const [effectiveDate, setEffectiveDate] = useState(defaultEffective);
+  const [toRoomId, setToRoomId] = useState<string | null>(null);
+  const [reason, setReason] = useState("Maintenance");
+  const [markOldRoomStatus, setMarkOldRoomStatus] = useState<
+    "maintenance" | "dirty" | "available"
+  >("maintenance");
+  const [err, setErr] = useState<string | null>(null);
+
+  type AvailRoom = {
+    id: string;
+    roomNumber: string;
+    roomType: string;
+    floor?: number;
+    baseRate: string;
+    status?: string;
+  };
+  const avail = useQuery({
+    queryKey: ["availability", effectiveDate, props.segmentTo],
+    queryFn: () =>
+      api.get<AvailRoom[]>("/rooms/availability", {
+        check_in: effectiveDate,
+        check_out: props.segmentTo,
+      }),
+    enabled: effectiveDate < props.segmentTo,
+  });
+
+  const swap = useMutation({
+    mutationFn: () =>
+      api.post(`/reservations/${props.reservationId}/swap-room-segment`, {
+        fromReservationRoomId: props.fromReservationRoomId,
+        toRoomId,
+        effectiveDate,
+        reason,
+        markOldRoomStatus,
+      }),
+    onSuccess: props.onDone,
+    onError: (e: Error) => setErr(e.message),
+  });
+
+  const remainingNights = differenceInCalendarDays(
+    new Date(props.segmentTo),
+    new Date(effectiveDate),
+  );
+
+  // Group by floor for readability — mirrors NewReservation + AddRoomModal.
+  const grouped = (() => {
+    const rooms = avail.data ?? [];
+    const byFloor = new Map<number | "?", AvailRoom[]>();
+    for (const rm of rooms) {
+      const key = rm.floor ?? "?";
+      const list = byFloor.get(key) ?? [];
+      list.push(rm);
+      byFloor.set(key, list);
+    }
+    return Array.from(byFloor.entries()).sort(([a], [b]) => {
+      if (a === "?") return 1;
+      if (b === "?") return -1;
+      return (a as number) - (b as number);
+    });
+  })();
+
+  return (
+    <ModalShell
+      title={`Swap Room ${props.fromRoomNumber}`}
+      onClose={props.onClose}
+      size="lg"
+    >
+      <div className="space-y-4">
+        <div className="text-sm text-textSecondary">
+          Current room <strong>{props.fromRoomNumber}</strong> is occupied
+          from <strong>{format(new Date(props.segmentFrom), "dd MMM")}</strong>{" "}
+          to <strong>{format(new Date(props.segmentTo), "dd MMM")}</strong>.
+          Pick the date the guest moves and the new room. Rate, GST, advance
+          and the invoice are not affected.
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label className="label block mb-1">
+              Effective date <span className="text-danger">*</span>
+            </label>
+            <input
+              className="input"
+              type="date"
+              min={minEffective}
+              max={maxEffective}
+              value={effectiveDate}
+              onChange={(e) => setEffectiveDate(e.target.value)}
+            />
+            <div className="text-[11px] text-textSecondary mt-1">
+              {remainingNights > 0
+                ? `${remainingNights} night${remainingNights === 1 ? "" : "s"} in the new room`
+                : "Pick a date inside the stay window"}
+            </div>
+          </div>
+          <div>
+            <label className="label block mb-1">
+              Reason <span className="text-danger">*</span>
+            </label>
+            <input
+              className="input"
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              placeholder="e.g. AC failure, plumbing, guest request"
+            />
+          </div>
+        </div>
+
+        <div>
+          <label className="label block mb-1">
+            Mark room {props.fromRoomNumber} as
+          </label>
+          <div className="flex gap-2 flex-wrap">
+            {(["maintenance", "dirty", "available"] as const).map((s) => (
+              <label
+                key={s}
+                className={`px-3 h-9 inline-flex items-center gap-2 rounded-sm border cursor-pointer text-sm capitalize ${
+                  markOldRoomStatus === s
+                    ? "border-brand-dark bg-brand-soft text-brand-dark font-semibold"
+                    : "border-borderc text-textSecondary hover:border-brand-dark/40"
+                }`}
+              >
+                <input
+                  type="radio"
+                  className="sr-only"
+                  checked={markOldRoomStatus === s}
+                  onChange={() => setMarkOldRoomStatus(s)}
+                />
+                {s}
+              </label>
+            ))}
+          </div>
+        </div>
+
+        <div>
+          <div className="label mb-1">
+            Move to room <span className="text-danger">*</span>
+          </div>
+          {avail.isLoading && (
+            <div className="text-sm text-textSecondary">Loading available rooms…</div>
+          )}
+          {avail.isError && (
+            <div className="text-sm text-danger">
+              Couldn't load availability: {(avail.error as Error).message}
+            </div>
+          )}
+          {!avail.isLoading && (avail.data?.length ?? 0) === 0 && (
+            <div className="text-sm text-textSecondary">
+              No rooms available for {format(new Date(effectiveDate), "dd MMM")} →{" "}
+              {format(new Date(props.segmentTo), "dd MMM")}.
+            </div>
+          )}
+          {grouped.map(([floor, rooms]) => (
+            <div key={String(floor)} className="mt-3">
+              <div className="text-[11px] font-semibold uppercase tracking-wider text-textSecondary mb-1">
+                {floor === "?" ? "Other" : `Floor ${floor}`} · {rooms.length} room
+                {rooms.length === 1 ? "" : "s"}
+              </div>
+              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">
+                {rooms.map((rm) => {
+                  const active = toRoomId === rm.id;
+                  return (
+                    <button
+                      key={rm.id}
+                      type="button"
+                      onClick={() => setToRoomId(rm.id)}
+                      className={`p-2.5 rounded-sm border-2 text-left transition-colors ${
+                        active
+                          ? "border-brand-dark bg-brand-soft"
+                          : "border-borderc hover:border-brand-dark hover:bg-bg"
+                      }`}
+                    >
+                      <div className="font-mono font-bold text-brand-dark text-sm">
+                        {rm.roomNumber}
+                      </div>
+                      <div className="text-[11px] text-textSecondary capitalize truncate">
+                        {rm.roomType}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {err && (
+          <div className="text-sm text-danger bg-danger/5 border border-danger/30 rounded p-2">
+            {err}
+          </div>
+        )}
+
+        <div className="flex items-center justify-end gap-2 pt-1">
+          <button className="btn-secondary" onClick={props.onClose}>
+            Cancel
+          </button>
+          <button
+            className="btn-primary"
+            disabled={!toRoomId || !reason.trim() || swap.isPending || remainingNights <= 0}
+            onClick={() => swap.mutate()}
+          >
+            {swap.isPending ? "Swapping…" : "Confirm Swap"}
+          </button>
+        </div>
+      </div>
+    </ModalShell>
   );
 }
 

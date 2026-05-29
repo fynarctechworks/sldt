@@ -26,7 +26,16 @@ export async function findAvailableRooms(checkIn: string, checkOut: string) {
       and(
         inArray(reservations.status, BLOCKING_STATUSES),
         or(
-          sql`${reservations.stayType} = 'overnight' AND daterange(${reservations.checkInDate}, ${reservations.checkOutDate}, '[)') && daterange(${checkIn}::date, ${checkOut}::date, '[)')`,
+          // Honour per-row effective_from/effective_to when present
+          // (mid-stay room swaps narrow a single reservation_rooms row
+          // to a sub-range of the parent reservation's stay). Falls
+          // back to the parent's check-in/check-out for legacy rows
+          // where the columns are NULL.
+          sql`${reservations.stayType} = 'overnight' AND daterange(
+            COALESCE(${reservationRooms.effectiveFrom}, ${reservations.checkInDate}),
+            COALESCE(${reservationRooms.effectiveTo},   ${reservations.checkOutDate}),
+            '[)'
+          ) && daterange(${checkIn}::date, ${checkOut}::date, '[)')`,
           sql`${reservations.stayType} = 'short_stay' AND ${reservations.checkInDate} >= ${checkIn}::date AND ${reservations.checkInDate} < ${checkOut}::date`,
         ),
       ),
@@ -69,7 +78,11 @@ export async function isRoomAvailable(
     // short_stay (day-use) collapses to an empty range and needs an
     // explicit single-day check against the probe window.
     or(
-      sql`${reservations.stayType} = 'overnight' AND daterange(${reservations.checkInDate}, ${reservations.checkOutDate}, '[)') && daterange(${checkIn}::date, ${checkOut}::date, '[)')`,
+      sql`${reservations.stayType} = 'overnight' AND daterange(
+        COALESCE(${reservationRooms.effectiveFrom}, ${reservations.checkInDate}),
+        COALESCE(${reservationRooms.effectiveTo},   ${reservations.checkOutDate}),
+        '[)'
+      ) && daterange(${checkIn}::date, ${checkOut}::date, '[)')`,
       sql`${reservations.stayType} = 'short_stay' AND ${reservations.checkInDate} >= ${checkIn}::date AND ${reservations.checkInDate} < ${checkOut}::date`,
     ),
     excludeReservationId ? ne(reservations.id, excludeReservationId) : undefined,
