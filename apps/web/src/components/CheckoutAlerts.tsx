@@ -452,18 +452,22 @@ function CheckoutRow({
     <li className={`flex items-center gap-3 px-3 py-2 rounded-md ${cardClass}`}>
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2 flex-wrap">
-          {rooms.map((rm) => (
-            <span
-              key={rm}
-              className={`font-mono text-[13px] font-extrabold px-2 py-0.5 rounded ${
-                onRedRow
-                  ? "bg-cream/20 text-cream"
-                  : "bg-bg text-brand-dark border border-borderc"
-              }`}
-            >
-              Room {rm}
-            </span>
-          ))}
+          {rooms.map((rm) => {
+            const isSwap = rm.includes("→");
+            return (
+              <span
+                key={rm}
+                title={isSwap ? "Room swapped mid-stay" : undefined}
+                className={`font-mono text-[13px] font-extrabold px-2 py-0.5 rounded ${
+                  onRedRow
+                    ? "bg-cream/20 text-cream"
+                    : "bg-bg text-brand-dark border border-borderc"
+                }`}
+              >
+                Room {rm.replace("→", " → ")}
+              </span>
+            );
+          })}
           <span className="font-semibold text-[14px] truncate">
             {row.guestName}
           </span>

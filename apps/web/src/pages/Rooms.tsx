@@ -424,13 +424,21 @@ function RoomModal({ room, onClose }: { room: Room | null; onClose: () => void }
   }
 
   useEffect(() => {
-    if (!form.roomType && roomTypes.length && !isEdit) {
+    if (!roomTypes.length) return;
+    // Fill an empty type on create (no room yet) OR on edit where the
+    // existing slug doesn't match any current room_types row (legacy
+    // slug, archived type, etc.). Without this fallback the <select>
+    // visually shows the first option but form.roomType stays empty,
+    // so submit fails server-side with "must contain at least 1
+    // character".
+    const hasMatch = roomTypes.some((t) => t.slug === form.roomType);
+    if (!form.roomType || !hasMatch) {
       const first = roomTypes[0]!;
       setForm((f) => ({
         ...f,
         roomType: first.slug,
-        baseRate: Number(first.defaultRate),
-        maxOccupancy: Number(first.maxOccupancy),
+        baseRate: isEdit ? f.baseRate : Number(first.defaultRate),
+        maxOccupancy: isEdit ? f.maxOccupancy : Number(first.maxOccupancy),
       }));
     }
   }, [roomTypes, form.roomType, isEdit]);

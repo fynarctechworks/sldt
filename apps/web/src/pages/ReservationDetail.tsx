@@ -644,6 +644,8 @@ export default function ReservationDetail() {
                 room={room}
                 reservationCheckIn={r.checkInDate}
                 reservationCheckOut={r.checkOutDate}
+                isShortStay={r.stayType === "short_stay"}
+                isSingleNight={r.stayType !== "short_stay" && nights <= 1}
                 nights={nights}
                 onSaved={invalidate}
                 onInvoiceIssuedNeedsPayment={(inv) =>
@@ -678,6 +680,7 @@ export default function ReservationDetail() {
                   key={c.id}
                   reservationId={r.id}
                   charge={c}
+                  gstMode={r.gstMode ?? "exclusive"}
                   canEdit={!invoice}
                   onSaved={invalidate}
                 />
@@ -1224,6 +1227,12 @@ function RoomRow(props: {
   // constrain the effective date picker.
   reservationCheckIn: string;
   reservationCheckOut: string;
+  // Day-use bookings swap in-place (no segmentation, no effective date)
+  // because they cover a single calendar day.
+  isShortStay: boolean;
+  // 1-night overnight stays also swap in-place — there's no meaningful
+  // sub-range to segment when the segment is exactly one night long.
+  isSingleNight: boolean;
   nights: number;
   onSaved: () => void;
   // Called when a per-room invoice was just issued AND it still has a
@@ -1436,18 +1445,19 @@ function RoomRow(props: {
                 }
               />
             )}
-          {props.room.roomStatus === "checked_in" &&
-            !props.room.roomInvoiceId &&
-            // Need at least one full night left in the segment to swap.
-            differenceInCalendarDays(new Date(segTo), new Date(segFrom)) > 1 && (
-              <button
-                className="btn-secondary !h-7 !px-2 text-xs"
-                onClick={() => setShowSwap(true)}
-                title="Move this guest to a different room for the remainder of the stay"
-              >
-                Swap
-              </button>
-            )}
+          {props.room.roomStatus === "checked_in" && !props.room.roomInvoiceId && (
+            <button
+              className="btn-secondary !h-7 !px-2 text-xs"
+              onClick={() => setShowSwap(true)}
+              title={
+                props.isShortStay
+                  ? "Move this guest to a different room (same day)"
+                  : "Move this guest to a different room"
+              }
+            >
+              Swap
+            </button>
+          )}
           {props.room.roomStatus === "checked_in" && (
             <button
               className="btn-secondary !h-7 !px-2 text-xs"
@@ -1508,6 +1518,11 @@ function RoomRow(props: {
         fromRoomNumber={props.room.roomNumber}
         segmentFrom={segFrom}
         segmentTo={segTo}
+        // "In-place" = no effective-date segmentation. Day-use stays
+        // are one calendar day; 1-night overnight stays have nothing
+        // meaningful to split. Both swap the room_id outright.
+        isShortStay={props.isShortStay}
+        inPlace={props.isShortStay || props.isSingleNight}
         onClose={() => setShowSwap(false)}
         onDone={() => {
           setShowSwap(false);
@@ -1525,10 +1540,19 @@ function SwapRoomModal(props: {
   fromRoomNumber: string;
   segmentFrom: string;
   segmentTo: string;
+  // Drives copy ("day use" vs "stay"). The actual no-segmentation
+  // path is controlled by `inPlace`.
+  isShortStay: boolean;
+  // True when the swap should NOT create a new segment — used for
+  // day-use bookings (single calendar day) and 1-night overnight
+  // stays (no meaningful sub-range). The API ignores effectiveDate
+  // for short_stay; for 1-night overnight we omit it here and let
+  // the existing in-place path apply.
+  inPlace: boolean;
   onClose: () => void;
   onDone: () => void;
 }) {
-  // Effective date must lie strictly inside the segment.
+  // Effective date must lie strictly inside the segment. (Overnight only.)
   // Default to "tomorrow inside the segment" — most swaps are
   // "starting tonight / next check-in".
   const minEffective = (() => {
@@ -1553,6 +1577,21 @@ function SwapRoomModal(props: {
   >("maintenance");
   const [err, setErr] = useState<string | null>(null);
 
+  // Availability probe window:
+  //   - day-use: single calendar day [segmentFrom, segmentFrom + 1)
+  //   - in-place overnight (1-night stay): full segment [segmentFrom, segmentTo)
+  //   - segmented overnight (multi-night): [effectiveDate, segmentTo)
+  const probeIn = props.isShortStay
+    ? props.segmentFrom
+    : props.inPlace
+      ? props.segmentFrom
+      : effectiveDate;
+  const probeOut = props.isShortStay
+    ? new Date(new Date(props.segmentFrom).getTime() + 24 * 60 * 60 * 1000)
+        .toISOString()
+        .slice(0, 10)
+    : props.segmentTo;
+
   type AvailRoom = {
     id: string;
     roomNumber: string;
@@ -1562,13 +1601,13 @@ function SwapRoomModal(props: {
     status?: string;
   };
   const avail = useQuery({
-    queryKey: ["availability", effectiveDate, props.segmentTo],
+    queryKey: ["availability", probeIn, probeOut],
     queryFn: () =>
       api.get<AvailRoom[]>("/rooms/availability", {
-        check_in: effectiveDate,
-        check_out: props.segmentTo,
+        check_in: probeIn,
+        check_out: probeOut,
       }),
-    enabled: effectiveDate < props.segmentTo,
+    enabled: probeIn < probeOut,
   });
 
   const swap = useMutation({
@@ -1576,7 +1615,10 @@ function SwapRoomModal(props: {
       api.post(`/reservations/${props.reservationId}/swap-room-segment`, {
         fromReservationRoomId: props.fromReservationRoomId,
         toRoomId,
-        effectiveDate,
+        // effectiveDate is only meaningful when we're creating a new
+        // segment. In-place swaps (short_stay or 1-night overnight)
+        // omit it; the server treats those as full-row replacements.
+        ...(props.inPlace ? {} : { effectiveDate }),
         reason,
         markOldRoomStatus,
       }),
@@ -1584,10 +1626,11 @@ function SwapRoomModal(props: {
     onError: (e: Error) => setErr(e.message),
   });
 
-  const remainingNights = differenceInCalendarDays(
-    new Date(props.segmentTo),
-    new Date(effectiveDate),
-  );
+  const remainingNights = props.inPlace
+    ? props.isShortStay
+      ? 1 // day-use is one calendar day
+      : differenceInCalendarDays(new Date(props.segmentTo), new Date(props.segmentFrom))
+    : differenceInCalendarDays(new Date(props.segmentTo), new Date(effectiveDate));
 
   // Group by floor for readability — mirrors NewReservation + AddRoomModal.
   const grouped = (() => {
@@ -1614,32 +1657,54 @@ function SwapRoomModal(props: {
     >
       <div className="space-y-4">
         <div className="text-sm text-textSecondary">
-          Current room <strong>{props.fromRoomNumber}</strong> is occupied
-          from <strong>{format(new Date(props.segmentFrom), "dd MMM")}</strong>{" "}
-          to <strong>{format(new Date(props.segmentTo), "dd MMM")}</strong>.
-          Pick the date the guest moves and the new room. Rate, GST, advance
-          and the invoice are not affected.
+          {props.isShortStay ? (
+            <>
+              Day-use guest in room <strong>{props.fromRoomNumber}</strong>.
+              Pick the new room. Charges, GST and the duration are not affected.
+            </>
+          ) : props.inPlace ? (
+            <>
+              Guest in room <strong>{props.fromRoomNumber}</strong> for{" "}
+              <strong>1 night</strong> (
+              {format(new Date(props.segmentFrom), "dd MMM")} →{" "}
+              {format(new Date(props.segmentTo), "dd MMM")}). Pick the new
+              room. Rate, GST and the invoice are not affected.
+            </>
+          ) : (
+            <>
+              Current room <strong>{props.fromRoomNumber}</strong> is occupied
+              from{" "}
+              <strong>{format(new Date(props.segmentFrom), "dd MMM")}</strong>{" "}
+              to <strong>{format(new Date(props.segmentTo), "dd MMM")}</strong>.
+              Pick the date the guest moves and the new room. Rate, GST,
+              advance and the invoice are not affected.
+            </>
+          )}
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          <div>
-            <label className="label block mb-1">
-              Effective date <span className="text-danger">*</span>
-            </label>
-            <input
-              className="input"
-              type="date"
-              min={minEffective}
-              max={maxEffective}
-              value={effectiveDate}
-              onChange={(e) => setEffectiveDate(e.target.value)}
-            />
-            <div className="text-[11px] text-textSecondary mt-1">
-              {remainingNights > 0
-                ? `${remainingNights} night${remainingNights === 1 ? "" : "s"} in the new room`
-                : "Pick a date inside the stay window"}
+        <div
+          className={props.inPlace ? "" : "grid grid-cols-1 sm:grid-cols-2 gap-3"}
+        >
+          {!props.inPlace && (
+            <div>
+              <label className="label block mb-1">
+                Effective date <span className="text-danger">*</span>
+              </label>
+              <input
+                className="input"
+                type="date"
+                min={minEffective}
+                max={maxEffective}
+                value={effectiveDate}
+                onChange={(e) => setEffectiveDate(e.target.value)}
+              />
+              <div className="text-[11px] text-textSecondary mt-1">
+                {remainingNights > 0
+                  ? `${remainingNights} night${remainingNights === 1 ? "" : "s"} in the new room`
+                  : "Pick a date inside the stay window"}
+              </div>
             </div>
-          </div>
+          )}
           <div>
             <label className="label block mb-1">
               Reason <span className="text-danger">*</span>
@@ -1693,8 +1758,9 @@ function SwapRoomModal(props: {
           )}
           {!avail.isLoading && (avail.data?.length ?? 0) === 0 && (
             <div className="text-sm text-textSecondary">
-              No rooms available for {format(new Date(effectiveDate), "dd MMM")} →{" "}
-              {format(new Date(props.segmentTo), "dd MMM")}.
+              {props.isShortStay
+                ? `No rooms available on ${format(new Date(probeIn), "dd MMM")}.`
+                : `No rooms available for ${format(new Date(probeIn), "dd MMM")} → ${format(new Date(props.segmentTo), "dd MMM")}.`}
             </div>
           )}
           {grouped.map(([floor, rooms]) => (
@@ -1757,20 +1823,66 @@ function SwapRoomModal(props: {
 function ChargeRow(props: {
   reservationId: string;
   charge: { id: string; description: string; amount: string; gstRate: string; createdAt: string; quantity?: number; rate?: string };
+  // Reservation's GST mode. In inclusive mode the stored `amount` is
+  // NET (recalc adds GST on top to reach the gross the guest agreed
+  // to), so we display gross here. In exclusive mode `amount` is
+  // already what the guest pays for this line, so we display as-is.
+  gstMode: "exclusive" | "inclusive";
   canEdit: boolean;
   onSaved: () => void;
 }) {
   const dialog = useDialog();
   const [editing, setEditing] = useState(false);
   const [description, setDescription] = useState(props.charge.description);
-  const [amount, setAmount] = useState(Number(props.charge.amount));
+  const netAmount = Number(props.charge.amount);
+  const gstRateNum = Number(props.charge.gstRate);
+  // Reconstruct gross for inclusive-mode rows; exclusive stores gross.
+  const grossAmount =
+    props.gstMode === "inclusive"
+      ? +(netAmount * (1 + gstRateNum / 100)).toFixed(2)
+      : netAmount;
+  // Stay-extension rows store the per-night DELTA so the math sums
+  // cleanly with the room line that already bills the added night(s)
+  // at the original rate. For display we surface the FULL new-night
+  // cost the guest agreed to (parsed from the description), since
+  // "₹500 delta" reads as confusing on a bill. The stored row is
+  // never mutated.
+  const extensionDisplay = (() => {
+    const desc = props.charge.description;
+    if (!/stay extension/i.test(desc)) return null;
+    const nightsMatch = /(\d+)\s*(?:nights?|n)\b/i.exec(desc);
+    if (!nightsMatch) return null;
+    const nights = Number(nightsMatch[1]);
+    // Two description formats:
+    //   - new: "(₹1500 → ₹2000)" — take the right side
+    //   - legacy: "@ ₹2000.00/night" — take the value after @
+    const arrow = /₹?\d[\d,.]*\s*(?:→|->)\s*₹?(\d[\d,.]*)/.exec(desc);
+    const atRate = /@\s*₹?(\d[\d,.]*)\s*\/\s*(?:night|n)\b/i.exec(desc);
+    const raw = arrow?.[1] ?? atRate?.[1];
+    if (!raw) return null;
+    const newRate = Number(raw.replace(/,/g, ""));
+    if (!nights || !newRate) return null;
+    return +(nights * newRate).toFixed(2);
+  })();
+  const displayAmount = extensionDisplay ?? grossAmount;
+  // The edit input stays in the SAME basis as the display: gross under
+  // inclusive mode, net under exclusive. On save we convert back to
+  // net before POSTing — see the save mutation below.
+  const [amount, setAmount] = useState(displayAmount);
   const save = useMutation({
-    mutationFn: () =>
-      api.patch(`/reservations/${props.reservationId}/charges/${props.charge.id}`, {
+    mutationFn: () => {
+      // Convert the displayed value (gross under inclusive) back to
+      // the net basis the server stores. Exclusive mode is already net.
+      const netRate =
+        props.gstMode === "inclusive"
+          ? +(amount / (1 + gstRateNum / 100)).toFixed(2)
+          : amount;
+      return api.patch(`/reservations/${props.reservationId}/charges/${props.charge.id}`, {
         description,
         quantity: 1,
-        rate: amount,
-      }),
+        rate: netRate,
+      });
+    },
     onSuccess: () => {
       setEditing(false);
       props.onSaved();
@@ -1809,7 +1921,7 @@ function ChargeRow(props: {
             onChange={(e) => setAmount(Number(e.target.value))}
           />
         ) : (
-          inr(props.charge.amount)
+          inr(displayAmount)
         )}
       </td>
       <td className="text-right">
@@ -1845,7 +1957,7 @@ function ChargeRow(props: {
               className="btn-secondary !h-7 !px-2 text-xs"
               onClick={() => {
                 setDescription(props.charge.description);
-                setAmount(Number(props.charge.amount));
+                setAmount(displayAmount);
                 setEditing(false);
               }}
             >

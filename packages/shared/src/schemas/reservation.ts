@@ -146,7 +146,9 @@ export const swapRoomSchema = z.object({
 export const swapRoomSegmentSchema = z.object({
   fromReservationRoomId: z.string().uuid(),
   toRoomId: z.string().uuid(),
-  effectiveDate: z.string().date(),
+  // Required for overnight bookings; ignored for short_stay (day-use)
+  // where the swap is in-place on the single calendar day.
+  effectiveDate: z.string().date().optional(),
   reason: z.string().min(1).max(500),
   markOldRoomStatus: z
     .enum(["maintenance", "dirty", "available"])
@@ -177,10 +179,19 @@ export const voidInvoiceSchema = z.object({
   reason: z.string().min(1).max(500),
 });
 
-export const availabilityQuerySchema = z.object({
-  check_in: z.string().date(),
-  check_out: z.string().date(),
-});
+export const availabilityQuerySchema = z
+  .object({
+    check_in: z.string().date(),
+    check_out: z.string().date(),
+  })
+  // Postgres collapses daterange(X, X, '[)') to an empty range that
+  // overlaps nothing — silently returning "all rooms available". For
+  // day-use bookings, callers must widen to [d, d+1) so the
+  // short_stay branch in availability.ts actually fires.
+  .refine((d) => d.check_out > d.check_in, {
+    message: "check_out must be strictly after check_in (use [d, d+1) for day-use)",
+    path: ["check_out"],
+  });
 
 export const extendReservationSchema = z.object({
   newCheckOutDate: z.string().date(),

@@ -12,6 +12,13 @@ type Exec = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 const BLOCKING_STATUSES = [...RESERVATION_BLOCKING_STATUSES];
 
 export async function findAvailableRooms(checkIn: string, checkOut: string) {
+  // See isRoomAvailable for the same guard rationale.
+  if (checkOut <= checkIn) {
+    throw new Error(
+      `findAvailableRooms: invalid probe window [${checkIn}, ${checkOut}). ` +
+        "For day-use bookings probe [d, d+1).",
+    );
+  }
   // Two-tier conflict check:
   //  - overnight bookings → standard half-open daterange overlap.
   //  - short_stay (day-use) bookings → checkInDate == checkOutDate,
@@ -71,6 +78,18 @@ export async function isRoomAvailable(
   excludeReservationId?: string,
   exec: Exec = db,
 ): Promise<boolean> {
+  // Hard guard against a degenerate probe window. Postgres collapses
+  // daterange(X, X, '[)') to an empty range that overlaps nothing —
+  // silently returning "available". Historical bug: callers passing
+  // the parent reservation's check-in/check-out for a short_stay
+  // booking (where they're equal) would bypass the conflict check.
+  // Surface it loudly instead of pretending the room is free.
+  if (checkOut <= checkIn) {
+    throw new Error(
+      `isRoomAvailable: invalid probe window [${checkIn}, ${checkOut}). ` +
+        "For day-use bookings probe [d, d+1) so the short_stay branch fires.",
+    );
+  }
   const overlap = and(
     eq(reservationRooms.roomId, roomId),
     inArray(reservations.status, BLOCKING_STATUSES),

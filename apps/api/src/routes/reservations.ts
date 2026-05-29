@@ -461,11 +461,22 @@ router.post(
           await lockRoom(tx, rid);
         }
 
+        // For short_stay (checkInDate === checkOutDate), [d, d) collapses
+        // to an empty Postgres range and the daterange overlap silently
+        // passes. Widen the probe to [d, d+1) so the lib's short_stay
+        // branch fires — without this, two concurrent same-day day-use
+        // creates for the same room both pass this check and race-insert.
+        const isShortStay = input.stayType === "short_stay";
+        const probeOut = isShortStay
+          ? new Date(new Date(input.checkInDate).getTime() + 86400000)
+              .toISOString()
+              .slice(0, 10)
+          : input.checkOutDate;
         for (const roomId of roomIds) {
           const ok = await isRoomAvailable(
             roomId,
             input.checkInDate,
-            input.checkOutDate,
+            probeOut,
             undefined,
             tx,
           );
@@ -795,19 +806,19 @@ router.get(
       assigned.reduce((a, rm) => a + Number(rm.ratePerNight) * newNights, 0)
     ).toFixed(2);
 
-    const settings = await getSettings();
-    const avgRate = assigned.length ? newRoomAmount / (newNights * assigned.length) : 0;
-    const newGstRate = getGstRate(avgRate, {
-      exemptBelow: Number(settings.gstSlabExemptBelow),
-      lowRate: Number(settings.gstSlabLowRate),
-      lowMax: Number(settings.gstSlabLowMax),
-      highRate: Number(settings.gstSlabHighRate),
-    });
+    // Inherit the reservation's snapshotted GST rate + mode — DO NOT
+    // re-derive from the slab. Adding nights to an existing booking
+    // must keep the same tax treatment, otherwise crossing a slab
+    // boundary by adding cheap/expensive nights would silently change
+    // the tax on rooms that were already priced.
+    const newGstRate = Number(current.gstRate);
+    const reservationGstMode = current.gstMode ?? "exclusive";
     const {
       subtotal: newSubtotal,
       gstAmount: newGstAmount,
       grandTotal: newGrandTotal,
-    } = calcGstBreakdown(newRoomAmount, newGstRate, settings.gstMode ?? "exclusive");
+    } = calcGstBreakdown(newRoomAmount, newGstRate, reservationGstMode);
+    void getGstRate;
     const advancePaid = Number(current.advancePaid);
     const newBalanceDue = +(newGrandTotal - advancePaid).toFixed(2);
 
@@ -935,21 +946,18 @@ router.post(
           roomRates.reduce((a, rm) => a + Number(rm.ratePerNight) * newNights, 0)
         ).toFixed(2);
 
-        const settings = await getSettings();
+        // Inherit reservation's snapshot — see /early-check-in/preview.
+        const gstRate = Number(current.gstRate);
+        const reservationGstMode = current.gstMode ?? "exclusive";
         const avgRate = roomRates.length
           ? newRoomAmount / (newNights * roomRates.length)
           : 0;
-        const gstRate = getGstRate(avgRate, {
-          exemptBelow: Number(settings.gstSlabExemptBelow),
-          lowRate: Number(settings.gstSlabLowRate),
-          lowMax: Number(settings.gstSlabLowMax),
-          highRate: Number(settings.gstSlabHighRate),
-        });
         const { subtotal: newSubtotal, gstAmount, grandTotal } = calcGstBreakdown(
           newRoomAmount,
           gstRate,
-          settings.gstMode ?? "exclusive",
+          reservationGstMode,
         );
+        void getGstRate;
         const balanceDue = +(grandTotal - Number(current.advancePaid)).toFixed(2);
 
         await tx
@@ -2353,7 +2361,17 @@ router.post(
       return fail(res, 409, "INVALID_STATUS", `Cannot swap room on ${r[0]!.status}`);
     }
 
-    const available = await isRoomAvailable(newRoomId, r[0]!.checkInDate, r[0]!.checkOutDate, id);
+    // For short_stay (day-use), checkInDate == checkOutDate would collapse
+    // to an empty Postgres daterange and silently pass the availability
+    // check. Widen the probe to [d, d+1) so the lib's short_stay branch
+    // fires (mirrors the same widening used in availability.ts).
+    const probeOut =
+      r[0]!.stayType === "short_stay"
+        ? new Date(new Date(r[0]!.checkInDate).getTime() + 86400000)
+            .toISOString()
+            .slice(0, 10)
+        : r[0]!.checkOutDate;
+    const available = await isRoomAvailable(newRoomId, r[0]!.checkInDate, probeOut, id);
     if (!available) return fail(res, 409, "ROOM_UNAVAILABLE", "New room is not available");
 
     const oldRows = await db
@@ -2425,14 +2443,6 @@ router.post(
         `Room swap is only valid for a checked-in reservation (status: ${reservation.status})`,
       );
     }
-    if (reservation.stayType === "short_stay") {
-      return fail(
-        res,
-        409,
-        "SHORT_STAY_NOT_SUPPORTED",
-        "Mid-stay swap is not available for day-use bookings",
-      );
-    }
 
     const segs = await db
       .select()
@@ -2462,76 +2472,129 @@ router.post(
       return fail(res, 400, "SAME_ROOM", "Target room is the same as the current room");
     }
 
-    const segFrom = seg.effectiveFrom ?? reservation.checkInDate;
-    const segTo = seg.effectiveTo ?? reservation.checkOutDate;
-    // Effective date must fall strictly inside the current segment —
-    // not on either boundary (a swap on the check-in date is just an
-    // edit; a swap on the check-out date is a no-op).
-    if (input.effectiveDate <= segFrom || input.effectiveDate >= segTo) {
-      return fail(
-        res,
-        400,
-        "EFFECTIVE_OUT_OF_RANGE",
-        `Effective date must be between ${segFrom} and ${segTo} (exclusive)`,
-      );
-    }
-
-    // The new room must be free for [effectiveDate, segTo).
-    const available = await isRoomAvailable(
-      input.toRoomId,
-      input.effectiveDate,
-      segTo,
-      id,
-    );
-    if (!available) {
-      return fail(res, 409, "ROOM_UNAVAILABLE", "Target room is not available for the remainder of the stay");
-    }
-
     const swapId = randomUUID();
     const now = new Date();
+    const isShortStay = reservation.stayType === "short_stay";
+    // In-place swap (no segmentation):
+    //   - day-use bookings (one calendar day, nothing to split)
+    //   - overnight bookings where the caller omitted effectiveDate.
+    //     This covers 1-night stays where there's no meaningful
+    //     sub-range; the UI also uses this for any "swap immediately,
+    //     don't bother splitting" case.
+    const inPlace = isShortStay || !input.effectiveDate;
 
-    await db.transaction(async (tx) => {
-      // 1. Close the old segment at the swap date.
-      await tx
-        .update(reservationRooms)
-        .set({
-          effectiveFrom: segFrom,
-          effectiveTo: input.effectiveDate,
+    if (inPlace) {
+      // Re-point the row at the new room and rotate housekeeping status.
+      // Charges, rate, GST, duration — all untouched.
+      const probeIn = reservation.checkInDate;
+      const probeOut = isShortStay
+        ? // short_stay availability probes [d, d+1) — the +1 day matches
+          // the lib's single-day branch.
+          new Date(new Date(probeIn).getTime() + 24 * 60 * 60 * 1000)
+            .toISOString()
+            .slice(0, 10)
+        : reservation.checkOutDate;
+      const available = await isRoomAvailable(
+        input.toRoomId,
+        probeIn,
+        probeOut,
+        id,
+      );
+      if (!available) {
+        return fail(res, 409, "ROOM_UNAVAILABLE", "Target room is not available for this stay");
+      }
+
+      await db.transaction(async (tx) => {
+        await tx
+          .update(reservationRooms)
+          .set({
+            roomId: input.toRoomId,
+            swapId,
+            swapReason: input.reason,
+          })
+          .where(eq(reservationRooms.id, seg.id));
+        await tx
+          .update(rooms)
+          .set({ status: input.markOldRoomStatus, updatedAt: now })
+          .where(eq(rooms.id, seg.roomId));
+        await tx
+          .update(rooms)
+          .set({ status: "occupied", updatedAt: now })
+          .where(eq(rooms.id, input.toRoomId));
+      });
+    } else {
+      // Overnight + caller provided effectiveDate → segment the row.
+      // The `inPlace` guard above already returned `effectiveDate`
+      // present, so the non-null assertion is sound.
+      const effectiveDate = input.effectiveDate!;
+      const segFrom = seg.effectiveFrom ?? reservation.checkInDate;
+      const segTo = seg.effectiveTo ?? reservation.checkOutDate;
+      // Effective date must fall strictly inside the current segment —
+      // not on either boundary (a swap on the check-in date is just an
+      // edit; a swap on the check-out date is a no-op).
+      if (effectiveDate <= segFrom || effectiveDate >= segTo) {
+        return fail(
+          res,
+          400,
+          "EFFECTIVE_OUT_OF_RANGE",
+          `Effective date must be between ${segFrom} and ${segTo} (exclusive)`,
+        );
+      }
+
+      // The new room must be free for [effectiveDate, segTo).
+      const available = await isRoomAvailable(
+        input.toRoomId,
+        effectiveDate,
+        segTo,
+        id,
+      );
+      if (!available) {
+        return fail(res, 409, "ROOM_UNAVAILABLE", "Target room is not available for the remainder of the stay");
+      }
+
+      await db.transaction(async (tx) => {
+        // 1. Close the old segment at the swap date.
+        await tx
+          .update(reservationRooms)
+          .set({
+            effectiveFrom: segFrom,
+            effectiveTo: effectiveDate,
+            swapId,
+            swapReason: input.reason,
+          })
+          .where(eq(reservationRooms.id, seg.id));
+
+        // 2. Insert a new segment for the remainder of the stay.
+        // Same rate / guest / invoice — only room_id and dates change.
+        await tx.insert(reservationRooms).values({
+          reservationId: id,
+          roomId: input.toRoomId,
+          ratePerNight: seg.ratePerNight,
+          soldAsType: seg.soldAsType,
+          guestId: seg.guestId,
+          status: "checked_in",
+          checkedInAt: now,
+          checkedInBy: req.user!.id,
+          invoiceId: seg.invoiceId,
+          effectiveFrom: effectiveDate,
+          effectiveTo: segTo,
           swapId,
           swapReason: input.reason,
-        })
-        .where(eq(reservationRooms.id, seg.id));
+        });
 
-      // 2. Insert a new segment for the remainder of the stay.
-      // Same rate / guest / invoice — only room_id and dates change.
-      await tx.insert(reservationRooms).values({
-        reservationId: id,
-        roomId: input.toRoomId,
-        ratePerNight: seg.ratePerNight,
-        soldAsType: seg.soldAsType,
-        guestId: seg.guestId,
-        status: "checked_in",
-        checkedInAt: now,
-        checkedInBy: req.user!.id,
-        invoiceId: seg.invoiceId,
-        effectiveFrom: input.effectiveDate,
-        effectiveTo: segTo,
-        swapId,
-        swapReason: input.reason,
+        // 3. Vacated room → markOldRoomStatus (defaults to maintenance).
+        await tx
+          .update(rooms)
+          .set({ status: input.markOldRoomStatus, updatedAt: now })
+          .where(eq(rooms.id, seg.roomId));
+
+        // 4. New room → occupied.
+        await tx
+          .update(rooms)
+          .set({ status: "occupied", updatedAt: now })
+          .where(eq(rooms.id, input.toRoomId));
       });
-
-      // 3. Vacated room → markOldRoomStatus (defaults to maintenance).
-      await tx
-        .update(rooms)
-        .set({ status: input.markOldRoomStatus, updatedAt: now })
-        .where(eq(rooms.id, seg.roomId));
-
-      // 4. New room → occupied.
-      await tx
-        .update(rooms)
-        .set({ status: "occupied", updatedAt: now })
-        .where(eq(rooms.id, input.toRoomId));
-    });
+    }
 
     await logActivity({
       action: "room_swap_segment",
@@ -2687,12 +2750,18 @@ router.post(
       // Only create a charge if the agreed rate actually differs. A zero
       // or negative-rounding delta means "same rate" → nothing to add.
       if (Math.abs(deltaAmount) > 0.009) {
-        const gstRate = getGstRate(input.ratePerNight, {
-          exemptBelow: Number(settings.gstSlabExemptBelow),
-          lowRate: Number(settings.gstSlabLowRate),
-          lowMax: Number(settings.gstSlabLowMax),
-          highRate: Number(settings.gstSlabHighRate),
-        });
+        // Reuse the reservation's own snapshotted GST rate so the
+        // extension follows the same tax treatment as the original
+        // nights — never re-derive from the slab based on the new
+        // rate. Re-deriving caused a single booking to carry rooms
+        // at one rate and an extension line at a different rate
+        // (e.g. 0% room + 5% extension when the new rate crossed a
+        // slab boundary).
+        const gstRate = Number(current.gstRate);
+        // Touch the helpers/settings reads so removing them in a
+        // future cleanup is intentional, not silent.
+        void getGstRate;
+        void settings;
         // In inclusive mode, convert the gross delta to its net portion
         // so recalc's add-GST-on-top yields the original gross. In
         // exclusive mode the delta is already net — store as-is.
@@ -2701,11 +2770,27 @@ router.post(
             ? calcGstBreakdown(deltaAmount, gstRate, "inclusive").subtotal
             : deltaAmount;
         const nightWord = extraNights === 1 ? "night" : "nights";
+        // Describe the line as a RATE DELTA, not a full nightly charge.
+        // The added night(s) are already billed on the room line at the
+        // original rate; this charge captures only the difference. Using
+        // "₹X/n" in the description previously read as "this line costs
+        // ₹X" which is misleading.
+        const sample = assigned[0]
+          ? Number(assigned[0].ratePerNight)
+          : input.ratePerNight;
+        const uniform = assigned.every(
+          (rm) => Math.abs(Number(rm.ratePerNight) - sample) < 0.009,
+        );
+        const rateChange =
+          assigned.length > 0 && uniform
+            ? ` (${assigned.length === 1 ? "" : `${assigned.length} rooms `}₹${sample.toFixed(0)} → ₹${input.ratePerNight.toFixed(0)})`
+            : "";
+        const inclLabel = reservationGstMode === "inclusive" ? " (incl. GST)" : "";
         const [charge] = await db
           .insert(additionalCharges)
           .values({
             reservationId: id,
-            description: `Stay extension — ${extraNights} ${nightWord} @ ₹${input.ratePerNight.toFixed(2)}/night${reservationGstMode === "inclusive" ? " (incl. GST)" : ""}`,
+            description: `Stay extension rate adjustment — ${extraNights} ${nightWord}${rateChange}${inclLabel}`,
             quantity: 1,
             rate: String(storedAmount.toFixed(2)),
             amount: String(storedAmount.toFixed(2)),
@@ -2958,20 +3043,30 @@ router.post(
         }
         deltaAmount = +deltaAmount.toFixed(2);
         if (Math.abs(deltaAmount) > 0.009) {
-          const gstRate = getGstRate(input.ratePerNight, {
-            exemptBelow: Number(settings.gstSlabExemptBelow),
-            lowRate: Number(settings.gstSlabLowRate),
-            lowMax: Number(settings.gstSlabLowMax),
-            highRate: Number(settings.gstSlabHighRate),
-          });
+          // Inherit the reservation's locked GST rate — see /extend
+          // for the rationale (same booking, same tax treatment).
+          const gstRate = Number(current.gstRate);
+          void getGstRate;
+          void settings;
           const storedAmount =
             reservationGstMode === "inclusive"
               ? calcGstBreakdown(deltaAmount, gstRate, "inclusive").subtotal
               : deltaAmount;
           const nightWord = extraNights === 1 ? "night" : "nights";
+          const sample = picked[0]
+            ? Number(picked[0].ratePerNight)
+            : input.ratePerNight;
+          const uniform = picked.every(
+            (rm) => Math.abs(Number(rm.ratePerNight) - sample) < 0.009,
+          );
+          const rateChange =
+            picked.length > 0 && uniform
+              ? ` (${picked.length === 1 ? "" : `${picked.length} rooms `}₹${sample.toFixed(0)} → ₹${input.ratePerNight.toFixed(0)})`
+              : "";
+          const inclLabel = reservationGstMode === "inclusive" ? " (incl. GST)" : "";
           await tx.insert(additionalCharges).values({
             reservationId: newReservationId,
-            description: `Stay extension — ${extraNights} ${nightWord} @ ₹${input.ratePerNight.toFixed(2)}/night${reservationGstMode === "inclusive" ? " (incl. GST)" : ""}`,
+            description: `Stay extension rate adjustment — ${extraNights} ${nightWord}${rateChange}${inclLabel}`,
             quantity: 1,
             rate: String(storedAmount.toFixed(2)),
             amount: String(storedAmount.toFixed(2)),
@@ -3194,15 +3289,13 @@ router.post(
         );
     const addedRoomAmount = +(input.ratePerNight * addedNights).toFixed(2);
 
-    const settings = await getSettings();
-    const gstMode = settings.gstMode ?? "exclusive";
-    const gstRate = getGstRate(input.ratePerNight, {
-      exemptBelow: Number(settings.gstSlabExemptBelow),
-      lowRate: Number(settings.gstSlabLowRate),
-      lowMax: Number(settings.gstSlabLowMax),
-      highRate: Number(settings.gstSlabHighRate),
-    });
-    const effectiveGstRate = Math.max(Number(current.gstRate), gstRate);
+    // Inherit the reservation's snapshotted GST rate + mode. Adding a
+    // room must NOT re-derive from the slab — that bumped the entire
+    // reservation's tax rate whenever the new room crossed a slab
+    // boundary, silently re-taxing rooms already on the bill.
+    const gstMode = current.gstMode ?? "exclusive";
+    const effectiveGstRate = Number(current.gstRate);
+    void getGstRate;
     // Combine the existing booking with the added room. In exclusive
     // mode we sum the stored net subtotals (input.ratePerNight is net).
     // In inclusive mode we sum gross amounts (input.ratePerNight is gross,
@@ -3315,14 +3408,15 @@ async function recalcReservation(id: string) {
   const reservationGstMode = current.gstMode ?? "exclusive";
   const roomAmount = assigned.reduce((a, rm) => a + Number(rm.ratePerNight) * nights, 0);
 
-  const settings = await getSettings();
+  // ALWAYS inherit the reservation's snapshotted GST rate. Re-deriving
+  // from the slab on every recalc made the rate drift whenever the
+  // average room rate crossed a slab boundary (e.g. after Add Room,
+  // Extend Stay, or Edit Rate). The snapshot is set once at create
+  // time and is the source of truth for the life of the booking.
+  const roomGstRate = Number(current.gstRate);
   const avgRate = assigned.length ? roomAmount / (nights * assigned.length) : 0;
-  const roomGstRate = getGstRate(avgRate, {
-    exemptBelow: Number(settings.gstSlabExemptBelow),
-    lowRate: Number(settings.gstSlabLowRate),
-    lowMax: Number(settings.gstSlabLowMax),
-    highRate: Number(settings.gstSlabHighRate),
-  });
+  void avgRate;
+  void getGstRate;
   const roomBreakdown = calcGstBreakdown(roomAmount, roomGstRate, reservationGstMode);
   const roomNet = roomBreakdown.subtotal;
   const roomGst = roomBreakdown.gstAmount;
@@ -3506,8 +3600,17 @@ router.patch(
       .select({ roomId: reservationRooms.roomId })
       .from(reservationRooms)
       .where(eq(reservationRooms.reservationId, id));
+    // Day-use bookings collapse [d, d) to an empty range — widen the
+    // probe to [d, d+1) so the short_stay branch in isRoomAvailable
+    // actually checks for same-day conflicts.
+    const probeOut =
+      stayRow?.stayType === "short_stay"
+        ? new Date(new Date(checkInDate).getTime() + 86400000)
+            .toISOString()
+            .slice(0, 10)
+        : checkOutDate;
     for (const rm of assigned) {
-      const ok2 = await isRoomAvailable(rm.roomId, checkInDate, checkOutDate, id);
+      const ok2 = await isRoomAvailable(rm.roomId, checkInDate, probeOut, id);
       if (!ok2) {
         return fail(res, 409, "ROOM_UNAVAILABLE", "One or more rooms unavailable for the new dates", {
           roomId: rm.roomId,

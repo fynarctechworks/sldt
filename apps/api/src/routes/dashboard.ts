@@ -94,11 +94,43 @@ async function buildDashboard() {
           reservationNumber: reservations.reservationNumber,
           guestName: guests.fullName,
           status: reservations.status,
+          // Each "slot" on a reservation is either:
+          //   - one unsegmented reservation_rooms row → emit roomNumber
+          //   - one or more rows sharing a swap_id (mid-stay swap) →
+          //     collapse to "OLD→NEW" ordered by effective_from
+          // Slots are then comma-joined for display.
+          // Each "slot" on a reservation is either:
+          //   - one unsegmented reservation_rooms row → emit roomNumber
+          //   - one or more rows sharing a swap_id (mid-stay swap) →
+          //     collapse to "OLD→NEW" ordered by effective_from
+          // For swap groups we pick the earliest-created row as the
+          // canonical representative to avoid duplicating the slot.
+          // Slots are then comma-joined for display.
           roomNumbers: sql<string>`COALESCE((
-            SELECT string_agg(${rooms.roomNumber}, ',' ORDER BY ${rooms.roomNumber})
-            FROM ${reservationRooms}
-            JOIN ${rooms} ON ${rooms.id} = ${reservationRooms.roomId}
-            WHERE ${reservationRooms.reservationId} = ${reservations.id}
+            SELECT string_agg(slot_label, ',' ORDER BY slot_label)
+            FROM (
+              SELECT
+                CASE
+                  WHEN rr.swap_id IS NULL THEN r.room_number
+                  ELSE (
+                    SELECT string_agg(r2.room_number, '→' ORDER BY rr2.effective_from NULLS FIRST)
+                    FROM reservation_rooms rr2
+                    JOIN rooms r2 ON r2.id = rr2.room_id
+                    WHERE rr2.swap_id = rr.swap_id
+                  )
+                END AS slot_label
+              FROM reservation_rooms rr
+              JOIN rooms r ON r.id = rr.room_id
+              WHERE rr.reservation_id = ${reservations.id}
+                AND (
+                  rr.swap_id IS NULL
+                  OR rr.created_at = (
+                    SELECT MIN(rr3.created_at)
+                    FROM reservation_rooms rr3
+                    WHERE rr3.swap_id = rr.swap_id
+                  )
+                )
+            ) slots
           ), '')`,
         })
         .from(reservations)
@@ -118,11 +150,43 @@ async function buildDashboard() {
           reservationNumber: reservations.reservationNumber,
           guestName: guests.fullName,
           status: reservations.status,
+          // Each "slot" on a reservation is either:
+          //   - one unsegmented reservation_rooms row → emit roomNumber
+          //   - one or more rows sharing a swap_id (mid-stay swap) →
+          //     collapse to "OLD→NEW" ordered by effective_from
+          // Slots are then comma-joined for display.
+          // Each "slot" on a reservation is either:
+          //   - one unsegmented reservation_rooms row → emit roomNumber
+          //   - one or more rows sharing a swap_id (mid-stay swap) →
+          //     collapse to "OLD→NEW" ordered by effective_from
+          // For swap groups we pick the earliest-created row as the
+          // canonical representative to avoid duplicating the slot.
+          // Slots are then comma-joined for display.
           roomNumbers: sql<string>`COALESCE((
-            SELECT string_agg(${rooms.roomNumber}, ',' ORDER BY ${rooms.roomNumber})
-            FROM ${reservationRooms}
-            JOIN ${rooms} ON ${rooms.id} = ${reservationRooms.roomId}
-            WHERE ${reservationRooms.reservationId} = ${reservations.id}
+            SELECT string_agg(slot_label, ',' ORDER BY slot_label)
+            FROM (
+              SELECT
+                CASE
+                  WHEN rr.swap_id IS NULL THEN r.room_number
+                  ELSE (
+                    SELECT string_agg(r2.room_number, '→' ORDER BY rr2.effective_from NULLS FIRST)
+                    FROM reservation_rooms rr2
+                    JOIN rooms r2 ON r2.id = rr2.room_id
+                    WHERE rr2.swap_id = rr.swap_id
+                  )
+                END AS slot_label
+              FROM reservation_rooms rr
+              JOIN rooms r ON r.id = rr.room_id
+              WHERE rr.reservation_id = ${reservations.id}
+                AND (
+                  rr.swap_id IS NULL
+                  OR rr.created_at = (
+                    SELECT MIN(rr3.created_at)
+                    FROM reservation_rooms rr3
+                    WHERE rr3.swap_id = rr.swap_id
+                  )
+                )
+            ) slots
           ), '')`,
         })
         .from(reservations)
@@ -198,11 +262,43 @@ async function buildDashboard() {
           durationHours: reservations.durationHours,
           checkedInAt: reservations.checkedInAt,
           lateCheckoutHours: reservations.lateCheckoutHours,
+          // Each "slot" on a reservation is either:
+          //   - one unsegmented reservation_rooms row → emit roomNumber
+          //   - one or more rows sharing a swap_id (mid-stay swap) →
+          //     collapse to "OLD→NEW" ordered by effective_from
+          // Slots are then comma-joined for display.
+          // Each "slot" on a reservation is either:
+          //   - one unsegmented reservation_rooms row → emit roomNumber
+          //   - one or more rows sharing a swap_id (mid-stay swap) →
+          //     collapse to "OLD→NEW" ordered by effective_from
+          // For swap groups we pick the earliest-created row as the
+          // canonical representative to avoid duplicating the slot.
+          // Slots are then comma-joined for display.
           roomNumbers: sql<string>`COALESCE((
-            SELECT string_agg(${rooms.roomNumber}, ',' ORDER BY ${rooms.roomNumber})
-            FROM ${reservationRooms}
-            JOIN ${rooms} ON ${rooms.id} = ${reservationRooms.roomId}
-            WHERE ${reservationRooms.reservationId} = ${reservations.id}
+            SELECT string_agg(slot_label, ',' ORDER BY slot_label)
+            FROM (
+              SELECT
+                CASE
+                  WHEN rr.swap_id IS NULL THEN r.room_number
+                  ELSE (
+                    SELECT string_agg(r2.room_number, '→' ORDER BY rr2.effective_from NULLS FIRST)
+                    FROM reservation_rooms rr2
+                    JOIN rooms r2 ON r2.id = rr2.room_id
+                    WHERE rr2.swap_id = rr.swap_id
+                  )
+                END AS slot_label
+              FROM reservation_rooms rr
+              JOIN rooms r ON r.id = rr.room_id
+              WHERE rr.reservation_id = ${reservations.id}
+                AND (
+                  rr.swap_id IS NULL
+                  OR rr.created_at = (
+                    SELECT MIN(rr3.created_at)
+                    FROM reservation_rooms rr3
+                    WHERE rr3.swap_id = rr.swap_id
+                  )
+                )
+            ) slots
           ), '')`,
         })
         .from(reservations)

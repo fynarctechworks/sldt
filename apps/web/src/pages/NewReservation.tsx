@@ -514,6 +514,11 @@ export default function NewReservation() {
   });
 
   const createAfterOtp = useMutation({
+    // All post-create work (check-in + receipt fetch) lives INSIDE the
+    // mutation so OtpModal's spinner stays up for the whole journey.
+    // OtpModal awaits onVerified → mutateAsync resolves only when this
+    // function returns, so the user sees "Creating reservation…" until
+    // the receipt modal is ready to render.
     mutationFn: async (otpCode: string) => {
       const guestId = pendingOtpGuestId;
       if (!guestId) throw new Error("Missing guest context");
@@ -543,30 +548,23 @@ export default function NewReservation() {
         otpCode,
       });
 
-      return reservation;
-    },
-    onSuccess: async (res) => {
-      setPendingOtpGuestId(null);
-      invalidateReservationData(qc, { reservationId: res.id });
-
       const tookAdvance = !isCreditBooking && advance > 0;
       if (mode === "walkin") {
-        try {
-          await api.post(`/reservations/${res.id}/check-in`);
-        } catch (e) {
-          setError(e instanceof Error ? e.message : "Check-in failed");
-          return;
-        }
+        await api.post(`/reservations/${reservation.id}/check-in`);
         setReceiptVariant("checkin");
-        await buildAndShowReceipt(res.id);
-        return;
-      }
-      if (tookAdvance) {
+        await buildAndShowReceipt(reservation.id);
+      } else if (tookAdvance) {
         setReceiptVariant("booking_advance");
-        await buildAndShowReceipt(res.id);
-      } else {
-        navigate(`/reservations/${res.id}`);
+        await buildAndShowReceipt(reservation.id);
       }
+      return { reservation, navigateOnly: mode !== "walkin" && !tookAdvance };
+    },
+    onSuccess: ({ reservation, navigateOnly }) => {
+      // Close the OTP modal only after all the work above resolved,
+      // so the spinner doesn't blink off mid-flight.
+      setPendingOtpGuestId(null);
+      invalidateReservationData(qc, { reservationId: reservation.id });
+      if (navigateOnly) navigate(`/reservations/${reservation.id}`);
     },
     onError: (e: Error) => setError(describeApiError(e)),
   });
