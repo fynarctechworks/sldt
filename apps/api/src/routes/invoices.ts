@@ -5,6 +5,7 @@ import { db } from "../db/client.js";
 import { invoiceLineItems, invoices, payments } from "../db/schema/invoices.js";
 import { reservations } from "../db/schema/reservations.js";
 import { logActivity } from "../lib/activity.js";
+import { loadGuestExtra } from "../lib/guestExtra.js";
 import { renderInvoicePdf } from "../lib/pdf.js";
 import { invalidateDashboard } from "../lib/redis.js";
 import { getSettings } from "../lib/settings.js";
@@ -116,6 +117,7 @@ router.get("/:id/pdf", requireAuth, requirePermission("view_invoices"), async (r
   ]);
   const settings = await getSettings();
   const companionCollections = await collectCompanionCollections(inv[0]!.reservationId, id);
+  const guestExtra = await loadGuestExtra(inv[0]!.reservationId);
   const pdf = await renderInvoicePdf({
     invoice: inv[0]!,
     lineItems: items,
@@ -131,6 +133,7 @@ router.get("/:id/pdf", requireAuth, requirePermission("view_invoices"), async (r
             : null,
         }
       : undefined,
+    guestExtra,
     companionCollections,
   });
   const inline = req.query.disposition === "inline";

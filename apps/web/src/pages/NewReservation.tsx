@@ -3,7 +3,7 @@ import { addDays, differenceInCalendarDays, format } from "date-fns";
 import { AlertTriangle, ChevronLeft, FileText, ShieldCheck, Snowflake, Sparkles, Tv, Upload, Wifi, X } from "lucide-react";
 import { CheckInReceiptModal, type CheckInReceiptData } from "@/components/CheckInReceiptModal";
 import { OtpModal } from "@/components/OtpModal";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { Loader } from "@/components/Loader";
 import { Combobox } from "@/components/Combobox";
@@ -15,15 +15,10 @@ import { invalidateReservationData } from "@/lib/invalidate";
 import { inr } from "@/lib/utils";
 
 function describeApiError(e: unknown): string {
-  if (e instanceof ApiError && e.code === "VALIDATION_ERROR") {
-    const details = e.details as { fieldErrors?: Record<string, string[]> } | undefined;
-    if (details?.fieldErrors) {
-      const fields = Object.entries(details.fieldErrors)
-        .map(([k, v]) => `${k}: ${v.join(", ")}`)
-        .join(" · ");
-      return fields ? `${e.message} (${fields})` : e.message;
-    }
-  }
+  // The API's error middleware already humanizes Zod errors into a
+  // user-readable summary like "ID Number is missing or too short;
+  // Phone is missing". Surface that directly — no extra prefixing.
+  if (e instanceof ApiError) return e.message;
   return e instanceof Error ? e.message : "Something went wrong";
 }
 
@@ -648,10 +643,23 @@ export default function NewReservation() {
             guest: {
               fullName: string;
               phone: string;
+              gender: string | null;
               idProofType: string | null;
               idProofLast4: string | null;
               photoUrl: string | null;
             };
+            // Migration 0020 — second-occupant block on the receipt.
+            coGuests?: {
+              id: string;
+              position: number;
+              guest: {
+                fullName: string;
+                phone: string;
+                gender: string | null;
+                idProofType: string | null;
+                idProofLast4: string | null;
+              };
+            }[];
             rooms: {
               roomNumber: string;
               roomType: string;
@@ -706,10 +714,18 @@ export default function NewReservation() {
           guest: {
             fullName: detail.guest.fullName,
             phone: detail.guest.phone,
+            gender: detail.guest.gender,
             idProofType: detail.guest.idProofType,
             idProofLast4: detail.guest.idProofLast4,
             photoUrl: detail.guest.photoUrl,
           },
+          coGuests: detail.coGuests?.map((cg) => ({
+            fullName: cg.guest.fullName,
+            phone: cg.guest.phone,
+            gender: cg.guest.gender,
+            idProofType: cg.guest.idProofType,
+            idProofLast4: cg.guest.idProofLast4,
+          })),
           rooms: detail.rooms.map((r) => ({
             roomNumber: r.roomNumber,
             roomType: r.roomType,
@@ -938,8 +954,17 @@ export default function NewReservation() {
               className="input"
               type="number"
               min={1}
-              value={adults}
-              onChange={(e) => setAdults(Number(e.target.value))}
+              // Empty string while the field is cleared so the user can
+              // type "2" without battling a sticky "0". Falls back to
+              // min on blur.
+              value={adults === 0 ? "" : adults}
+              onChange={(e) => {
+                const v = e.target.value;
+                setAdults(v === "" ? 0 : Math.max(0, Number(v)));
+              }}
+              onBlur={() => {
+                if (adults < 1) setAdults(1);
+              }}
             />
           </div>
           <div>
@@ -948,8 +973,11 @@ export default function NewReservation() {
               className="input"
               type="number"
               min={0}
-              value={children}
-              onChange={(e) => setChildren(Number(e.target.value))}
+              value={children === 0 ? "" : children}
+              onChange={(e) => {
+                const v = e.target.value;
+                setChildren(v === "" ? 0 : Math.max(0, Number(v)));
+              }}
             />
           </div>
         </div>
@@ -1005,10 +1033,18 @@ export default function NewReservation() {
                     min={1}
                     max={23.5}
                     step={0.5}
-                    value={shortStayHours}
+                    value={shortStayHours === 0 ? "" : shortStayHours}
                     onChange={(e) => {
-                      const n = Math.max(1, Math.min(23.5, Number(e.target.value)));
+                      const v = e.target.value;
+                      if (v === "") {
+                        setShortStayHours(0);
+                        return;
+                      }
+                      const n = Math.min(23.5, Number(v));
                       setShortStayHours(n);
+                    }}
+                    onBlur={() => {
+                      if (shortStayHours < 1) setShortStayHours(1);
                     }}
                   />
                   <span className="text-xs text-textSecondary">hours (custom)</span>
@@ -1158,7 +1194,9 @@ export default function NewReservation() {
         ) : (
           <div className="grid grid-cols-2 gap-3">
             <div>
-              <label className="label block mb-1">Full Name</label>
+              <label className="label block mb-1">
+                Full Name <span className="text-danger">*</span>
+              </label>
               <input
                 className="input"
                 value={newGuest.fullName}
@@ -1166,7 +1204,9 @@ export default function NewReservation() {
               />
             </div>
             <div>
-              <label className="label block mb-1">Phone</label>
+              <label className="label block mb-1">
+                Phone <span className="text-danger">*</span>
+              </label>
               <input
                 className="input"
                 type="tel"
@@ -1216,7 +1256,9 @@ export default function NewReservation() {
               </select>
             </div>
             <div>
-              <label className="label block mb-1">ID Type</label>
+              <label className="label block mb-1">
+                ID Type <span className="text-danger">*</span>
+              </label>
               <select
                 className="input"
                 value={newGuest.idProofType}
@@ -1232,7 +1274,9 @@ export default function NewReservation() {
               </select>
             </div>
             <div>
-              <label className="label block mb-1">ID Number</label>
+              <label className="label block mb-1">
+                ID Number <span className="text-danger">*</span>
+              </label>
               <input
                 className="input"
                 value={newGuest.idProofNumber}
@@ -1285,26 +1329,6 @@ export default function NewReservation() {
         )}
       </div>
 
-      {needsCoGuest && (
-        <SecondOccupantCard
-          mode={coGuestUseNew ? "new" : "existing"}
-          onModeChange={(m) => setCoGuestUseNew(m === "new")}
-          query={coGuestQuery}
-          setQuery={setCoGuestQuery}
-          selected={coGuest}
-          onSelected={setCoGuest}
-          excludeGuestId={selectedGuest?.id ?? null}
-          form={coGuestForm}
-          setForm={setCoGuestForm}
-          kycPhoto={coGuestKycPhoto}
-          setKycPhoto={setCoGuestKycPhoto}
-          kycFront={coGuestKycFront}
-          setKycFront={setCoGuestKycFront}
-          kycBack={coGuestKycBack}
-          setKycBack={setCoGuestKycBack}
-        />
-      )}
-
       {/* KYC card is contextual:
             - New Guest mode → render the upload pickers (required for
               walk-ins, optional otherwise).
@@ -1336,7 +1360,8 @@ export default function NewReservation() {
               <div className="flex items-center gap-2">
                 <ShieldCheck className="w-4 h-4 text-accentBlue" />
                 <h2 className="font-semibold text-navy">
-                  KYC Documents {mode === "walkin" ? "(required)" : "(optional now, required at check-in)"}
+                  KYC Documents · Primary Guest{" "}
+                  {mode === "walkin" ? "(required)" : "(optional now, required at check-in)"}
                 </h2>
               </div>
               <div className="text-xs text-textSecondary -mt-1">
@@ -1352,6 +1377,26 @@ export default function NewReservation() {
             </>
           )}
         </div>
+      )}
+
+      {needsCoGuest && (
+        <SecondOccupantCard
+          mode={coGuestUseNew ? "new" : "existing"}
+          onModeChange={(m) => setCoGuestUseNew(m === "new")}
+          query={coGuestQuery}
+          setQuery={setCoGuestQuery}
+          selected={coGuest}
+          onSelected={setCoGuest}
+          excludeGuestId={selectedGuest?.id ?? null}
+          form={coGuestForm}
+          setForm={setCoGuestForm}
+          kycPhoto={coGuestKycPhoto}
+          setKycPhoto={setCoGuestKycPhoto}
+          kycFront={coGuestKycFront}
+          setKycFront={setCoGuestKycFront}
+          kycBack={coGuestKycBack}
+          setKycBack={setCoGuestKycBack}
+        />
       )}
 
       <div className="card space-y-3">
@@ -2057,7 +2102,13 @@ function KycFilePicker({
 
   const isPdf = file?.type === "application/pdf";
   const sizeKb = file ? Math.round(file.size / 1024) : 0;
-  const inputId = `kyc-${label.toLowerCase()}`;
+  // Unique per-instance id. Multiple KYC blocks on the same page
+  // (primary guest + second guest) would otherwise share a DOM id
+  // and clicking the second block's label would activate the first
+  // block's input. useId() generates a stable, unique id per render
+  // instance — safe across SSR/CSR.
+  const reactId = useId();
+  const inputId = `kyc-${reactId}-${label.toLowerCase().replace(/\s+/g, "-")}`;
 
   return (
     <div>
@@ -2283,7 +2334,9 @@ function SecondOccupantCard(props: {
               </select>
             </div>
             <div>
-              <label className="label block mb-1">ID Type</label>
+              <label className="label block mb-1">
+                ID Type <span className="text-danger">*</span>
+              </label>
               <select
                 className="input"
                 value={f.idProofType}
@@ -2310,26 +2363,76 @@ function SecondOccupantCard(props: {
                 onChange={(e) => setF({ idProofNumber: e.target.value })}
               />
             </div>
+            <div>
+              <label className="label block mb-1">Nationality</label>
+              <input
+                className="input"
+                value={f.nationality}
+                onChange={(e) => setF({ nationality: e.target.value })}
+              />
+            </div>
+            <div>
+              <label className="label block mb-1">State</label>
+              <Combobox
+                value={f.state}
+                onChange={(v) =>
+                  // Wipe city when state changes so the city dropdown
+                  // doesn't keep a stale value from the previous state.
+                  setF({ state: v, city: f.state === v ? f.city : "" })
+                }
+                groups={[
+                  { label: "States", options: INDIAN_STATES },
+                  { label: "Union Territories", options: INDIAN_UNION_TERRITORIES },
+                ]}
+                placeholder="Type to search or pick from list…"
+              />
+            </div>
+            <div>
+              <label className="label block mb-1">City</label>
+              <Combobox
+                value={f.city}
+                onChange={(v) => setF({ city: v })}
+                options={citiesForState(f.state)}
+                placeholder={
+                  f.state
+                    ? `Type to search ${f.state} cities…`
+                    : "Pick a state first, or type any city…"
+                }
+              />
+            </div>
+            <div className="sm:col-span-2">
+              <label className="label block mb-1">Address</label>
+              <input
+                className="input"
+                value={f.address}
+                onChange={(e) => setF({ address: e.target.value })}
+              />
+            </div>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-            <KycFilePicker
-              label="Customer Photo"
-              file={props.kycPhoto}
-              onChange={props.setKycPhoto}
-              required
-            />
-            <KycFilePicker
-              label="ID Front"
-              file={props.kycFront}
-              onChange={props.setKycFront}
-              required
-            />
-            <KycFilePicker
-              label="ID Back"
-              file={props.kycBack}
-              onChange={props.setKycBack}
-            />
+          <div className="pt-2 border-t border-borderc">
+            <div className="text-[11px] uppercase tracking-wider text-textSecondary font-semibold mb-2">
+              KYC Documents · Second Guest (required)
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <KycFilePicker
+                label="Customer Photo"
+                file={props.kycPhoto}
+                onChange={props.setKycPhoto}
+                required
+              />
+              <KycFilePicker
+                label="ID Front"
+                file={props.kycFront}
+                onChange={props.setKycFront}
+                required
+              />
+              <KycFilePicker
+                label="ID Back"
+                file={props.kycBack}
+                onChange={props.setKycBack}
+              />
+            </div>
           </div>
         </div>
       )}

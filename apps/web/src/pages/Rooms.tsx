@@ -489,8 +489,11 @@ function RoomModal({ room, onClose }: { room: Room | null; onClose: () => void }
             <input
               className="input"
               type="number"
-              value={form.floor}
-              onChange={(e) => setForm({ ...form, floor: Number(e.target.value) })}
+              value={form.floor === 0 ? "" : form.floor}
+              onChange={(e) => {
+                const v = e.target.value;
+                setForm({ ...form, floor: v === "" ? 0 : Number(v) });
+              }}
             />
           </Field>
           <Field label="Type">

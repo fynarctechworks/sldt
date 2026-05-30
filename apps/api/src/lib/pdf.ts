@@ -1,11 +1,11 @@
 import { format } from "date-fns";
-import { eq } from "drizzle-orm";
+import { asc, eq } from "drizzle-orm";
 import puppeteer, { type Browser, type PaperFormat } from "puppeteer";
 import { db } from "../db/client.js";
 import type { InvoiceLineItem, Invoice, Payment } from "../db/schema/invoices.js";
 import { payments } from "../db/schema/invoices.js";
-import type { Guest } from "../db/schema/guests.js";
-import { reservationRooms, type Reservation } from "../db/schema/reservations.js";
+import { guests, type Guest } from "../db/schema/guests.js";
+import { reservationCoGuests, reservationRooms, type Reservation } from "../db/schema/reservations.js";
 import { rooms } from "../db/schema/rooms.js";
 import { roomTypes } from "../db/schema/settings.js";
 import type { Settings } from "../db/schema/settings.js";
@@ -82,6 +82,13 @@ function esc(s: string | null | undefined) {
   return String(s ?? "").replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!,
   );
+}
+
+// "prefer_not_to_say" → "Prefer not to say", "male" → "Male", etc.
+function formatGender(g: string | null | undefined): string {
+  if (!g) return "";
+  if (g === "prefer_not_to_say") return "Prefer not to say";
+  return g.charAt(0).toUpperCase() + g.slice(1);
 }
 
 function inr(n: string | number, symbol = "₹") {
@@ -481,6 +488,19 @@ function renderInvoiceHtml(data: {
     // receipt rendering path).
     checkedInAt?: string | null;
   };
+  // Guest extras for the Billed To block (migration 0020). gender prints
+  // alongside the existing name; coGuests prints as a small "Also
+  // occupying" sub-block so the bill mirrors who actually used the room.
+  guestExtra?: {
+    gender?: string | null;
+    coGuests?: {
+      fullName: string;
+      phone: string;
+      gender: string | null;
+      idProofType: string;
+      idProofLast4: string;
+    }[];
+  };
   // Other bookings for the same guest that were paid at the same desk
   // visit (the "collect previous balance" flow on check-out). Surfaced as
   // an informational footer block. Does NOT affect the invoice's totals
@@ -563,8 +583,30 @@ ${L.showLogo && L.logoUrl ? `<div class="watermark"><img src="${esc(L.logoUrl)}"
     <div class="info-card">
       <div class="label">Billed To</div>
       <div class="name">${esc(invoice.guestName)}</div>
+      ${
+        data.guestExtra?.gender
+          ? `<div class="sub">${esc(formatGender(data.guestExtra.gender))}</div>`
+          : ""
+      }
       ${invoice.guestAddress ? `<div class="sub">${esc(invoice.guestAddress)}</div>` : ""}
       ${invoice.guestGstin ? `<div class="sub mono">GSTIN: ${esc(invoice.guestGstin)}</div>` : ""}
+      ${
+        data.guestExtra?.coGuests && data.guestExtra.coGuests.length > 0
+          ? `<div style="margin-top:8px;padding-top:6px;border-top:1px dashed #D6D2C4;">
+              <div class="label" style="font-size:9px;">Also occupying</div>
+              ${data.guestExtra.coGuests
+                .map(
+                  (cg) =>
+                    `<div class="sub" style="margin-top:3px;">${esc(cg.fullName)} · ${esc(cg.phone)}${
+                      cg.idProofType && cg.idProofLast4
+                        ? ` · ${esc(cg.idProofType.replace("_", " "))} ····${esc(cg.idProofLast4)}`
+                        : ""
+                    }${cg.gender ? ` · ${esc(formatGender(cg.gender))}` : ""}</div>`,
+                )
+                .join("")}
+            </div>`
+          : ""
+      }
     </div>
     <div class="info-card">
       <div class="label">Stay</div>
@@ -754,6 +796,17 @@ export async function renderInvoicePdf(data: {
     // receipt rendering path).
     checkedInAt?: string | null;
   };
+  // See renderInvoiceHtml signature — pass-through.
+  guestExtra?: {
+    gender?: string | null;
+    coGuests?: {
+      fullName: string;
+      phone: string;
+      gender: string | null;
+      idProofType: string;
+      idProofLast4: string;
+    }[];
+  };
   companionCollections?: {
     invoiceNumber: string | null;
     reservationNumber: string;
@@ -799,8 +852,18 @@ function renderReceiptHtml(data: {
   // into Advance (at/before check-in) vs Later. Optional — if omitted,
   // the totals render with a single "Paid" line as before.
   allPayments?: Payment[];
+  // Additional adults whose KYC was captured at booking (migration 0020).
+  // Empty for single-occupancy stays.
+  coGuests?: {
+    position: number;
+    fullName: string;
+    phone: string;
+    gender: string | null;
+    idProofType: string;
+    idProofLast4: string;
+  }[];
 }) {
-  const { payment, reservation, guest, invoice, settings, rooms, allPayments } = data;
+  const { payment, reservation, guest, invoice, settings, rooms, allPayments, coGuests } = data;
   const L = layoutFromSettings(settings);
 
   const isAdvance = !invoice;
@@ -978,7 +1041,28 @@ ${L.showLogo && L.logoUrl ? `<div class="watermark"><img src="${esc(L.logoUrl)}"
       <div class="card-sub">${esc(guest.phone)}</div>
       ${
         guest.idProofType && guest.idProofLast4
-          ? `<div class="card-id">${esc(guest.idProofType.replace("_", " "))} ····${esc(guest.idProofLast4)}</div>`
+          ? `<div class="card-id">${esc(guest.idProofType.replace("_", " "))} ····${esc(guest.idProofLast4)}${
+              guest.gender ? ` · ${esc(formatGender(guest.gender))}` : ""
+            }</div>`
+          : guest.gender
+            ? `<div class="card-id">${esc(formatGender(guest.gender))}</div>`
+            : ""
+      }
+      ${
+        coGuests && coGuests.length > 0
+          ? `<div style="margin-top:6px;padding-top:6px;border-top:1px dashed #D6D2C4;">
+              <div class="card-label" style="font-size:8px;">Also occupying</div>
+              ${coGuests
+                .map(
+                  (cg) =>
+                    `<div class="card-sub" style="margin-top:2px;">${esc(cg.fullName)} · ${esc(cg.phone)}${
+                      cg.idProofType && cg.idProofLast4
+                        ? ` · ${esc(cg.idProofType.replace("_", " "))} ····${esc(cg.idProofLast4)}`
+                        : ""
+                    }${cg.gender ? ` · ${esc(formatGender(cg.gender))}` : ""}</div>`,
+                )
+                .join("")}
+            </div>`
           : ""
       }
     </div>
@@ -1186,6 +1270,23 @@ export async function renderReceiptPdf(data: {
     .from(payments)
     .where(eq(payments.reservationId, data.reservation.id));
 
+  // Co-guests (migration 0020) — additional adults whose KYC was
+  // captured at booking. Surfaced on the receipt as a "Also occupying"
+  // block so the printed slip mirrors what's on screen.
+  const coGuestRows = await db
+    .select({
+      position: reservationCoGuests.position,
+      fullName: guests.fullName,
+      phone: guests.phone,
+      gender: guests.gender,
+      idProofType: guests.idProofType,
+      idProofLast4: guests.idProofLast4,
+    })
+    .from(reservationCoGuests)
+    .innerJoin(guests, eq(guests.id, reservationCoGuests.guestId))
+    .where(eq(reservationCoGuests.reservationId, data.reservation.id))
+    .orderBy(asc(reservationCoGuests.position));
+
   const browser = await getBrowser();
   const page = await browser.newPage();
   try {
@@ -1194,6 +1295,7 @@ export async function renderReceiptPdf(data: {
       ...data,
       rooms: roomsForRender,
       allPayments,
+      coGuests: coGuestRows,
     });
     await page.setContent(html, { waitUntil: "networkidle0", timeout: 15_000 });
     const pdf = await page.pdf({

@@ -6,6 +6,7 @@ import { invoiceLineItems, invoices, payments } from "../db/schema/invoices.js";
 import { reservations } from "../db/schema/reservations.js";
 import { guests } from "../db/schema/guests.js";
 import { logActivity } from "../lib/activity.js";
+import { loadGuestExtra } from "../lib/guestExtra.js";
 import { logger } from "../lib/logger.js";
 import { renderInvoicePdf, renderReceiptPdf } from "../lib/pdf.js";
 import { generateReceiptNumber } from "../lib/receipt.js";
@@ -454,6 +455,7 @@ async function regenerateInvoicePdfForReservation(reservationId: string): Promis
             : null,
         }
       : undefined,
+    guestExtra: await loadGuestExtra(reservationId),
     companionCollections: companion,
   });
   await uploadPublicPdf(`invoices/${inv.invoiceNumber}.pdf`, pdf);

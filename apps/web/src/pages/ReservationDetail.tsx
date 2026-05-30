@@ -999,10 +999,18 @@ export default function ReservationDetail() {
               guest: {
                 fullName: r.guest.fullName,
                 phone: r.guest.phone,
+                gender: (r.guest as { gender?: string | null }).gender,
                 idProofType: r.guest.idProofType,
                 idProofLast4: r.guest.idProofLast4,
                 photoUrl: r.guest.photoUrl,
               },
+              coGuests: r.coGuests?.map((cg) => ({
+                fullName: cg.guest.fullName,
+                phone: cg.guest.phone,
+                gender: cg.guest.gender,
+                idProofType: cg.guest.idProofType,
+                idProofLast4: cg.guest.idProofLast4,
+              })),
               rooms: r.rooms.map((rm) => ({
                 roomNumber: rm.roomNumber,
                 roomType: rm.roomType,
@@ -1072,10 +1080,18 @@ export default function ReservationDetail() {
                 guest: {
                   fullName: r.guest.fullName,
                   phone: r.guest.phone,
+                  gender: (r.guest as { gender?: string | null }).gender,
                   idProofType: r.guest.idProofType,
                   idProofLast4: r.guest.idProofLast4,
                   photoUrl: r.guest.photoUrl,
                 },
+                coGuests: r.coGuests?.map((cg) => ({
+                  fullName: cg.guest.fullName,
+                  phone: cg.guest.phone,
+                  gender: cg.guest.gender,
+                  idProofType: cg.guest.idProofType,
+                  idProofLast4: cg.guest.idProofLast4,
+                })),
                 rooms: r.rooms.map((rm) => ({
                   roomNumber: rm.roomNumber,
                   roomType: rm.roomType,
@@ -1953,8 +1969,11 @@ function ChargeRow(props: {
             type="number"
             min={0}
             step="0.01"
-            value={amount}
-            onChange={(e) => setAmount(Number(e.target.value))}
+            value={amount === 0 ? "" : amount}
+            onChange={(e) => {
+              const v = e.target.value;
+              setAmount(v === "" ? 0 : Number(v));
+            }}
           />
         ) : (
           inr(displayAmount)
@@ -2679,8 +2698,11 @@ function ExtendModal(props: {
               type="number"
               min={0}
               step="0.01"
-              value={ratePerNight}
-              onChange={(e) => setRatePerNight(Number(e.target.value))}
+              value={ratePerNight === 0 ? "" : ratePerNight}
+              onChange={(e) => {
+                const v = e.target.value;
+                setRatePerNight(v === "" ? 0 : Number(v));
+              }}
             />
             {/* Live preview so staff see exactly what the guest pays for
                 the extension. Existing nights are NOT re-priced — only
@@ -2763,8 +2785,14 @@ function LateCheckoutModal(props: {
               min={1}
               max={24}
               step="0.5"
-              value={hours}
-              onChange={(e) => setHours(Number(e.target.value))}
+              value={hours === 0 ? "" : hours}
+              onChange={(e) => {
+                const v = e.target.value;
+                setHours(v === "" ? 0 : Number(v));
+              }}
+              onBlur={() => {
+                if (hours < 1) setHours(1);
+              }}
             />
           </div>
           <div>
@@ -3263,8 +3291,11 @@ function PerRoomCheckoutModal(props: {
                     type="number"
                     min={0}
                     step="0.01"
-                    value={amount}
-                    onChange={(e) => setAmount(Number(e.target.value))}
+                    value={amount === 0 ? "" : amount}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setAmount(v === "" ? 0 : Number(v));
+                    }}
                   />
                   {amount < due - 0.009 && (
                     <div className="text-[11px] text-textSecondary mt-1">

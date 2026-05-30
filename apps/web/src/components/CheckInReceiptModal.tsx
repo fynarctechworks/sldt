@@ -4,6 +4,12 @@ import { useEffect } from "react";
 import { supabase } from "@/lib/supabase";
 import { formatTime, inr } from "@/lib/utils";
 
+function formatGender(g: string | null | undefined): string {
+  if (!g) return "";
+  if (g === "prefer_not_to_say") return "Prefer not to say";
+  return g.charAt(0).toUpperCase() + g.slice(1);
+}
+
 export interface CheckInReceiptData {
   reservationId?: string;
   reservationNumber: string;
@@ -20,10 +26,21 @@ export interface CheckInReceiptData {
   guest: {
     fullName: string;
     phone: string;
+    gender?: string | null;
     idProofType?: string | null;
     idProofLast4?: string | null;
     photoUrl?: string | null;
   };
+  // Migration 0020 — additional adults whose KYC was captured at booking.
+  // Rendered as a small "Also occupying" block under the Guest card so
+  // the on-screen modal matches the printed receipt.
+  coGuests?: {
+    fullName: string;
+    phone: string;
+    gender?: string | null;
+    idProofType?: string | null;
+    idProofLast4?: string | null;
+  }[];
   rooms: {
     roomNumber: string;
     roomType: string;
@@ -362,13 +379,38 @@ export function CheckInReceiptModal({ data, onClose, variant = "checkin" }: Prop
                 <div className="min-w-0">
                   <div className="font-semibold text-brand-dark">{data.guest.fullName}</div>
                   <div className="font-mono text-[11px] mt-0.5">{data.guest.phone}</div>
-                  {data.guest.idProofType && data.guest.idProofLast4 && (
+                  {(data.guest.idProofType || data.guest.gender) && (
                     <div className="text-[10px] text-textSecondary mt-1 capitalize">
-                      {data.guest.idProofType.replace("_", " ")} ····{data.guest.idProofLast4}
+                      {data.guest.idProofType && data.guest.idProofLast4 && (
+                        <>
+                          {data.guest.idProofType.replace("_", " ")} ····{data.guest.idProofLast4}
+                        </>
+                      )}
+                      {data.guest.idProofType && data.guest.gender && " · "}
+                      {data.guest.gender && formatGender(data.guest.gender)}
                     </div>
                   )}
                 </div>
               </div>
+              {data.coGuests && data.coGuests.length > 0 && (
+                <div className="mt-2 pt-2 border-t border-borderc/60 space-y-1">
+                  <div className="text-[9px] uppercase tracking-wider text-textSecondary font-semibold">
+                    Also occupying
+                  </div>
+                  {data.coGuests.map((cg, i) => (
+                    <div key={i} className="text-[10px] text-textSecondary leading-tight">
+                      <span className="text-brand-dark font-semibold">{cg.fullName}</span>
+                      <span className="font-mono"> · {cg.phone}</span>
+                      {cg.idProofType && cg.idProofLast4 && (
+                        <span className="capitalize">
+                          {" "}· {cg.idProofType.replace("_", " ")} ····{cg.idProofLast4}
+                        </span>
+                      )}
+                      {cg.gender && <span> · {formatGender(cg.gender)}</span>}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
             <div className="border border-borderc rounded-sm bg-cream/40 p-2.5">
               <div className="text-[9px] uppercase tracking-wider text-textSecondary font-semibold">

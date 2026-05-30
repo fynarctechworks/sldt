@@ -14,7 +14,7 @@ import multer from "multer";
 import { z } from "zod";
 import { db } from "../db/client.js";
 import { guestFollowUps, guestNotes, guests } from "../db/schema/guests.js";
-import { reservations, reservationRooms } from "../db/schema/reservations.js";
+import { reservationCoGuests, reservations, reservationRooms } from "../db/schema/reservations.js";
 import { rooms } from "../db/schema/rooms.js";
 import { invoices, payments } from "../db/schema/invoices.js";
 import { logActivity } from "../lib/activity.js";
@@ -314,8 +314,9 @@ router.get(
     if (!exists.length) return fail(res, 404, "NOT_FOUND", "Guest not found");
 
     // Reservations where this guest is either the booker OR a per-room
-    // occupant. Using a UNION on reservation ids keeps the result set
-    // deduplicated even when both are true.
+    // occupant OR a co-guest (migration 0020). A Set keeps the result
+    // deduplicated even when the guest plays more than one role on the
+    // same booking.
     const bookerIds = await db
       .select({ id: reservations.id })
       .from(reservations)
@@ -324,8 +325,16 @@ router.get(
       .select({ id: reservationRooms.reservationId })
       .from(reservationRooms)
       .where(eq(reservationRooms.guestId, id));
+    const coGuestIds = await db
+      .select({ id: reservationCoGuests.reservationId })
+      .from(reservationCoGuests)
+      .where(eq(reservationCoGuests.guestId, id));
     const allIds = Array.from(
-      new Set([...bookerIds.map((r) => r.id), ...occupantIds.map((r) => r.id)]),
+      new Set([
+        ...bookerIds.map((r) => r.id),
+        ...occupantIds.map((r) => r.id),
+        ...coGuestIds.map((r) => r.id),
+      ]),
     );
     if (allIds.length === 0) return ok(res, []);
 
@@ -401,30 +410,42 @@ router.get(
     if (!found.length) return fail(res, 404, "NOT_FOUND", "Guest not found");
 
     const [resStats, paidStats] = await Promise.all([
-      db
-        .select({
-          // total = anything ever booked (incl. cancelled). The UI groups it
-          // semantically using the other sub-counts.
-          total: sql<number>`count(*)::int`,
-          completed: sql<number>`count(*) filter (where ${reservations.status} = 'checked_out')::int`,
-          // upcoming = future-dated confirmed bookings the guest hasn't arrived
-          // for yet. Currently-checked-in stays are tracked separately as
-          // inHouse so the UI doesn't conflate "future" with "now".
-          upcoming: sql<number>`count(*) filter (where ${reservations.status} = 'confirmed')::int`,
-          inHouse: sql<number>`count(*) filter (where ${reservations.status} = 'checked_in')::int`,
-          cancelled: sql<number>`count(*) filter (where ${reservations.status} = 'cancelled')::int`,
-          // firstStay = earliest *completed* check-in. Null until the guest
-          // has stayed at least once so "Since May 2026" doesn't appear next
-          // to "Last stay: Never" for a brand-new guest with only future
-          // bookings.
-          firstStay: sql<string | null>`min(${reservations.checkInDate}) filter (where ${reservations.status} = 'checked_out')`,
-          lastStay: sql<string | null>`max(${reservations.checkOutDate}) filter (where ${reservations.status} = 'checked_out')`,
-          // First-ever booking date (any status). Used by the UI to show
-          // "First booking: …" when the guest has no completed stays yet.
-          firstBooking: sql<string | null>`min(${reservations.checkInDate})`,
-        })
-        .from(reservations)
-        .where(eq(reservations.guestId, id)),
+      // Stats span every reservation the guest is on:
+      //   - booker        (reservations.guest_id = :id)
+      //   - per-room occupant (reservation_rooms.guest_id = :id)
+      //   - co-guest      (reservation_co_guests.guest_id = :id, migration 0020)
+      // DISTINCT keeps a single reservation from being counted multiple
+      // times when the guest plays more than one role on it.
+      db.execute<{
+        total: number;
+        completed: number;
+        upcoming: number;
+        inHouse: number;
+        cancelled: number;
+        firstStay: string | null;
+        lastStay: string | null;
+        firstBooking: string | null;
+      }>(sql`
+        WITH guest_resv AS (
+          SELECT DISTINCT r.id, r.status, r.check_in_date, r.check_out_date
+          FROM ${reservations} r
+          LEFT JOIN ${reservationRooms} rr ON rr.reservation_id = r.id
+          LEFT JOIN ${reservationCoGuests} cg ON cg.reservation_id = r.id
+          WHERE r.guest_id = ${id}
+             OR rr.guest_id = ${id}
+             OR cg.guest_id = ${id}
+        )
+        SELECT
+          COUNT(*)::int AS total,
+          COUNT(*) FILTER (WHERE status = 'checked_out')::int AS completed,
+          COUNT(*) FILTER (WHERE status = 'confirmed')::int AS upcoming,
+          COUNT(*) FILTER (WHERE status = 'checked_in')::int "inHouse",
+          COUNT(*) FILTER (WHERE status = 'cancelled')::int AS cancelled,
+          MIN(check_in_date) FILTER (WHERE status = 'checked_out') "firstStay",
+          MAX(check_out_date) FILTER (WHERE status = 'checked_out') "lastStay",
+          MIN(check_in_date) "firstBooking"
+        FROM guest_resv
+      `),
       // Total paid + balance due across the whole guest history.
       //
       // Total paid: sum of every non-voided, "received" payment on any of

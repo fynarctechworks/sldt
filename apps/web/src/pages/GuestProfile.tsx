@@ -33,6 +33,7 @@ interface Guest {
   fullName: string;
   phone: string;
   email: string | null;
+  gender: "male" | "female" | "other" | "prefer_not_to_say" | null;
   idProofType: string;
   idProofLast4: string;
   idProofMasked?: string;
@@ -201,6 +202,21 @@ function EditGuestModal({ guest, onClose }: { guest: Guest; onClose: () => void 
     fullName: guest.fullName,
     phone: guest.phone,
     email: guest.email ?? "",
+    gender: (guest.gender ?? "") as
+      | ""
+      | "male"
+      | "female"
+      | "other"
+      | "prefer_not_to_say",
+    idProofType: guest.idProofType as
+      | "aadhaar"
+      | "pan"
+      | "passport"
+      | "driving_license"
+      | "voter_id",
+    // Empty by default — staff types a new ID number only when they
+    // actually want to replace the existing one. Sent only when non-empty.
+    idProofNumber: "",
     address: guest.address ?? "",
     city: guest.city ?? "",
     state: guest.state ?? "",
@@ -218,6 +234,11 @@ function EditGuestModal({ guest, onClose }: { guest: Guest; onClose: () => void 
         fullName: form.fullName,
         phone: form.phone,
         email: form.email || null,
+        gender: form.gender || undefined,
+        idProofType: form.idProofType,
+        // Only send when staff entered a replacement — otherwise the
+        // existing ID stays untouched.
+        ...(form.idProofNumber ? { idProofNumber: form.idProofNumber } : {}),
         address: form.address || null,
         city: form.city || null,
         state: form.state || null,
@@ -235,7 +256,7 @@ function EditGuestModal({ guest, onClose }: { guest: Guest; onClose: () => void 
     onError: (e: Error) => setErr(e.message),
   });
 
-  function set<K extends keyof typeof form>(k: K, v: string) {
+  function set<K extends keyof typeof form>(k: K, v: (typeof form)[K]) {
     setForm({ ...form, [k]: v });
   }
 
@@ -293,6 +314,44 @@ function EditGuestModal({ guest, onClose }: { guest: Guest; onClose: () => void 
                 className="input"
                 value={form.nationality}
                 onChange={(e) => set("nationality", e.target.value)}
+              />
+            </Field>
+            <Field label="Gender">
+              <select
+                className="input"
+                value={form.gender}
+                onChange={(e) =>
+                  set("gender", e.target.value as typeof form.gender)
+                }
+              >
+                <option value="">Select gender…</option>
+                <option value="male">Male</option>
+                <option value="female">Female</option>
+                <option value="other">Other</option>
+                <option value="prefer_not_to_say">Prefer not to say</option>
+              </select>
+            </Field>
+            <Field label="ID Type">
+              <select
+                className="input"
+                value={form.idProofType}
+                onChange={(e) =>
+                  set("idProofType", e.target.value as typeof form.idProofType)
+                }
+              >
+                <option value="aadhaar">Aadhaar</option>
+                <option value="pan">PAN</option>
+                <option value="passport">Passport</option>
+                <option value="driving_license">Driving License</option>
+                <option value="voter_id">Voter ID</option>
+              </select>
+            </Field>
+            <Field label={`ID Number (current ends ••••${guest.idProofLast4})`}>
+              <input
+                className="input font-mono"
+                value={form.idProofNumber}
+                placeholder="Leave blank to keep current"
+                onChange={(e) => set("idProofNumber", e.target.value)}
               />
             </Field>
           </div>
@@ -603,6 +662,16 @@ function ProfileTab({ g }: { g: Guest }) {
           }
         />
         <Row label="Nationality" value={g.nationality} />
+        <Row
+          label="Gender"
+          value={
+            g.gender
+              ? g.gender === "prefer_not_to_say"
+                ? "Prefer not to say"
+                : g.gender.charAt(0).toUpperCase() + g.gender.slice(1)
+              : null
+          }
+        />
         <Row
           label="Date of Birth"
           value={g.dateOfBirth ? format(new Date(g.dateOfBirth), "dd MMM yyyy") : null}

@@ -39,6 +39,7 @@ import {
 import { getGuestBalance } from "../lib/ledger.js";
 import { resolveCurrentPropertyId } from "../lib/currentProperty.js";
 import { calcGstBreakdown, getGstRate } from "../lib/gst.js";
+import { loadGuestExtra } from "../lib/guestExtra.js";
 import { buildInvoice, selectChargesForScope } from "../lib/invoiceBuilder.js";
 import { PAYMENT_METHODS } from "../db/schema/enums.js";
 import { invoiceNumber, reservationNumber } from "../lib/numbers.js";
@@ -1616,6 +1617,7 @@ async function handlePerRoomCheckout(args: {
               durationHours: r.durationHours ? Number(r.durationHours) : null,
               checkedInAt: r.checkedInAt ? r.checkedInAt.toISOString() : null,
             },
+            guestExtra: await loadGuestExtra(r.id),
           });
           const url = await uploadPublicPdf(`invoices/${issued.invoiceNumber}.pdf`, pdf);
           if (url) invoiceLinks.push(url);
@@ -2054,6 +2056,7 @@ router.post(
                   ? r[0]!.checkedInAt.toISOString()
                   : null,
               },
+              guestExtra: await loadGuestExtra(r[0]!.id),
             });
             const url = await uploadPublicPdf(`invoices/${invNumber}.pdf`, pdf);
             if (url) invoiceLink = url;
@@ -3852,6 +3855,7 @@ router.get(
         durationHours: r[0]!.durationHours ? Number(r[0]!.durationHours) : null,
         checkedInAt: r[0]!.checkedInAt ? r[0]!.checkedInAt.toISOString() : null,
       },
+      guestExtra: await loadGuestExtra(r[0]!.id),
     });
 
     res.setHeader("Content-Type", "application/pdf");

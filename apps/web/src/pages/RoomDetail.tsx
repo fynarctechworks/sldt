@@ -69,8 +69,11 @@ export default function RoomDetail() {
           <input
             className="input"
             type="number"
-            value={form.floor ?? 0}
-            onChange={(e) => setForm({ ...form, floor: Number(e.target.value) })}
+            value={form.floor === undefined || form.floor === 0 ? "" : form.floor}
+            onChange={(e) => {
+              const v = e.target.value;
+              setForm({ ...form, floor: v === "" ? 0 : Number(v) });
+            }}
           />
         </Field>
         <Field label="Type">
@@ -91,7 +94,7 @@ export default function RoomDetail() {
           <input
             className="input"
             type="number"
-            value={form.baseRate ?? 0}
+            value={!form.baseRate || form.baseRate === "0" ? "" : form.baseRate}
             onChange={(e) => setForm({ ...form, baseRate: e.target.value })}
           />
         </Field>
@@ -99,8 +102,18 @@ export default function RoomDetail() {
           <input
             className="input"
             type="number"
-            value={form.maxOccupancy ?? 1}
-            onChange={(e) => setForm({ ...form, maxOccupancy: Number(e.target.value) })}
+            value={
+              form.maxOccupancy === undefined || form.maxOccupancy === 0
+                ? ""
+                : form.maxOccupancy
+            }
+            onChange={(e) => {
+              const v = e.target.value;
+              setForm({ ...form, maxOccupancy: v === "" ? 0 : Number(v) });
+            }}
+            onBlur={() => {
+              if (!form.maxOccupancy) setForm({ ...form, maxOccupancy: 1 });
+            }}
           />
         </Field>
       </div>

@@ -1317,16 +1317,22 @@ function RoomTypeModal({ row, onClose }: { row: RoomTypeRow | null; onClose: () 
             <input
               className="input"
               type="number"
-              value={form.defaultRate}
-              onChange={(e) => setForm({ ...form, defaultRate: Number(e.target.value) })}
+              value={form.defaultRate === 0 ? "" : form.defaultRate}
+              onChange={(e) => {
+                const v = e.target.value;
+                setForm({ ...form, defaultRate: v === "" ? 0 : Number(v) });
+              }}
             />
           </Field>
           <Field label="Max Occupancy">
             <input
               className="input"
               type="number"
-              value={form.maxOccupancy}
-              onChange={(e) => setForm({ ...form, maxOccupancy: Number(e.target.value) })}
+              value={form.maxOccupancy === 0 ? "" : form.maxOccupancy}
+              onChange={(e) => {
+                const v = e.target.value;
+                setForm({ ...form, maxOccupancy: v === "" ? 0 : Number(v) });
+              }}
             />
           </Field>
         </div>

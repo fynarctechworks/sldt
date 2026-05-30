@@ -371,12 +371,16 @@ export function EditInvoiceModal({ invoiceId, onClose, onSaved }: Props) {
                                 className="input !h-8 !py-0 text-sm text-right tabular-nums"
                                 type="number"
                                 min={1}
-                                value={l.quantity}
-                                onChange={(e) =>
+                                value={l.quantity === 0 ? "" : l.quantity}
+                                onChange={(e) => {
+                                  const v = e.target.value;
                                   updateLine(idx, {
-                                    quantity: Math.max(1, Math.floor(Number(e.target.value) || 1)),
-                                  })
-                                }
+                                    quantity: v === "" ? 0 : Math.floor(Number(v)),
+                                  });
+                                }}
+                                onBlur={() => {
+                                  if (l.quantity < 1) updateLine(idx, { quantity: 1 });
+                                }}
                               />
                             </td>
                             <td className="px-2 py-1.5">
@@ -385,10 +389,11 @@ export function EditInvoiceModal({ invoiceId, onClose, onSaved }: Props) {
                                 type="number"
                                 min={0}
                                 step="0.01"
-                                value={l.rate}
-                                onChange={(e) =>
-                                  updateLine(idx, { rate: Number(e.target.value) || 0 })
-                                }
+                                value={l.rate === 0 ? "" : l.rate}
+                                onChange={(e) => {
+                                  const v = e.target.value;
+                                  updateLine(idx, { rate: v === "" ? 0 : Number(v) });
+                                }}
                               />
                             </td>
                             <td className="px-2 py-1.5">
@@ -398,15 +403,16 @@ export function EditInvoiceModal({ invoiceId, onClose, onSaved }: Props) {
                                 min={0}
                                 max={100}
                                 step="0.01"
-                                value={l.gstRate}
-                                onChange={(e) =>
+                                value={l.gstRate === 0 ? "" : l.gstRate}
+                                onChange={(e) => {
+                                  const v = e.target.value;
                                   updateLine(idx, {
-                                    gstRate: Math.min(
-                                      100,
-                                      Math.max(0, Number(e.target.value) || 0),
-                                    ),
-                                  })
-                                }
+                                    gstRate:
+                                      v === ""
+                                        ? 0
+                                        : Math.min(100, Math.max(0, Number(v))),
+                                  });
+                                }}
                               />
                             </td>
                             <td className="px-2 py-1.5 text-right font-mono tabular-nums text-sm">
