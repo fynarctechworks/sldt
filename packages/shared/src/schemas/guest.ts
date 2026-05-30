@@ -4,10 +4,17 @@ import { ID_PROOF_TYPES } from "../enums.js";
 const phoneRegex = /^[6-9]\d{9}$/;
 const gstinRegex = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/;
 
+export const GENDERS = ["male", "female", "other", "prefer_not_to_say"] as const;
+export type Gender = (typeof GENDERS)[number];
+
 export const guestCreateSchema = z.object({
   fullName: z.string().min(2).max(100),
   phone: z.string().regex(phoneRegex, "Phone must be 10-digit Indian mobile"),
   email: z.string().email().optional().nullable(),
+  // Required for new guests. Legacy rows are NULL — keep update
+  // schema's gender optional so an edit doesn't force the staff to
+  // fill it for old records they haven't touched.
+  gender: z.enum(GENDERS),
   idProofType: z.enum(ID_PROOF_TYPES),
   idProofNumber: z.string().min(4).max(50),
   address: z.string().max(500).optional().nullable(),
@@ -25,6 +32,8 @@ export const guestCreateSchema = z.object({
   notes: z.string().max(1000).optional().nullable(),
 });
 
+// Update is fully optional (PATCH semantics), including gender so we
+// don't force fills on legacy rows.
 export const guestUpdateSchema = guestCreateSchema.partial();
 
 export const guestListQuerySchema = z.object({

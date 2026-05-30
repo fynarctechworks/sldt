@@ -108,6 +108,7 @@ export default function NewReservation() {
     fullName: "",
     phone: "",
     email: "",
+    gender: "" as "" | "male" | "female" | "other" | "prefer_not_to_say",
     idProofType: "aadhaar" as "aadhaar" | "pan" | "passport" | "driving_license" | "voter_id",
     idProofNumber: "",
     address: "",
@@ -116,6 +117,28 @@ export default function NewReservation() {
     nationality: "Indian",
   });
   const [useNewGuest, setUseNewGuest] = useState(false);
+
+  // Co-guest (2nd occupant). Required when numAdults >= 2.
+  // Mirror the booker state: existing-guest search OR new-guest form.
+  const [coGuest, setCoGuest] = useState<Guest | null>(null);
+  const [coGuestUseNew, setCoGuestUseNew] = useState(false);
+  const [coGuestForm, setCoGuestForm] = useState({
+    fullName: "",
+    phone: "",
+    email: "",
+    gender: "" as "" | "male" | "female" | "other" | "prefer_not_to_say",
+    idProofType: "aadhaar" as "aadhaar" | "pan" | "passport" | "driving_license" | "voter_id",
+    idProofNumber: "",
+    address: "",
+    city: "",
+    state: "",
+    nationality: "Indian",
+  });
+  const [coGuestQuery, setCoGuestQuery] = useState("");
+  const [coGuestKycPhoto, setCoGuestKycPhoto] = useState<File | null>(null);
+  const [coGuestKycFront, setCoGuestKycFront] = useState<File | null>(null);
+  const [coGuestKycBack, setCoGuestKycBack] = useState<File | null>(null);
+  const needsCoGuest = adults >= 2;
 
   const [selectedRooms, setSelectedRooms] = useState<
     {
@@ -447,6 +470,7 @@ export default function NewReservation() {
   //     consumed in the same transaction.
 
   const [pendingOtpGuestId, setPendingOtpGuestId] = useState<string | null>(null);
+  const [pendingCoGuestIds, setPendingCoGuestIds] = useState<string[]>([]);
 
   // Flip a dirty room straight to "clean" so staff can re-let it without
   // leaving this page. The optimistic update bumps the cached availability
@@ -468,6 +492,7 @@ export default function NewReservation() {
     mutationFn: async () => {
       let guestId = selectedGuest?.id;
       if (useNewGuest) {
+        if (!newGuest.gender) throw new Error("Gender is required for new guest");
         const g = await api.post<Guest>("/guests", {
           ...newGuest,
           phone: normalizeIndianPhone(newGuest.phone),
@@ -502,13 +527,44 @@ export default function NewReservation() {
         await api.upload(`/guests/${guestId}/kyc`, form);
       }
 
-      return { guestId };
+      // Co-guest (2nd occupant). Required when adults >= 2.
+      const coGuestIds: string[] = [];
+      if (needsCoGuest) {
+        let coGuestId = coGuest?.id;
+        if (coGuestUseNew) {
+          if (!coGuestForm.gender)
+            throw new Error("Gender is required for the second guest");
+          if (!coGuestForm.fullName || !coGuestForm.phone || !coGuestForm.idProofNumber)
+            throw new Error("Fill in the second guest's name, phone, and ID number");
+          const g2 = await api.post<Guest>("/guests", {
+            ...coGuestForm,
+            phone: normalizeIndianPhone(coGuestForm.phone),
+            email: coGuestForm.email || undefined,
+          });
+          coGuestId = g2.id;
+          if (coGuestKycFront || coGuestKycPhoto || coGuestKycBack) {
+            const form = new FormData();
+            if (coGuestKycFront) form.append("front", coGuestKycFront);
+            if (coGuestKycBack) form.append("back", coGuestKycBack);
+            if (coGuestKycPhoto) form.append("photo", coGuestKycPhoto);
+            await api.upload(`/guests/${coGuestId}/kyc`, form);
+          }
+        }
+        if (!coGuestId)
+          throw new Error("A second guest with KYC is required for 2+ adults");
+        if (coGuestId === guestId)
+          throw new Error("Booker can't also be the second guest");
+        coGuestIds.push(coGuestId);
+      }
+
+      return { guestId, coGuestIds };
     },
-    onSuccess: ({ guestId }) => {
+    onSuccess: ({ guestId, coGuestIds }) => {
       // Open OTP modal. The actual reservation gets created only in the
       // OTP-verified callback (createAfterOtp.mutate). If staff abandons
       // the OTP step, no DB write ever happens.
       setPendingOtpGuestId(guestId);
+      setPendingCoGuestIds(coGuestIds);
     },
     onError: (e: Error) => setError(describeApiError(e)),
   });
@@ -540,6 +596,7 @@ export default function NewReservation() {
           ratePerNight: r.ratePerNight,
           soldAsType: r.soldAsType ?? undefined,
         })),
+        coGuestIds: pendingCoGuestIds.length > 0 ? pendingCoGuestIds : undefined,
         advancePaid: isCreditBooking ? 0 : advance > 0 ? advance : 0,
         advancePaymentMethod: isCreditBooking ? undefined : advance > 0 ? paymentMethod : undefined,
         useWalletCredit: effectiveWalletApply > 0 ? effectiveWalletApply : undefined,
@@ -1138,6 +1195,27 @@ export default function NewReservation() {
               />
             </div>
             <div>
+              <label className="label block mb-1">
+                Gender <span className="text-danger">*</span>
+              </label>
+              <select
+                className="input"
+                value={newGuest.gender}
+                onChange={(e) =>
+                  setNewGuest({
+                    ...newGuest,
+                    gender: e.target.value as typeof newGuest.gender,
+                  })
+                }
+              >
+                <option value="">Select gender…</option>
+                <option value="male">Male</option>
+                <option value="female">Female</option>
+                <option value="other">Other</option>
+                <option value="prefer_not_to_say">Prefer not to say</option>
+              </select>
+            </div>
+            <div>
               <label className="label block mb-1">ID Type</label>
               <select
                 className="input"
@@ -1206,6 +1284,26 @@ export default function NewReservation() {
           </div>
         )}
       </div>
+
+      {needsCoGuest && (
+        <SecondOccupantCard
+          mode={coGuestUseNew ? "new" : "existing"}
+          onModeChange={(m) => setCoGuestUseNew(m === "new")}
+          query={coGuestQuery}
+          setQuery={setCoGuestQuery}
+          selected={coGuest}
+          onSelected={setCoGuest}
+          excludeGuestId={selectedGuest?.id ?? null}
+          form={coGuestForm}
+          setForm={setCoGuestForm}
+          kycPhoto={coGuestKycPhoto}
+          setKycPhoto={setCoGuestKycPhoto}
+          kycFront={coGuestKycFront}
+          setKycFront={setCoGuestKycFront}
+          kycBack={coGuestKycBack}
+          setKycBack={setCoGuestKycBack}
+        />
+      )}
 
       {/* KYC card is contextual:
             - New Guest mode → render the upload pickers (required for
@@ -2019,6 +2117,219 @@ function KycFilePicker({
                 Replace
               </label>
             </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// 2nd occupant block. Shown when numAdults >= 2. Either pick an
+// existing guest (search by phone/name) or create a fresh guest +
+// upload their KYC. The submitted reservation links this guest via
+// reservationCoGuests.
+interface SecondOccupantForm {
+  fullName: string;
+  phone: string;
+  email: string;
+  gender: "" | "male" | "female" | "other" | "prefer_not_to_say";
+  idProofType: "aadhaar" | "pan" | "passport" | "driving_license" | "voter_id";
+  idProofNumber: string;
+  address: string;
+  city: string;
+  state: string;
+  nationality: string;
+}
+
+function SecondOccupantCard(props: {
+  mode: "existing" | "new";
+  onModeChange: (m: "existing" | "new") => void;
+  query: string;
+  setQuery: (q: string) => void;
+  selected: Guest | null;
+  onSelected: (g: Guest | null) => void;
+  excludeGuestId: string | null;
+  form: SecondOccupantForm;
+  setForm: (f: SecondOccupantForm) => void;
+  kycPhoto: File | null;
+  setKycPhoto: (f: File | null) => void;
+  kycFront: File | null;
+  setKycFront: (f: File | null) => void;
+  kycBack: File | null;
+  setKycBack: (f: File | null) => void;
+}) {
+  const f = props.form;
+  const setF = (patch: Partial<typeof f>) => props.setForm({ ...f, ...patch });
+  const search = useQuery({
+    queryKey: ["coGuestSearch", props.query],
+    queryFn: () =>
+      api.get<Guest[]>("/guests", { search: props.query, per_page: 8 }),
+    enabled: props.query.length >= 2 && props.mode === "existing",
+  });
+  const results = (search.data ?? []).filter(
+    (g) => g.id !== props.excludeGuestId,
+  );
+
+  return (
+    <div className="card space-y-3">
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <h2 className="font-semibold text-navy">
+          2.5 Second Guest <span className="text-danger">*</span>
+        </h2>
+        <div className="text-xs">
+          <button
+            type="button"
+            className={`px-3 py-1 rounded-sm ${props.mode === "existing" ? "bg-navy text-white" : "bg-gray-100"}`}
+            onClick={() => {
+              props.onModeChange("existing");
+              props.onSelected(null);
+            }}
+          >
+            Existing
+          </button>
+          <button
+            type="button"
+            className={`px-3 py-1 rounded-sm ml-1 ${props.mode === "new" ? "bg-navy text-white" : "bg-gray-100"}`}
+            onClick={() => {
+              props.onModeChange("new");
+              props.onSelected(null);
+            }}
+          >
+            New
+          </button>
+        </div>
+      </div>
+      <div className="text-xs text-textSecondary -mt-1">
+        With 2 or more adults, the second guest's KYC is required by law.
+      </div>
+
+      {props.mode === "existing" ? (
+        <div className="space-y-2">
+          <input
+            className="input"
+            placeholder="Search by phone or name (min 2 chars)"
+            value={props.query}
+            onChange={(e) => props.setQuery(e.target.value)}
+          />
+          {props.selected && (
+            <div className="text-sm text-success">
+              Selected: <strong>{props.selected.fullName}</strong> ({props.selected.phone})
+            </div>
+          )}
+          {!props.selected && results.length > 0 && (
+            <ul className="border border-borderc rounded divide-y divide-borderc">
+              {results.map((g) => (
+                <li
+                  key={g.id}
+                  className="px-3 py-2 hover:bg-bg cursor-pointer text-sm"
+                  onClick={() => props.onSelected(g)}
+                >
+                  <span className="font-medium">{g.fullName}</span>{" "}
+                  <span className="text-textSecondary">· {g.phone}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      ) : (
+        <div className="space-y-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label className="label block mb-1">
+                Full name <span className="text-danger">*</span>
+              </label>
+              <input
+                className="input"
+                value={f.fullName}
+                onChange={(e) => setF({ fullName: e.target.value })}
+              />
+            </div>
+            <div>
+              <label className="label block mb-1">
+                Phone <span className="text-danger">*</span>
+              </label>
+              <input
+                className="input"
+                type="tel"
+                inputMode="numeric"
+                maxLength={10}
+                value={f.phone}
+                onChange={(e) =>
+                  setF({ phone: e.target.value.replace(/\D/g, "").slice(0, 10) })
+                }
+                placeholder="9876543210"
+              />
+            </div>
+            <div>
+              <label className="label block mb-1">Email</label>
+              <EmailInput value={f.email} onChange={(v) => setF({ email: v })} />
+            </div>
+            <div>
+              <label className="label block mb-1">
+                Gender <span className="text-danger">*</span>
+              </label>
+              <select
+                className="input"
+                value={f.gender}
+                onChange={(e) =>
+                  setF({ gender: e.target.value as typeof f.gender })
+                }
+              >
+                <option value="">Select gender…</option>
+                <option value="male">Male</option>
+                <option value="female">Female</option>
+                <option value="other">Other</option>
+                <option value="prefer_not_to_say">Prefer not to say</option>
+              </select>
+            </div>
+            <div>
+              <label className="label block mb-1">ID Type</label>
+              <select
+                className="input"
+                value={f.idProofType}
+                onChange={(e) =>
+                  setF({
+                    idProofType: e.target.value as typeof f.idProofType,
+                  })
+                }
+              >
+                <option value="aadhaar">Aadhaar</option>
+                <option value="pan">PAN</option>
+                <option value="passport">Passport</option>
+                <option value="driving_license">Driving License</option>
+                <option value="voter_id">Voter ID</option>
+              </select>
+            </div>
+            <div>
+              <label className="label block mb-1">
+                ID Number <span className="text-danger">*</span>
+              </label>
+              <input
+                className="input"
+                value={f.idProofNumber}
+                onChange={(e) => setF({ idProofNumber: e.target.value })}
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <KycFilePicker
+              label="Customer Photo"
+              file={props.kycPhoto}
+              onChange={props.setKycPhoto}
+              required
+            />
+            <KycFilePicker
+              label="ID Front"
+              file={props.kycFront}
+              onChange={props.setKycFront}
+              required
+            />
+            <KycFilePicker
+              label="ID Back"
+              file={props.kycBack}
+              onChange={props.setKycBack}
+            />
           </div>
         </div>
       )}

@@ -15,6 +15,8 @@ import { profiles } from "./profiles.js";
 import { properties } from "./properties.js";
 
 export const FOLLOW_UP_STATUSES = ["pending", "done", "cancelled"] as const;
+export const GENDERS = ["male", "female", "other", "prefer_not_to_say"] as const;
+export type Gender = (typeof GENDERS)[number];
 
 export const guests = pgTable(
   "guests",
@@ -36,6 +38,8 @@ export const guests = pgTable(
     city: text("city"),
     state: text("state"),
     nationality: text("nationality").notNull().default("Indian"),
+    // Migration 0020. NULL on legacy rows; new guests require it.
+    gender: text("gender", { enum: GENDERS }),
     dateOfBirth: date("date_of_birth"),
     companyName: text("company_name"),
     gstin: text("gstin"),

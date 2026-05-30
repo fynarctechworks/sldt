@@ -382,6 +382,7 @@ function AddGuestModal({ onClose }: { onClose: () => void }) {
     fullName: "",
     phone: "",
     email: "",
+    gender: "" as "" | "male" | "female" | "other" | "prefer_not_to_say",
     idProofType: "aadhaar" as IdProofType,
     idProofNumber: "",
     address: "",
@@ -408,8 +409,9 @@ function AddGuestModal({ onClose }: { onClose: () => void }) {
   }
 
   const create = useMutation({
-    mutationFn: () =>
-      api.post("/guests", {
+    mutationFn: () => {
+      if (!form.gender) throw new Error("Gender is required");
+      return api.post("/guests", {
         ...form,
         email: form.email || undefined,
         city: form.city || undefined,
@@ -418,7 +420,8 @@ function AddGuestModal({ onClose }: { onClose: () => void }) {
         companyName: form.companyName || undefined,
         gstin: form.gstin || undefined,
         notes: form.notes || undefined,
-      }),
+      });
+    },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["guests"] });
       onClose();
@@ -499,6 +502,25 @@ function AddGuestModal({ onClose }: { onClose: () => void }) {
               value={form.nationality}
               onChange={(e) => setForm({ ...form, nationality: e.target.value })}
             />
+          </Field>
+          <Field label="Gender *">
+            <select
+              className="input"
+              value={form.gender}
+              onChange={(e) =>
+                setForm({
+                  ...form,
+                  gender: e.target.value as typeof form.gender,
+                })
+              }
+              required
+            >
+              <option value="">Select gender…</option>
+              <option value="male">Male</option>
+              <option value="female">Female</option>
+              <option value="other">Other</option>
+              <option value="prefer_not_to_say">Prefer not to say</option>
+            </select>
           </Field>
           <Field label="State">
             <Combobox

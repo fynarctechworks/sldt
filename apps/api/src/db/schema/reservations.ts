@@ -147,7 +147,26 @@ export const reservationRooms = pgTable("reservation_rooms", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+// Migration 0020 — co-guest link table. Each row pairs a reservation
+// with a real Guest row that occupies the booking alongside the
+// booker. Used to enforce "if numAdults >= 2 then at least 1 co-guest
+// with KYC".  Position is 1-based and unique per reservation so the
+// UI can render slots stably.
+export const reservationCoGuests = pgTable("reservation_co_guests", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  reservationId: uuid("reservation_id")
+    .notNull()
+    .references(() => reservations.id, { onDelete: "cascade" }),
+  guestId: uuid("guest_id")
+    .notNull()
+    .references(() => guests.id),
+  position: integer("position").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 export type Reservation = typeof reservations.$inferSelect;
 export type NewReservation = typeof reservations.$inferInsert;
 export type ReservationRoom = typeof reservationRooms.$inferSelect;
 export type NewReservationRoom = typeof reservationRooms.$inferInsert;
+export type ReservationCoGuest = typeof reservationCoGuests.$inferSelect;
+export type NewReservationCoGuest = typeof reservationCoGuests.$inferInsert;

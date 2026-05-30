@@ -23,7 +23,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { db } from "../db/client.js";
 import { additionalCharges, invoiceLineItems, invoices, payments } from "../db/schema/invoices.js";
-import { reservationRooms, reservations } from "../db/schema/reservations.js";
+import { reservationCoGuests, reservationRooms, reservations } from "../db/schema/reservations.js";
 import { rooms } from "../db/schema/rooms.js";
 import { roomTypes } from "../db/schema/settings.js";
 import { combinedRoomTypeLabel, type RoomTypeLabelMap } from "../lib/roomTypeLabel.js";
@@ -247,6 +247,27 @@ router.get("/:id", requireAuth, requirePermission("view_reservations"), async (r
     : [];
   const occupantById = new Map(occupants.map((g) => [g.id, g]));
 
+  // Migration 0020 — co-guests linked to this reservation. Join with
+  // guests so the UI can render name/phone/gender without a follow-up
+  // fetch.
+  const coGuestRows = await db
+    .select({
+      cg: reservationCoGuests,
+      g: {
+        id: guests.id,
+        fullName: guests.fullName,
+        phone: guests.phone,
+        gender: guests.gender,
+        idProofType: guests.idProofType,
+        idProofLast4: guests.idProofLast4,
+        guestPhoto: guests.guestPhoto,
+      },
+    })
+    .from(reservationCoGuests)
+    .innerJoin(guests, eq(guests.id, reservationCoGuests.guestId))
+    .where(eq(reservationCoGuests.reservationId, id))
+    .orderBy(asc(reservationCoGuests.position));
+
   const s = await getSettings();
 
   const guestPhotoUrl = guest[0]?.guestPhoto ? await signedKycUrl(guest[0].guestPhoto) : null;
@@ -290,6 +311,11 @@ router.get("/:id", requireAuth, requirePermission("view_reservations"), async (r
         };
       });
     })(),
+    coGuests: coGuestRows.map((row) => ({
+      id: row.cg.id,
+      position: row.cg.position,
+      guest: row.g,
+    })),
     additionalCharges: charges,
     invoice: inv,
     invoices: allInvoices,
@@ -581,6 +607,18 @@ router.post(
             status: "confirmed" as const,
           })),
         );
+
+        // Migration 0020 — link co-guests (additional adults whose
+        // KYC was required at booking). Position is 1-based.
+        if (input.coGuestIds && input.coGuestIds.length > 0) {
+          await tx.insert(reservationCoGuests).values(
+            input.coGuestIds.map((gid, i) => ({
+              reservationId: r!.id,
+              guestId: gid,
+              position: i + 1,
+            })),
+          );
+        }
 
         await tx
           .update(rooms)

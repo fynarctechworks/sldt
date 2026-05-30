@@ -46,6 +46,11 @@ export const reservationCreateSchema = z
     // the reservation insert, then proceeds. Omitting this rejects the
     // create unless an admin override flag is added later.
     otpCode: z.string().min(4).max(8).optional(),
+    // Co-guests (migration 0020). Up to 1 additional guest with full
+    // KYC is required when numAdults >= 2. Capped at 1 since we only
+    // require KYC for the first 2 adults total; further adults beyond
+    // 2 don't need their own record. Each id must be a real Guest row.
+    coGuestIds: z.array(z.string().uuid()).max(1).optional().default([]),
   })
   .superRefine((d, ctx) => {
     if (d.stayType === "short_stay") {
@@ -68,6 +73,23 @@ export const reservationCreateSchema = z
         code: z.ZodIssueCode.custom,
         path: ["checkOutDate"],
         message: "check_out_date must be after check_in_date",
+      });
+    }
+    // Co-guest requirement: 2+ adults need at least 1 co-guest with KYC.
+    // (numAdults beyond 2 doesn't require additional KYC — capped at 1.)
+    if (d.numAdults >= 2 && (!d.coGuestIds || d.coGuestIds.length < 1)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["coGuestIds"],
+        message: "A second guest with KYC is required when there are 2 or more adults",
+      });
+    }
+    // Booker can't also be listed as a co-guest.
+    if (d.coGuestIds?.some((id) => id === d.guestId)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["coGuestIds"],
+        message: "Booker can't also be a co-guest",
       });
     }
   });

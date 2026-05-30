@@ -526,6 +526,7 @@ router.post(
         fullName: input.fullName,
         phone: input.phone,
         email: input.email || null,
+        gender: input.gender,
         idProofType: input.idProofType,
         idProofNumberEncrypted: encrypt(input.idProofNumber),
         idProofLast4: last4(input.idProofNumber),

@@ -85,6 +85,20 @@ interface Detail {
     idProofLast4: string | null;
     photoUrl: string | null;
   };
+  // Migration 0020 — additional adults whose KYC was captured at booking.
+  coGuests?: {
+    id: string;
+    position: number;
+    guest: {
+      id: string;
+      fullName: string;
+      phone: string;
+      gender: string | null;
+      idProofType: string | null;
+      idProofLast4: string | null;
+      guestPhoto: string | null;
+    };
+  }[];
   rooms: {
     id: string;
     roomNumber: string;
@@ -450,6 +464,28 @@ export default function ReservationDetail() {
               </div>
             </div>
           </div>
+          {/* Co-guests (migration 0020). Additional adults whose KYC
+              was captured at booking. Shown only when present. */}
+          {r.coGuests && r.coGuests.length > 0 && (
+            <div className="mt-3 pt-3 border-t border-borderc space-y-1.5">
+              <div className="text-[11px] uppercase tracking-wider text-textSecondary font-semibold">
+                Also occupying
+              </div>
+              {r.coGuests.map((cg) => (
+                <div key={cg.id} className="text-sm flex items-center justify-between gap-2">
+                  <button
+                    onClick={() => navigate(`/guests/${cg.guest.id}`)}
+                    className="text-navy hover:underline text-left truncate"
+                  >
+                    {cg.guest.fullName}
+                  </button>
+                  <span className="font-mono text-xs text-textSecondary shrink-0">
+                    {cg.guest.phone}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
         <div className="card">
           <div className="label">Dates</div>
