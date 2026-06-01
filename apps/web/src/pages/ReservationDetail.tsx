@@ -122,6 +122,14 @@ interface Detail {
     effectiveTo?: string | null;
     swapId?: string | null;
     swapReason?: string | null;
+    // Same-day re-let pending: a walk-in is currently in this room
+    // and due to check out before this reservation's check-in date.
+    reletPending?: {
+      reservationId: string;
+      reservationNumber: string;
+      guestName: string;
+      checkOutDate: string;
+    } | null;
   }[];
   additionalCharges: {
     id: string;
@@ -174,6 +182,15 @@ export default function ReservationDetail() {
   const [err, setErr] = useState<string | null>(null);
 
   const [showCharge, setShowCharge] = useState(false);
+  // When the staff opens "Add Charge" from the overdue → checkout flow,
+  // we want to: (a) pre-fill the description + GST as a late fee, and
+  // (b) jump straight into the checkout modal once the charge saves.
+  // Both bits live in this combined state object.
+  const [lateFeeFlow, setLateFeeFlow] = useState<null | {
+    description: string;
+    gstRate: number;
+    titleOverride: string;
+  }>(null);
   const [showPay, setShowPay] = useState(false);
   const [showCheckout, setShowCheckout] = useState(false);
   const [showKyc, setShowKyc] = useState(false);
@@ -302,6 +319,26 @@ export default function ReservationDetail() {
     onError: (e: Error) => setErr(e.message),
   });
 
+  // No-show: guest never arrived. Advance is forfeit (kept as revenue,
+  // not refunded). Rooms release immediately. Distinct from Cancel so
+  // reports can separate true cancellations from no-shows.
+  const noShow = useMutation({
+    mutationFn: (note: string) =>
+      api.post<{ forfeitedAdvance: number }>(`/reservations/${id}/no-show`, {
+        note,
+      }),
+    onSuccess: (resp) => {
+      invalidate();
+      toast(
+        resp.forfeitedAdvance > 0
+          ? `Marked no-show. ₹${resp.forfeitedAdvance.toFixed(2)} advance forfeited.`
+          : "Marked no-show.",
+        "success",
+      );
+    },
+    onError: (e: Error) => setErr(e.message),
+  });
+
   // Reclassifies the booking as complimentary. Existing payments are left
   // alone — see API route for the rationale. The Complimentary report
   // shows the gap between billed and already-paid.
@@ -316,16 +353,19 @@ export default function ReservationDetail() {
   });
 
   function previewInvoice(invoiceId: string, invoiceNumber: string) {
+    // Prefer the SLDT-INV-NNNN handle so the network request shows up
+    // in DevTools with a readable URL. The API resolves either form.
     setPdfPreview({
-      url: `${import.meta.env.VITE_API_URL}/invoices/${invoiceId}/pdf`,
+      url: `${import.meta.env.VITE_API_URL}/invoices/${invoiceNumber}/pdf`,
       title: `Invoice · ${invoiceNumber}`,
       filename: `${invoiceNumber}.pdf`,
     });
   }
 
   function previewReceipt(paymentId: string, receiptNumber: string | null) {
+    const handle = receiptNumber ?? paymentId;
     setPdfPreview({
-      url: `${import.meta.env.VITE_API_URL}/payments/${paymentId}/receipt`,
+      url: `${import.meta.env.VITE_API_URL}/payments/${handle}/receipt`,
       title: `Receipt · ${receiptNumber ?? paymentId.slice(0, 8)}`,
       filename: `${receiptNumber ?? "receipt-" + paymentId.slice(0, 8)}.pdf`,
     });
@@ -439,6 +479,36 @@ export default function ReservationDetail() {
         </div>
       )}
 
+      {/* Likely no-show banner — confirmed booking whose check-in date
+          is in the past OR today + past hotel check-in time. Staff
+          should either verify (check-in if guest just arrived late)
+          or click Mark No-show. */}
+      {r.status === "confirmed" && (() => {
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const ci = new Date(r.checkInDate);
+        ci.setHours(0, 0, 0, 0);
+        const daysLate = Math.floor((today.getTime() - ci.getTime()) / 86400000);
+        if (daysLate < 1) return null;
+        return (
+          <div className="card border-danger/40 bg-danger/5 flex items-start gap-3">
+            <div className="text-danger text-lg leading-none mt-0.5">⚠</div>
+            <div className="flex-1">
+              <div className="font-semibold text-danger">
+                Guest hasn't arrived — booking was for{" "}
+                {format(new Date(r.checkInDate), "dd MMM yyyy")}{" "}
+                ({daysLate} day{daysLate === 1 ? "" : "s"} ago).
+              </div>
+              <div className="text-xs text-textSecondary mt-0.5">
+                If they just walked in late, hit <strong>Verify &amp; Check In</strong>.
+                If they're not coming, use <strong>Mark No-show</strong> to forfeit
+                the advance and release the room.
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <div className="card">
           <div className="label">Guest</div>
@@ -452,7 +522,7 @@ export default function ReservationDetail() {
             )}
             <div className="min-w-0">
               <button
-                onClick={() => navigate(`/guests/${r.guestId}`)}
+                onClick={() => guest?.phone && navigate(`/guests/${guest.phone}`)}
                 className="font-semibold text-navy hover:underline text-left"
               >
                 {guest?.fullName}
@@ -474,7 +544,7 @@ export default function ReservationDetail() {
               {r.coGuests.map((cg) => (
                 <div key={cg.id} className="text-sm flex items-center justify-between gap-2">
                   <button
-                    onClick={() => navigate(`/guests/${cg.guest.id}`)}
+                    onClick={() => navigate(`/guests/${cg.guest.phone}`)}
                     className="text-navy hover:underline text-left truncate"
                   >
                     {cg.guest.fullName}
@@ -578,7 +648,46 @@ export default function ReservationDetail() {
           </button>
         )}
         {canCheckOut && (
-          <button className="btn-primary" onClick={() => setShowCheckout(true)}>
+          <button
+            className="btn-primary"
+            onClick={async () => {
+              // Overdue intercept: if the guest stayed past their
+              // scheduled checkout (either multi-day or past today's
+              // hotel checkout time), give staff a chance to add a
+              // late fee BEFORE generating the invoice. Skipping is
+              // explicit — no fee means the checkout proceeds as is.
+              const isLate = overdueDays > 0 || minutesOverdue > 0;
+              if (isLate) {
+                const headline =
+                  overdueDays > 0
+                    ? `Guest stayed ${overdueDays} day${overdueDays === 1 ? "" : "s"} past the scheduled check-out.`
+                    : `Guest is ${minutesOverdue} min past today's check-out time.`;
+                const wantsFee = await dialog.confirm({
+                  title: "Add a late fee?",
+                  message: `${headline} Do you want to add a late-checkout charge to the bill before generating the invoice?`,
+                  okLabel: "Yes, add fee",
+                  cancelLabel: "No, skip",
+                });
+                if (wantsFee) {
+                  setLateFeeFlow({
+                    description: `Late checkout fee (${
+                      overdueDays > 0
+                        ? `${overdueDays} day${overdueDays === 1 ? "" : "s"}`
+                        : `${minutesOverdue} min`
+                    } past scheduled out)`,
+                    // Late fee defaults to 0% — same as other one-off
+                    // charges. Staff explicitly picks 5%/18% from the
+                    // dropdown when it's actually tax-applicable.
+                    gstRate: 0,
+                    titleOverride: "Add Late-Checkout Fee",
+                  });
+                  setShowCharge(true);
+                  return;
+                }
+              }
+              setShowCheckout(true);
+            }}
+          >
             Check Out & Generate Invoice
           </button>
         )}
@@ -636,6 +745,31 @@ export default function ReservationDetail() {
             <Gift className="w-4 h-4" /> Make Complimentary
           </button>
         )}
+        {r.status === "confirmed" && (
+          <button
+            className="btn-secondary inline-flex items-center gap-2"
+            onClick={async () => {
+              const advance = Number(r.advancePaid ?? 0);
+              const advanceLine =
+                advance > 0
+                  ? ` The ₹${advance.toFixed(2)} advance will be FORFEITED (kept as revenue, not refunded).`
+                  : "";
+              const reason = await dialog.prompt({
+                title: "Mark as no-show",
+                message: `Guest didn't arrive for their booking.${advanceLine} This releases the room and closes the reservation. Add a short note for the record.`,
+                placeholder: "e.g. No contact after 9pm cutoff; phone unreachable",
+                okLabel: "Mark no-show",
+                cancelLabel: "Not yet",
+                tone: "danger",
+                required: true,
+                multiline: true,
+              });
+              if (reason) noShow.mutate(reason);
+            }}
+          >
+            <AlertTriangle className="w-4 h-4" /> Mark No-show
+          </button>
+        )}
         {canCancel && (
           <button
             className="btn-danger inline-flex items-center gap-2"
@@ -643,7 +777,7 @@ export default function ReservationDetail() {
               const reason = await dialog.prompt({
                 title: "Cancel reservation",
                 message: "This cannot be undone. Please provide a reason for the records.",
-                placeholder: "e.g. Guest requested, no-show, duplicate booking",
+                placeholder: "e.g. Guest requested, duplicate booking",
                 okLabel: "Cancel reservation",
                 cancelLabel: "Keep it",
                 tone: "danger",
@@ -875,10 +1009,24 @@ export default function ReservationDetail() {
             invoiced: !!rm.roomInvoiceId,
           }))}
           minutesOverdue={minutesOverdue}
-          onClose={() => setShowCharge(false)}
+          initialDescription={lateFeeFlow?.description}
+          initialGstRate={lateFeeFlow?.gstRate}
+          titleOverride={lateFeeFlow?.titleOverride}
+          onClose={() => {
+            setShowCharge(false);
+            setLateFeeFlow(null);
+          }}
           onSaved={() => {
             setShowCharge(false);
             invalidate();
+            // If this Add Charge was invoked from the overdue → checkout
+            // flow, advance to the Check Out modal as soon as the fee
+            // is saved. Cancelling the Charge modal does NOT auto-open
+            // checkout (staff explicitly bailed).
+            if (lateFeeFlow) {
+              setLateFeeFlow(null);
+              setShowCheckout(true);
+            }
           }}
         />
       )}
@@ -1158,7 +1306,7 @@ export default function ReservationDetail() {
               `Split off ${created.reservationNumber} — opening it now`,
               "success",
             );
-            navigate(`/reservations/${created.id}`);
+            navigate(`/reservations/${created.reservationNumber}`);
           }}
         />
       )}
@@ -1273,6 +1421,14 @@ function RoomRow(props: {
     effectiveTo?: string | null;
     swapId?: string | null;
     swapReason?: string | null;
+    // Same-day re-let pending (server-computed). Surface a banner so
+    // staff knows a walk-in is in the room right now.
+    reletPending?: {
+      reservationId: string;
+      reservationNumber: string;
+      guestName: string;
+      checkOutDate: string;
+    } | null;
   };
   // Reservation-level window — used as the fallback bound when the row's
   // effective_from / effective_to are NULL, and so the swap modal can
@@ -1459,6 +1615,17 @@ function RoomRow(props: {
                 <Wifi className="w-2.5 h-2.5" /> Wi-Fi
               </span>
             )}
+          </div>
+        )}
+        {props.room.reletPending && (
+          <div className="mt-2 inline-flex items-start gap-1.5 px-2 py-1 rounded-sm bg-warning/10 border border-warning/40 text-[10px] text-warning leading-snug max-w-full">
+            <AlertTriangle className="w-3 h-3 shrink-0 mt-0.5" />
+            <span>
+              <strong>Re-let pending</strong> ·{" "}
+              {props.room.reletPending.guestName} (
+              {props.room.reletPending.reservationNumber}) checks out by{" "}
+              {props.room.reletPending.checkOutDate} before this guest arrives.
+            </span>
           </div>
         )}
       </td>
@@ -1817,9 +1984,11 @@ function SwapRoomModal(props: {
           )}
           {grouped.map(([floor, rooms]) => (
             <div key={String(floor)} className="mt-3">
-              <div className="text-[11px] font-semibold uppercase tracking-wider text-textSecondary mb-1">
-                {floor === "?" ? "Other" : `Floor ${floor}`} · {rooms.length} room
-                {rooms.length === 1 ? "" : "s"}
+              <div className="text-base font-bold text-brand-dark tracking-wide mb-2 pb-1 border-b border-borderc/60">
+                {floor === "?" ? "Other" : `Floor ${floor}`}
+                <span className="ml-2 text-xs font-semibold text-textSecondary uppercase tracking-wider">
+                  · {rooms.length} room{rooms.length === 1 ? "" : "s"}
+                </span>
               </div>
               <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">
                 {rooms.map((rm) => {
@@ -2338,9 +2507,9 @@ function AddRoomModal(props: {
                 <div className="space-y-3">
                   {floors.map((floor) => (
                     <div key={String(floor)}>
-                      <div className="text-[10px] uppercase tracking-wider text-textSecondary font-semibold mb-1.5">
-                        {floor === "?" ? "Other" : `Floor ${floor}`}{" "}
-                        <span className="text-textSecondary/70">
+                      <div className="text-base font-bold text-brand-dark tracking-wide mb-2 pb-1 border-b border-borderc/60">
+                        {floor === "?" ? "Other" : `Floor ${floor}`}
+                        <span className="ml-2 text-xs font-semibold text-textSecondary uppercase tracking-wider">
                           · {byFloor.get(floor)!.length} room
                           {byFloor.get(floor)!.length === 1 ? "" : "s"}
                         </span>
@@ -2837,15 +3006,21 @@ function ChargeModal(props: {
   reservationId: string;
   rooms: { id: string; roomNumber: string; invoiced: boolean }[];
   minutesOverdue?: number;
+  // Pre-fill for "Add late fee" from the checkout flow. Staff can edit
+  // before saving; the modal isn't locked.
+  initialDescription?: string;
+  initialGstRate?: number;
+  // Optional title override (e.g. "Add Late-Checkout Fee") for clarity.
+  titleOverride?: string;
   onClose: () => void;
   onSaved: () => void;
 }) {
-  const [description, setDescription] = useState("");
+  const [description, setDescription] = useState(props.initialDescription ?? "");
   const [amount, setAmount] = useState(0);
   // Default to 0% so an "extra bed" or one-off charge doesn't silently
   // add 18% GST. Staff picks 5% / 18% only when the line item is
   // actually GST-applicable (restaurant, laundry, etc.).
-  const [gstRate, setGstRate] = useState(0);
+  const [gstRate, setGstRate] = useState(props.initialGstRate ?? 0);
   // Charge attribution. Empty set = "All rooms / reservation-wide"
   // — the charge will land on the combined invoice (or the booker's
   // share when the reservation is split into per-room invoices). Any
@@ -2915,7 +3090,7 @@ function ChargeModal(props: {
   }
 
   return (
-    <ModalShell title="Add Charge" onClose={props.onClose}>
+    <ModalShell title={props.titleOverride ?? "Add Charge"} onClose={props.onClose}>
       <div className="space-y-3">
         <OverdueWarning minutesOverdue={props.minutesOverdue ?? 0} />
         <div>

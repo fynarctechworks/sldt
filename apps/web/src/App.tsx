@@ -23,6 +23,7 @@ const Messages = lazy(() => import("@/pages/Messages"));
 const Notifications = lazy(() => import("@/pages/Notifications"));
 const Collections = lazy(() => import("@/pages/Collections"));
 const Credits = lazy(() => import("@/pages/Credits"));
+const Invoices = lazy(() => import("@/pages/Invoices"));
 
 export default function App() {
   return (
@@ -250,6 +251,18 @@ export default function App() {
               <AppShell>
                 <PermissionGuard any={["view_revenue"]}>
                   <Credits />
+                </PermissionGuard>
+              </AppShell>
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/invoices"
+          element={
+            <ProtectedRoute>
+              <AppShell>
+                <PermissionGuard any={["view_invoices"]}>
+                  <Invoices />
                 </PermissionGuard>
               </AppShell>
             </ProtectedRoute>

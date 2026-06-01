@@ -178,7 +178,7 @@ export function CommandPalette() {
           icon: <CalendarPlus className="w-4 h-4" />,
           label: `${r.reservationNumber} · ${r.guestName}`,
           sub: `${r.status} · ${r.checkInDate} → ${r.checkOutDate}`,
-          href: `/reservations/${r.id}`,
+          href: `/reservations/${r.reservationNumber}`,
         });
       }
       for (const g of data.guests) {
@@ -189,7 +189,7 @@ export function CommandPalette() {
           label: g.fullName,
           sub: `${g.phone} · ID ••••${g.idProofLast4}`,
           badge: g.isBlacklisted ? "BLACKLIST" : g.isVip ? "VIP" : undefined,
-          href: `/guests/${g.id}`,
+          href: `/guests/${g.phone}`,
         });
       }
       for (const r of data.rooms) {
@@ -199,7 +199,7 @@ export function CommandPalette() {
           icon: <DoorOpen className="w-4 h-4" />,
           label: `Room ${r.roomNumber}`,
           sub: `Floor ${r.floor} · ${r.roomType.replace(/_/g, " ")} · ${r.status}`,
-          href: `/rooms/${r.id}`,
+          href: `/rooms/${r.roomNumber}`,
         });
       }
     }

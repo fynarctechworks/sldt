@@ -8,21 +8,28 @@ import {
   guestTagsSchema,
   guestUpdateSchema,
 } from "@hoteldesk/shared";
-import { and, asc, desc, eq, ilike, inArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, ilike, inArray, isNull, or, sql } from "drizzle-orm";
 import { Router } from "express";
 import multer from "multer";
 import { z } from "zod";
 import { db } from "../db/client.js";
-import { guestFollowUps, guestNotes, guests } from "../db/schema/guests.js";
+import {
+  guestFollowUps,
+  guestNotes,
+  guestPhoneHistory,
+  guests,
+} from "../db/schema/guests.js";
 import { reservationCoGuests, reservations, reservationRooms } from "../db/schema/reservations.js";
 import { rooms } from "../db/schema/rooms.js";
 import { invoices, payments } from "../db/schema/invoices.js";
 import { logActivity } from "../lib/activity.js";
 import { encrypt, last4 } from "../lib/crypto.js";
+import { normalisePhone } from "../lib/phone.js";
 import { resolveCurrentPropertyId } from "../lib/currentProperty.js";
 import { fail, list, ok } from "../lib/response.js";
 import { deleteKycFile, signedKycUrl, uploadKycPhoto, validateKycFile } from "../lib/storage.js";
 import { requireAuth, requirePermission } from "../middleware/auth.js";
+import { resolveGuestId } from "../middleware/resolveGuest.js";
 import { validate } from "../middleware/validate.js";
 
 // Multer config for KYC uploads. We reject anything that isn't an image at
@@ -43,6 +50,11 @@ const upload = multer({
 });
 
 const router = Router();
+
+// Resolve :id to a UUID before every handler — accepts either the
+// UUID or a phone number, so navigation can build URLs like
+// /guests/9876543210 instead of leaking UUIDs.
+router.param("id", resolveGuestId as never);
 
 // Mask the ID proof for non-admin views. Only the last 4 digits leak out
 // so staff can still verify a guest at the desk without seeing the full
@@ -532,35 +544,52 @@ router.post(
   validate(guestCreateSchema),
   async (req, res) => {
     const input = req.body;
+    // Normalise so "(987) 654-3210" and "9876543210" don't both
+    // register as distinct guests. The duplicate check has to use the
+    // same shape we'll store.
+    const phone = normalisePhone(input.phone);
     const dup = await db
       .select({ id: guests.id })
       .from(guests)
-      .where(eq(guests.phone, input.phone))
+      .where(eq(guests.phone, phone))
       .limit(1);
     if (dup.length) return fail(res, 409, "DUPLICATE_PHONE", "Phone already registered");
 
     const propertyId = await resolveCurrentPropertyId(req);
-    const [created] = await db
-      .insert(guests)
-      .values({
-        propertyId,
-        fullName: input.fullName,
-        phone: input.phone,
-        email: input.email || null,
-        gender: input.gender,
-        idProofType: input.idProofType,
-        idProofNumberEncrypted: encrypt(input.idProofNumber),
-        idProofLast4: last4(input.idProofNumber),
-        address: input.address || null,
-        city: input.city || null,
-        state: input.state || null,
-        nationality: input.nationality || "Indian",
-        dateOfBirth: input.dateOfBirth || null,
-        companyName: input.companyName || null,
-        gstin: input.gstin || null,
-        notes: input.notes || null,
-      })
-      .returning();
+    // Insert the guest + their first phone-history row atomically so
+    // we can never have a guest without an open history row. (The
+    // 0022 backfill seeds existing guests; this keeps new ones
+    // consistent going forward.)
+    const created = await db.transaction(async (tx) => {
+      const [row] = await tx
+        .insert(guests)
+        .values({
+          propertyId,
+          fullName: input.fullName,
+          phone,
+          email: input.email || null,
+          gender: input.gender,
+          idProofType: input.idProofType,
+          idProofNumberEncrypted: encrypt(input.idProofNumber),
+          idProofLast4: last4(input.idProofNumber),
+          address: input.address || null,
+          city: input.city || null,
+          state: input.state || null,
+          nationality: input.nationality || "Indian",
+          dateOfBirth: input.dateOfBirth || null,
+          companyName: input.companyName || null,
+          gstin: input.gstin || null,
+          notes: input.notes || null,
+        })
+        .returning();
+      await tx.insert(guestPhoneHistory).values({
+        guestId: row!.id,
+        phone,
+        // valid_from defaults to now() at the DB level; valid_to NULL
+        // marks it as the currently-active phone.
+      });
+      return row;
+    });
 
     await logActivity({
       action: "guest_created",
@@ -583,8 +612,17 @@ router.put(
     const id = req.params.id!;
     const input = req.body;
     const update: Record<string, unknown> = { updatedAt: new Date() };
+    // If the caller is changing the phone, normalise it the same way
+    // we do for create + the resolver. We compare against the existing
+    // row to decide whether to write a history transition.
+    let nextPhone: string | undefined;
+    if (typeof input.phone === "string") {
+      nextPhone = normalisePhone(input.phone);
+      update.phone = nextPhone;
+    }
     for (const [k, v] of Object.entries(input)) {
       if (v === undefined) continue;
+      if (k === "phone") continue; // already handled above
       if (k === "idProofNumber" && typeof v === "string") {
         update.idProofNumberEncrypted = encrypt(v);
         update.idProofLast4 = last4(v);
@@ -592,7 +630,98 @@ router.put(
         update[k] = v;
       }
     }
-    const [updated] = await db.update(guests).set(update).where(eq(guests.id, id)).returning();
+
+    // Wrap update + history transition in a transaction so we never
+    // end up with the guest on a new number but no open history row
+    // (or two open rows). The transition only fires when the phone
+    // actually changes — re-saving the same phone is a no-op.
+    //
+    // The collision check lives INSIDE the transaction so two
+    // concurrent updates to the same new phone can't both pass
+    // pre-flight. We use a sentinel string (`__phone_collision__`)
+    // returned from the transaction to communicate the 409 without
+    // throwing — throwing inside a tx rolls back, which is what we
+    // want, but it'd also bubble as a generic 500 unless caught
+    // separately. The Postgres unique-index error is still caught
+    // outside as a belt-and-braces fallback.
+    const TX_NOT_FOUND = "__not_found__" as const;
+    const TX_COLLISION = "__phone_collision__" as const;
+    let updated: typeof guests.$inferSelect | null = null;
+    try {
+      const result = await db.transaction(async (tx) => {
+        const [before] = await tx
+          .select({ phone: guests.phone })
+          .from(guests)
+          .where(eq(guests.id, id))
+          .limit(1);
+        if (!before) return TX_NOT_FOUND;
+
+        if (nextPhone && nextPhone !== before.phone) {
+          const collision = await tx
+            .select({ id: guests.id })
+            .from(guests)
+            .where(eq(guests.phone, nextPhone))
+            .limit(1);
+          if (collision.length && collision[0]!.id !== id) {
+            return TX_COLLISION;
+          }
+        }
+
+        const [row] = await tx
+          .update(guests)
+          .set(update)
+          .where(eq(guests.id, id))
+          .returning();
+
+        if (nextPhone && nextPhone !== before.phone) {
+          // Close the currently-active history row (if any), then
+          // open a new one for the new number. valid_to defaults to
+          // NULL on INSERT — only the close needs an explicit
+          // timestamp.
+          await tx
+            .update(guestPhoneHistory)
+            .set({ validTo: new Date() })
+            .where(
+              and(
+                eq(guestPhoneHistory.guestId, id),
+                isNull(guestPhoneHistory.validTo),
+              ),
+            );
+          await tx.insert(guestPhoneHistory).values({
+            guestId: id,
+            phone: nextPhone,
+          });
+        }
+        return row;
+      });
+
+      if (result === TX_NOT_FOUND)
+        return fail(res, 404, "NOT_FOUND", "Guest not found");
+      if (result === TX_COLLISION)
+        return fail(
+          res,
+          409,
+          "DUPLICATE_PHONE",
+          "Phone already registered to another guest",
+        );
+      updated = result ?? null;
+    } catch (err) {
+      // Belt-and-braces: if the unique index on guests.phone catches
+      // a collision we somehow missed (e.g. an INSERT racing in
+      // between the SELECT and UPDATE inside the transaction), turn
+      // it into a clean 409 instead of bubbling a 500.
+      const code = (err as { code?: string })?.code;
+      if (code === "23505") {
+        return fail(
+          res,
+          409,
+          "DUPLICATE_PHONE",
+          "Phone already registered to another guest",
+        );
+      }
+      throw err;
+    }
+
     if (!updated) return fail(res, 404, "NOT_FOUND", "Guest not found");
 
     await logActivity({

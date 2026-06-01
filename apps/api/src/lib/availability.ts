@@ -1,8 +1,9 @@
-import { and, eq, inArray, ne, or, sql } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, ne, or, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { RESERVATION_BLOCKING_STATUSES } from "../db/schema/enums.js";
 import { reservationRooms, reservations } from "../db/schema/reservations.js";
 import { rooms } from "../db/schema/rooms.js";
+import { guests } from "../db/schema/guests.js";
 
 type Db = typeof db;
 type Exec = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -48,15 +49,20 @@ export async function findAvailableRooms(checkIn: string, checkOut: string) {
       ),
     );
 
-  // Hard-block any room that is currently occupied, reserved, or under
-  // maintenance — these can never be re-let until the underlying state
-  // changes. Dirty rooms remain in the result so the front desk can
-  // re-let them after acknowledging a quick clean-up (the UI surfaces
-  // a "Mark clean & select" affordance per dirty card).
+  // Hard-block only rooms that physically cannot be sold:
+  //   - occupied    → a guest is in there NOW
+  //   - maintenance → out of inventory
+  // Reserved rooms ARE included so same-day re-let works: the daterange
+  // overlap check above already filters out any room whose existing
+  // reservation conflicts with the probe window. A walk-in for tonight
+  // [1 Jun, 2 Jun) does NOT overlap a reservation for [2 Jun, 3 Jun)
+  // so the room is technically free tonight.
+  // Dirty rooms also stay in the result; the UI surfaces a "Mark clean
+  // & select" affordance per dirty card.
   const all = await db
     .select()
     .from(rooms)
-    .where(sql`${rooms.status} NOT IN ('maintenance', 'occupied', 'reserved')`)
+    .where(sql`${rooms.status} NOT IN ('maintenance', 'occupied')`)
     // Order by floor then room number so the picker reads as a
     // natural floor-by-floor list (101, 102, 201, 202, 301, ...).
     // room_number is text — cast to int when it's purely numeric so
@@ -68,7 +74,56 @@ export async function findAvailableRooms(checkIn: string, checkOut: string) {
     );
   const conflictRows = await conflicts;
   const blocked = new Set(conflictRows.map((r) => r.roomId));
-  return all.filter((r) => !blocked.has(r.id));
+  const candidates = all.filter((r) => !blocked.has(r.id));
+
+  // For each candidate that has a FUTURE reservation starting on or
+  // after the probe window's end, fetch the soonest one so the UI can
+  // warn "Room reserved for [guest] arriving [date]". The walk-in
+  // booking must vacate before that arrival.
+  const candidateIds = candidates.map((c) => c.id);
+  if (candidateIds.length === 0) return candidates;
+  const nextRes = await db
+    .select({
+      roomId: reservationRooms.roomId,
+      reservationId: reservations.id,
+      reservationNumber: reservations.reservationNumber,
+      checkInDate: reservations.checkInDate,
+      guestName: guests.fullName,
+    })
+    .from(reservationRooms)
+    .innerJoin(reservations, eq(reservations.id, reservationRooms.reservationId))
+    .innerJoin(guests, eq(guests.id, reservations.guestId))
+    .where(
+      and(
+        inArray(reservationRooms.roomId, candidateIds),
+        inArray(reservations.status, BLOCKING_STATUSES),
+        gte(reservations.checkInDate, checkOut),
+      ),
+    )
+    .orderBy(asc(reservations.checkInDate));
+  // Keep only the SOONEST next reservation per room.
+  const nextByRoom = new Map<
+    string,
+    {
+      reservationId: string;
+      reservationNumber: string;
+      checkInDate: string;
+      guestName: string;
+    }
+  >();
+  for (const r of nextRes) {
+    if (nextByRoom.has(r.roomId)) continue;
+    nextByRoom.set(r.roomId, {
+      reservationId: r.reservationId,
+      reservationNumber: r.reservationNumber,
+      checkInDate: r.checkInDate,
+      guestName: r.guestName,
+    });
+  }
+  return candidates.map((c) => ({
+    ...c,
+    nextReservation: nextByRoom.get(c.id) ?? null,
+  }));
 }
 
 export async function isRoomAvailable(

@@ -78,6 +78,9 @@ export const reservations = pgTable(
     checkedOutAt: timestamp("checked_out_at", { withTimezone: true }),
     checkedInBy: uuid("checked_in_by").references(() => profiles.id),
     checkedOutBy: uuid("checked_out_by").references(() => profiles.id),
+    // Migration 0021 — set once we fire the pre-arrival WhatsApp/SMS
+    // reminder. Used to dedupe so the dashboard tick doesn't resend.
+    arrivalReminderSentAt: timestamp("arrival_reminder_sent_at", { withTimezone: true }),
     createdBy: uuid("created_by")
       .notNull()
       .references(() => profiles.id),

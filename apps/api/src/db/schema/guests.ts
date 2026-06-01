@@ -82,6 +82,31 @@ export const guests = pgTable(
 export type Guest = typeof guests.$inferSelect;
 export type NewGuest = typeof guests.$inferInsert;
 
+// Phone history — see migration 0022. Lets /guests/:phone URLs keep
+// resolving after a guest updates their phone number. Exactly one row
+// per guest has valid_to IS NULL (their current phone).
+export const guestPhoneHistory = pgTable(
+  "guest_phone_history",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    guestId: uuid("guest_id")
+      .notNull()
+      .references(() => guests.id, { onDelete: "cascade" }),
+    phone: text("phone").notNull(),
+    validFrom: timestamp("valid_from", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    validTo: timestamp("valid_to", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => ({
+    phoneIdx: index("idx_phone_history_phone").on(t.phone),
+    guestIdx: index("idx_phone_history_guest").on(t.guestId, t.validFrom),
+  }),
+);
+
 export const guestNotes = pgTable(
   "guest_notes",
   {

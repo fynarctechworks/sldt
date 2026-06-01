@@ -2,6 +2,7 @@ import {
   addRoomSchema,
   additionalChargeSchema,
   cancelSchema,
+  noShowSchema,
   makeComplimentarySchema,
   checkInSchema,
   checkOutSchema,
@@ -18,7 +19,7 @@ import {
 } from "@hoteldesk/shared";
 import { randomUUID } from "node:crypto";
 import { differenceInCalendarDays, format } from "date-fns";
-import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lte, ne, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 import { db } from "../db/client.js";
@@ -54,6 +55,7 @@ import { invalidateDashboard } from "../lib/redis.js";
 import { fail, list, ok } from "../lib/response.js";
 import { getSettings } from "../lib/settings.js";
 import { requireAuth, requirePermission } from "../middleware/auth.js";
+import { resolveReservationId } from "../middleware/resolveReservation.js";
 import { idempotent } from "../middleware/idempotency.js";
 import { validate } from "../middleware/validate.js";
 import { guests } from "../db/schema/guests.js";
@@ -61,6 +63,12 @@ import { otps } from "../db/schema/otps.js";
 import { guestLedger } from "../db/schema/guestLedger.js";
 
 const router = Router();
+
+// Resolve `:id` to a UUID before every handler — lets clients use
+// either the UUID or the human-readable SLDT-RES-NNNN format
+// interchangeably. Handlers downstream keep using req.params.id and
+// always see a UUID. Cached in-memory; cheap.
+router.param("id", resolveReservationId as never);
 
 // Loads slug → label for every room type (active + archived). Used by the
 // invoice/receipt rendering paths so the displayed room-type names match
@@ -246,6 +254,40 @@ router.get("/:id", requireAuth, requirePermission("view_reservations"), async (r
         .from(guests)
         .where(inArray(guests.id, occupantIds))
     : [];
+
+  // Same-day re-let watch: for a FUTURE confirmed booking, list any
+  // currently-checked-in walk-in occupying any of this reservation's
+  // rooms and due to vacate by THIS reservation's check-in date. The
+  // UI surfaces these as "Re-let pending" badges so the desk knows
+  // the room is in use right now and the walk-in needs to be checked
+  // out before this guest arrives.
+  const myRoomIds = resRooms.map((x) => x.room.id);
+  const reletWatch =
+    r[0]!.status === "confirmed" && myRoomIds.length > 0
+      ? await db
+          .select({
+            roomId: reservationRooms.roomId,
+            reservationId: reservations.id,
+            reservationNumber: reservations.reservationNumber,
+            guestName: guests.fullName,
+            checkOutDate: reservations.checkOutDate,
+          })
+          .from(reservationRooms)
+          .innerJoin(reservations, eq(reservations.id, reservationRooms.reservationId))
+          .innerJoin(guests, eq(guests.id, reservations.guestId))
+          .where(
+            and(
+              inArray(reservationRooms.roomId, myRoomIds),
+              eq(reservations.status, "checked_in"),
+              lte(reservations.checkOutDate, r[0]!.checkInDate),
+              ne(reservations.id, id),
+            ),
+          )
+      : [];
+  const reletByRoom = new Map<string, (typeof reletWatch)[number]>();
+  for (const w of reletWatch) {
+    if (!reletByRoom.has(w.roomId)) reletByRoom.set(w.roomId, w);
+  }
   const occupantById = new Map(occupants.map((g) => [g.id, g]));
 
   // Migration 0020 — co-guests linked to this reservation. Join with
@@ -309,6 +351,10 @@ router.get("/:id", requireAuth, requirePermission("view_reservations"), async (r
           // "Ac Single Bed Rooms" or "Ac Single Bed Rooms booked as Non Ac
           // Bed Rooms" — see lib/roomTypeLabel.ts.
           displayType: combinedRoomTypeLabel(x.room.roomType, x.rr.soldAsType, m),
+          // Same-day re-let watch. When this future reservation's room
+          // is currently held by a checked-in walk-in due to vacate
+          // before our check-in date, surface a small banner.
+          reletPending: reletByRoom.get(x.room.id) ?? null,
         };
       });
     })(),
@@ -1296,6 +1342,74 @@ router.post(
   },
 );
 
+// Close-only checkout — used when every room on the reservation already
+// has its own invoice (someone per-room checked them out earlier in the
+// stay). There's no new invoice to issue and no payment to take; the
+// stay just needs to be wrapped up so the rooms move to dirty and the
+// reservation flips to checked_out.
+async function closeOnlyCheckout(args: {
+  req: import("express").Request;
+  res: import("express").Response;
+  reservation: typeof reservations.$inferSelect;
+  resRooms: Array<{
+    rr: typeof reservationRooms.$inferSelect;
+    room: typeof rooms.$inferSelect;
+  }>;
+}) {
+  const { req, res, reservation: r, resRooms } = args;
+  const id = r.id;
+  const now = new Date();
+
+  await db.transaction(async (tx) => {
+    await tx
+      .update(reservations)
+      .set({
+        status: "checked_out",
+        checkedOutAt: now,
+        checkedOutBy: req.user!.id,
+        updatedAt: now,
+      })
+      .where(eq(reservations.id, id));
+
+    // Flip every still-checked-in per-room row to checked_out.
+    await tx
+      .update(reservationRooms)
+      .set({
+        status: "checked_out",
+        checkedOutAt: now,
+        checkedOutBy: req.user!.id,
+      })
+      .where(
+        and(
+          eq(reservationRooms.reservationId, id),
+          inArray(reservationRooms.status, ["confirmed", "checked_in"] as const),
+        ),
+      );
+
+    // Move every room on the reservation to dirty so housekeeping can
+    // pick them up. Rooms that were already dirty from per-room checkout
+    // stay dirty (no harm in idempotent updates).
+    const allRoomIds = resRooms.map((x) => x.room.id);
+    if (allRoomIds.length > 0) {
+      await tx
+        .update(rooms)
+        .set({ status: "dirty", updatedAt: now })
+        .where(inArray(rooms.id, allRoomIds));
+    }
+  });
+
+  await logActivity({
+    action: "reservation_closed",
+    entityType: "reservation",
+    entityId: id,
+    description: `${r.reservationNumber}: stay closed (all rooms previously invoiced)`,
+    performedBy: req.user!.id,
+    ipAddress: req.ip,
+  });
+  await invalidateDashboard();
+  return ok(res, { success: true, closedOnly: true });
+}
+
 // Per-room checkout handler. Issues one tax invoice per still-un-invoiced
 // room, splits the staff-entered finalPayment proportionally across those
 // invoices, and runs the same status flips + housekeeping task creation as
@@ -1325,12 +1439,12 @@ async function handlePerRoomCheckout(args: {
   // as they are — their invoice + payment are untouched.
   const targetRooms = resRooms.filter((x) => !x.rr.invoiceId);
   if (targetRooms.length === 0) {
-    return fail(
-      res,
-      409,
-      "ALREADY_INVOICED",
-      "Every room already has its own invoice — nothing left to bill",
-    );
+    // Close-only path: every room was already invoiced via the per-room
+    // flow during the stay. No new invoice to issue and no money to
+    // collect (those invoices were settled individually). Just flip the
+    // reservation to checked_out, mark all rooms dirty, and let the
+    // caller move on.
+    return await closeOnlyCheckout({ req, res, reservation: r, resRooms });
   }
 
   // Pre-build each invoice (math only, no DB writes yet) so we know the
@@ -1753,12 +1867,15 @@ router.post(
     // the combined invoice — they were never billed elsewhere.
     const billableRooms = resRooms.filter((x) => !x.rr.invoiceId);
     if (billableRooms.length === 0) {
-      return fail(
+      // See handlePerRoomCheckout: when every room is already invoiced
+      // there's nothing left to bill OR combine. Close the stay so
+      // staff can wrap up.
+      return await closeOnlyCheckout({
+        req,
         res,
-        409,
-        "ALREADY_INVOICED",
-        "Every room already has its own invoice — nothing left to combine",
-      );
+        reservation: r[0]!,
+        resRooms,
+      });
     }
     const billableRoomIds = new Set(billableRooms.map((x) => x.room.id));
     const billableCharges = charges.filter(
@@ -2384,6 +2501,92 @@ router.post(
       walletCreditRestored,
       roomStatus: targetRoomStatus,
     });
+  },
+);
+
+// Mark a confirmed reservation as no-show. Standard hotel policy:
+// the advance (if any) is FORFEIT — it stays on the books as revenue
+// and is not refunded. Rooms are released immediately (the guest
+// never arrived → no cleaning needed). Only valid on 'confirmed'
+// status; a checked_in guest by definition arrived, so they can't be
+// a no-show. Use Cancel for those.
+router.post(
+  "/:id/no-show",
+  requireAuth,
+  requirePermission("view_reservations"),
+  validate(noShowSchema),
+  async (req, res) => {
+    const id = req.params.id!;
+    const { note } = req.body as { note: string };
+    const r = await db.select().from(reservations).where(eq(reservations.id, id)).limit(1);
+    if (!r.length) return fail(res, 404, "NOT_FOUND", "Reservation not found");
+    if (r[0]!.status !== "confirmed") {
+      return fail(
+        res,
+        409,
+        "INVALID_STATUS",
+        `Only confirmed reservations can be marked no-show (current: ${r[0]!.status})`,
+      );
+    }
+
+    const roomIds = (
+      await db
+        .select({ roomId: reservationRooms.roomId })
+        .from(reservationRooms)
+        .where(eq(reservationRooms.reservationId, id))
+    ).map((x) => x.roomId);
+
+    const forfeitedAdvance = Number(r[0]!.advancePaid ?? 0);
+
+    await db.transaction(async (tx) => {
+      // Reservation: flip to no_show. The advance stays on the books
+      // (forfeit revenue). The balance is set to 0 — there's nothing
+      // more to collect because the stay isn't happening.
+      // cancellationReason field doubles as the no-show note so the
+      // existing reports + audit surfaces pick it up without a schema
+      // change.
+      await tx
+        .update(reservations)
+        .set({
+          status: "no_show",
+          cancellationReason: note,
+          balanceDue: "0",
+          updatedAt: new Date(),
+        })
+        .where(eq(reservations.id, id));
+
+      // Free the rooms. Guest never arrived → status goes straight to
+      // 'available' (no dirty/cleaning step).
+      if (roomIds.length) {
+        await tx
+          .update(rooms)
+          .set({ status: "available", updatedAt: new Date() })
+          .where(inArray(rooms.id, roomIds));
+      }
+
+      // Mirror onto per-room rows so per-room queries see no_show.
+      // We reuse 'cancelled' on the row enum because reservation_rooms
+      // doesn't have a no_show state — the parent's status is the
+      // canonical truth.
+      await tx
+        .update(reservationRooms)
+        .set({ status: "cancelled" })
+        .where(eq(reservationRooms.reservationId, id));
+    });
+
+    await logActivity({
+      action: "reservation_no_show",
+      entityType: "reservation",
+      entityId: id,
+      description: `${r[0]!.reservationNumber} marked no-show: ${note}${
+        forfeitedAdvance > 0 ? ` · ₹${forfeitedAdvance.toFixed(2)} advance forfeited` : ""
+      }`,
+      performedBy: req.user!.id,
+      ipAddress: req.ip,
+      metadata: { forfeitedAdvance, note },
+    });
+    await invalidateDashboard();
+    return ok(res, { success: true, forfeitedAdvance });
   },
 );
 

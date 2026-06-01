@@ -156,7 +156,7 @@ export default function Credits() {
                 <tr
                   key={g.guestId}
                   className="cursor-pointer"
-                  onClick={() => navigate(`/guests/${g.guestId}`)}
+                  onClick={() => navigate(`/guests/${g.phone}`)}
                 >
                   <td>
                     <div className="font-semibold text-brand-dark">{g.fullName}</div>
@@ -183,7 +183,7 @@ export default function Credits() {
                     <div className="inline-flex gap-1">
                       <button
                         className="btn-secondary !h-7 !px-2 text-xs"
-                        onClick={() => navigate(`/guests/${g.guestId}`)}
+                        onClick={() => navigate(`/guests/${g.phone}`)}
                       >
                         Open
                       </button>

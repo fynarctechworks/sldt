@@ -135,6 +135,14 @@ export const checkOutSchema = z.object({
   invoiceMode: z.enum(["per_room", "combined"]).optional().default("per_room"),
 });
 
+// Mark a confirmed reservation as no-show. Standard hotel policy: the
+// advance (if any) is forfeit — it stays on the books as revenue and
+// is not refunded. Note is required so the audit log explains the
+// decision (e.g. "no contact after 9pm deadline").
+export const noShowSchema = z.object({
+  note: z.string().min(1).max(500),
+});
+
 export const cancelSchema = z.object({
   cancellationReason: z.string().min(1).max(500),
 });

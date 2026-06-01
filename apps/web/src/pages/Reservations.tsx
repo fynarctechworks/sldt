@@ -290,7 +290,7 @@ export default function Reservations() {
                 r={r}
                 hotelCheckInTime={hotelCheckInTime}
                 hotelCheckOutTime={hotelCheckOutTime}
-                onOpen={() => navigate(`/reservations/${r.id}`)}
+                onOpen={() => navigate(`/reservations/${r.reservationNumber}`)}
               />
             ))}
           </ul>

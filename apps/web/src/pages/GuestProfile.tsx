@@ -109,6 +109,20 @@ export default function GuestProfile() {
     enabled: !!id,
   });
 
+  // Old-phone redirect. The API resolver accepts both UUIDs and any
+  // phone the guest has historically had (via guest_phone_history).
+  // When the URL phone differs from the guest's CURRENT phone, swap
+  // the URL in place so shared links update to the canonical handle
+  // without ever 404'ing. UUIDs in the URL are also rewritten to the
+  // phone form for consistency with the rest of the app.
+  useEffect(() => {
+    if (!data || !id) return;
+    const want = data.phone;
+    if (want && want !== id) {
+      navigate(`/guests/${want}${window.location.search}`, { replace: true });
+    }
+  }, [data, id, navigate]);
+
   const outstandingQ = useQuery({
     queryKey: ["outstanding"],
     queryFn: () =>
@@ -541,14 +555,14 @@ function BalanceBreakdown({ guestId }: { guestId: string }) {
       label: i.invoiceNumber,
       sub: `Issued ${format(new Date(i.issuedAt), "dd MMM yyyy")} · ${i.reservationNumber}`,
       amount: i.balanceDue,
-      href: `/reservations/${i.reservationId}`,
+      href: `/reservations/${i.reservationNumber}`,
     })),
     ...data.preInvoiceReservations.map((r) => ({
       key: `pre-${r.reservationId}`,
       label: r.reservationNumber,
       sub: `Advance pending · stay still open since ${format(new Date(r.createdAt), "dd MMM yyyy")}`,
       amount: r.balanceDue,
-      href: `/reservations/${r.reservationId}`,
+      href: `/reservations/${r.reservationNumber}`,
     })),
   ].sort((a, b) => b.amount - a.amount);
 
@@ -1290,7 +1304,11 @@ function StaysTab({ guestId }: { guestId: string }) {
   return (
     <div className="space-y-3">
       {data.map((r) => (
-        <StayCard key={r.id} r={r} onOpen={() => navigate(`/reservations/${r.id}`)} />
+        <StayCard
+          key={r.id}
+          r={r}
+          onOpen={() => navigate(`/reservations/${r.reservationNumber}`)}
+        />
       ))}
     </div>
   );

@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import {
   boolean,
+  integer,
   jsonb,
   numeric,
   pgTable,
@@ -77,6 +78,12 @@ export const settings = pgTable("settings", {
   docShowGstin: boolean("doc_show_gstin").notNull().default(true),
   docShowTerms: boolean("doc_show_terms").notNull().default(false),
   docShowSignature: boolean("doc_show_signature").notNull().default(true),
+
+  // Migration 0021 — arrival reminder / no-show watch settings.
+  arrivalReminderHoursBefore: integer("arrival_reminder_hours_before")
+    .notNull()
+    .default(24),
+  noShowCutoffHours: integer("no_show_cutoff_hours").notNull().default(6),
 
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

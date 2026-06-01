@@ -16,9 +16,15 @@ import { resolveCurrentPropertyId } from "../lib/currentProperty.js";
 import { invalidateDashboard } from "../lib/redis.js";
 import { fail, ok } from "../lib/response.js";
 import { requireAuth, requirePermission } from "../middleware/auth.js";
+import { resolveRoomId } from "../middleware/resolveRoom.js";
 import { validate } from "../middleware/validate.js";
 
 const router = Router();
+
+// Resolve :id to a UUID before every handler — accepts either the
+// UUID or the room_number (e.g. "201") so navigation can build
+// staff-friendly URLs like /rooms/201.
+router.param("id", resolveRoomId as never);
 
 router.get(
   "/availability",

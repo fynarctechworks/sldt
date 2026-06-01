@@ -150,7 +150,7 @@ export function TapeChart({ data }: { data: TapeChartData }) {
             >
               {/* Sticky room label */}
               <button
-                onClick={() => navigate(`/rooms/${room.id}`)}
+                onClick={() => navigate(`/rooms/${room.roomNumber}`)}
                 className="sticky left-0 z-10 bg-surface border-r border-borderc px-3 text-left flex flex-col justify-center hover:bg-bg"
                 style={{ height: ROW_H }}
                 title={`${room.roomType} · floor ${room.floor}`}
@@ -209,7 +209,7 @@ export function TapeChart({ data }: { data: TapeChartData }) {
                 return (
                   <button
                     key={seg.reservationId + seg.roomId}
-                    onClick={() => navigate(`/reservations/${seg.reservationId}`)}
+                    onClick={() => navigate(`/reservations/${seg.reservationNumber}`)}
                     className={`absolute rounded border text-left px-2 truncate text-[11px] font-medium leading-none flex items-center gap-1 shadow-sm hover:scale-[1.02] hover:shadow-md transition-transform ${STATUS_BAR[seg.status]} ${
                       isDayUse ? "bg-[repeating-linear-gradient(45deg,_transparent_0_3px,_rgba(0,0,0,0.06)_3px_6px)]" : ""
                     } ${clippedLeft ? "rounded-l-none" : ""} ${clippedRight ? "rounded-r-none" : ""}`}

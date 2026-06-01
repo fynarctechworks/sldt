@@ -34,7 +34,15 @@ export const guestCreateSchema = z.object({
 
 // Update is fully optional (PATCH semantics), including gender so we
 // don't force fills on legacy rows.
-export const guestUpdateSchema = guestCreateSchema.partial();
+//
+// `nationality` is overridden to drop the .default("Indian") that
+// otherwise leaks in via .partial(). Without this, a PUT that only
+// changes the phone would silently overwrite the existing nationality
+// with "Indian" — fine for new guests, wrong for guests already
+// stored as something else.
+export const guestUpdateSchema = guestCreateSchema.partial().extend({
+  nationality: z.string().max(60).optional(),
+});
 
 export const guestListQuerySchema = z.object({
   search: z.string().optional(),

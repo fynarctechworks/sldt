@@ -23,6 +23,10 @@ export default {
         success: "#3F7D4F",
         warning: "#C77A2C",
         danger: "#A33A30",
+        // Informational blue — used for the upcoming-arrivals banner.
+        // Same visual weight as `danger` but reads "heads up, not
+        // emergency".
+        info: "#1F4E8A",
         bg: "#FAF7F0",
         surface: "#FFFFFF",
         textPrimary: "#1C2620",

@@ -2,13 +2,12 @@ import { useQuery } from "@tanstack/react-query";
 import {
   ArrowRight,
   BedDouble,
+  CalendarClock,
   CalendarPlus,
   CheckCircle2,
-  LineChart,
   LogIn,
   LogOut,
   Receipt,
-  TrendingUp,
   UserPlus,
   Wallet,
 } from "lucide-react";
@@ -47,17 +46,35 @@ interface DashboardData {
   revenue_today?: { total_collected: number };
   revenue_kpis?: {
     mtd_collected: number;
-    mtd_room_revenue: number;
-    mtd_room_nights: number;
-    adr: number;
-    revpar: number;
+    outstanding_balance: number;
+  };
+  // Operations counters — visible to everyone (no money). Drives the
+  // "morning work" cards on the dashboard.
+  operations_kpis?: {
+    pending_checkouts_today: number;
+    rooms_out_of_service: number;
   };
   // Forecast is always present (occupancy-only, no money).
   forecast: {
     total_rooms: number;
     days: { day: string; occupied: number; arrivals: number }[];
   };
-  room_grid: { id: string; room_number: string; room_type: string; status: string; guest_name: string | null; reservation_id: string | null }[];
+  room_grid: {
+    id: string;
+    room_number: string;
+    room_type: string;
+    status: string;
+    guest_name: string | null;
+    reservation_id: string | null;
+    reservation_number: string | null;
+    // Upcoming hold window when the room is sellable tonight but
+    // booked for a future stay. Both ends are yyyy-MM-dd.
+    held_from: string | null;
+    held_to: string | null;
+    // Same-day re-let: room currently held by a walk-in but a
+    // confirmed booking is arriving within 24h.
+    relet_pending: { nextGuestName: string; nextCheckIn: string } | null;
+  }[];
 }
 
 export default function Dashboard() {
@@ -100,8 +117,8 @@ export default function Dashboard() {
         <StatCard
           icon={<BedDouble className="w-5 h-5" />}
           label="Occupancy"
-          value={`${data.occupancy.percentage}%`}
-          sub={`${data.occupancy.occupied} / ${data.occupancy.total} rooms`}
+          value={`${data.occupancy.occupied} / ${data.occupancy.total} rooms`}
+          sub={`${data.occupancy.percentage}% occupied`}
         />
         <StatCard
           icon={<LogIn className="w-5 h-5" />}
@@ -129,94 +146,50 @@ export default function Dashboard() {
         </Can>
       </div>
 
-      {/* Commercial KPIs. Three rupee numbers in a row only make sense
-          for users authorised to see money — gated behind view_revenue.
-          ADR and RevPAR are the standard hotel-industry benchmarks; we
-          surface both so operators can compare against industry data
-          (HVS / STR / Hotelivate quarterly reports). */}
-      {data.revenue_kpis && (
-        <Can do="view_revenue">
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+      {/* Operating + financial KPIs. Mixed row:
+          - Revenue MTD + Outstanding Balance gated behind view_revenue
+            so only users with permission see money figures.
+          - Pending Check-outs + Rooms Out of Service are operational
+            counters (no rupee values) and visible to everyone — they're
+            the morning work queue for housekeeping and the front desk. */}
+      {(data.revenue_kpis || data.operations_kpis) && (
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          {data.revenue_kpis && (
+            <Can do="view_revenue">
+              <StatCard
+                icon={<Receipt className="w-5 h-5" />}
+                label="Revenue MTD"
+                value={inr(data.revenue_kpis.mtd_collected)}
+                sub="collected this month"
+              />
+            </Can>
+          )}
+          {data.revenue_kpis && (
+            <Can do="view_revenue">
+              <StatCard
+                icon={<Wallet className="w-5 h-5" />}
+                label="Outstanding Balance"
+                value={inr(data.revenue_kpis.outstanding_balance)}
+                sub="unpaid across all bookings"
+              />
+            </Can>
+          )}
+          {data.operations_kpis && (
             <StatCard
-              icon={<Receipt className="w-5 h-5" />}
-              label="Revenue MTD"
-              value={inr(data.revenue_kpis.mtd_collected)}
-              sub="collected this month"
+              icon={<LogOut className="w-5 h-5" />}
+              label="Pending Check-outs"
+              value={String(data.operations_kpis.pending_checkouts_today)}
+              sub="due today, not yet processed"
             />
+          )}
+          {data.operations_kpis && (
             <StatCard
-              icon={<LineChart className="w-5 h-5" />}
-              label="ADR"
-              value={inr(data.revenue_kpis.adr)}
-              sub={`${data.revenue_kpis.mtd_room_nights} room-night${data.revenue_kpis.mtd_room_nights === 1 ? "" : "s"}`}
+              icon={<BedDouble className="w-5 h-5" />}
+              label="Rooms Out of Service"
+              value={String(data.operations_kpis.rooms_out_of_service)}
+              sub="maintenance + dirty"
             />
-            <StatCard
-              icon={<TrendingUp className="w-5 h-5" />}
-              label="RevPAR"
-              value={inr(data.revenue_kpis.revpar)}
-              sub="revenue per available room"
-            />
-            <StatCard
-              icon={<Wallet className="w-5 h-5" />}
-              label="Room Revenue MTD"
-              value={inr(data.revenue_kpis.mtd_room_revenue)}
-              sub="rooms only, ex-extras"
-            />
-          </div>
-        </Can>
-      )}
-
-      {/* 7-day forecast strip. Bars sized to occupancy percentage; the
-          top of each cell shows the predicted-occupied count out of
-          total rooms. Arrivals are inset as a small badge so the desk
-          can see "we have 11 in-house tomorrow, of whom 4 are new
-          arrivals". Visible to everyone — no money on this widget. */}
-      {data.forecast.days.length > 0 && (
-        <div className="card">
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="font-semibold text-brand-dark">Next 7 Days · Forecast</h2>
-            <span className="text-xs text-textSecondary">
-              {data.forecast.total_rooms} room{data.forecast.total_rooms === 1 ? "" : "s"} total
-            </span>
-          </div>
-          <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-7 gap-2">
-            {data.forecast.days.map((d, i) => {
-              const pct =
-                data.forecast.total_rooms > 0
-                  ? Math.round((d.occupied / data.forecast.total_rooms) * 100)
-                  : 0;
-              const dt = new Date(d.day + "T00:00:00");
-              return (
-                <div
-                  key={d.day}
-                  className="border border-borderc rounded-md p-2 bg-surface flex flex-col gap-1"
-                  title={`${d.occupied} occupied · ${d.arrivals} arriving · ${pct}%`}
-                >
-                  <div className="text-[10px] uppercase tracking-wider text-textSecondary leading-none">
-                    {i === 0
-                      ? "Today"
-                      : dt.toLocaleDateString("en-IN", { weekday: "short" })}
-                  </div>
-                  <div className="text-xs font-mono text-brand-dark leading-none">
-                    {dt.toLocaleDateString("en-IN", { day: "2-digit", month: "short" })}
-                  </div>
-                  <div className="mt-1 h-1.5 rounded-full bg-borderc/40 overflow-hidden">
-                    <div
-                      className={`h-full ${pct >= 80 ? "bg-danger" : pct >= 50 ? "bg-brass" : "bg-brand-dark"}`}
-                      style={{ width: `${pct}%` }}
-                    />
-                  </div>
-                  <div className="flex items-baseline justify-between">
-                    <span className="text-sm font-semibold text-brand-dark">{pct}%</span>
-                    {d.arrivals > 0 && (
-                      <span className="text-[10px] text-brass bg-brass/15 px-1.5 py-0.5 rounded-sm font-semibold">
-                        +{d.arrivals}
-                      </span>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
+          )}
         </div>
       )}
 
@@ -224,8 +197,13 @@ export default function Dashboard() {
         <h2 className="font-semibold text-brand-dark mb-4">Availability by Room Type</h2>
         <div className="grid grid-cols-1 gap-4">
           {groupByType(data.room_grid).map((g) => {
-            const pct = g.total > 0 ? Math.round((g.available / g.total) * 100) : 0;
+            // "Sellable tonight" = truly available + held-tonight-but-
+            // -reserved-for-future. Drives the big headline number so
+            // staff sees what they can actually book.
+            const sellable = g.available + g.held;
+            const pct = g.total > 0 ? Math.round((sellable / g.total) * 100) : 0;
             const availPct = g.total > 0 ? (g.available / g.total) * 100 : 0;
+            const heldPct = g.total > 0 ? (g.held / g.total) * 100 : 0;
             const occPct = g.total > 0 ? (g.occupied / g.total) * 100 : 0;
             const resPct = g.total > 0 ? (g.reserved / g.total) * 100 : 0;
             const dirtyPct = g.total > 0 ? (g.dirty / g.total) * 100 : 0;
@@ -239,6 +217,7 @@ export default function Dashboard() {
               { label: "Occupied", count: g.occupied, bgTint: "bg-[#0F3D2E]/10", dot: "bg-[#0F3D2E]" },
               { label: "Reserved", count: g.reserved, bgTint: "bg-[#B08A4A]/15", dot: "bg-[#B08A4A]" },
             ];
+            if (g.held > 0) chips.push({ label: "Held", count: g.held, bgTint: "bg-warning/15", dot: "bg-warning" });
             if (g.dirty > 0) chips.push({ label: "Dirty", count: g.dirty, bgTint: "bg-[#D9A441]/15", dot: "bg-[#D9A441]" });
             if (g.clean > 0) chips.push({ label: "Clean", count: g.clean, bgTint: "bg-[#5B8BAF]/10", dot: "bg-[#5B8BAF]" });
             if (g.inspected > 0) chips.push({ label: "Inspected", count: g.inspected, bgTint: "bg-[#3F7D4F]/15", dot: "bg-[#3F7D4F]" });
@@ -252,12 +231,20 @@ export default function Dashboard() {
                 </div>
 
                 <div className="flex items-baseline gap-2">
-                  <div className="text-3xl font-bold text-brand">{g.available}</div>
-                  <div className="text-xs text-textSecondary">available · {pct}%</div>
+                  <div className="text-3xl font-bold text-brand">{sellable}</div>
+                  <div className="text-xs text-textSecondary">
+                    sellable tonight · {pct}%
+                    {g.held > 0 && (
+                      <span className="ml-1 text-warning font-semibold">
+                        ({g.held} held)
+                      </span>
+                    )}
+                  </div>
                 </div>
 
                 <div className="flex h-3 mt-3 rounded-full overflow-hidden bg-borderc/40 ring-1 ring-borderc">
                   {availPct > 0 && <div className="bg-[#E6B800]" style={{ width: `${availPct}%` }} title={`Available ${g.available}`} />}
+                  {heldPct > 0 && <div className="bg-warning" style={{ width: `${heldPct}%` }} title={`Held tonight ${g.held}`} />}
                   {occPct > 0 && <div className="bg-[#0F3D2E]" style={{ width: `${occPct}%` }} title={`Occupied ${g.occupied}`} />}
                   {resPct > 0 && <div className="bg-[#B08A4A]" style={{ width: `${resPct}%` }} title={`Reserved ${g.reserved}`} />}
                   {dirtyPct > 0 && <div className="bg-[#D9A441]" style={{ width: `${dirtyPct}%` }} title={`Dirty ${g.dirty}`} />}
@@ -278,69 +265,24 @@ export default function Dashboard() {
                   ))}
                 </div>
 
-                <div className="flex flex-wrap gap-2 mt-4">
-                  {g.rooms.map((r) => {
-                    const isHousekeeping =
-                      r.status === "dirty" ||
-                      r.status === "clean" ||
-                      r.status === "inspected" ||
-                      r.status === "maintenance";
-
-                    const tile = (
-                      <span
-                        className={`min-w-[84px] sm:min-w-[112px] px-3 sm:px-4 py-2 sm:py-3 rounded-lg font-mono shadow-sm border-2 hover:scale-105 hover:shadow-md transition-all flex flex-col items-center leading-tight cursor-pointer ${gridColor(r.status)}`}
-                      >
-                        <span className="text-2xl font-bold tracking-wide">{r.room_number}</span>
-                        <span className="text-[11px] uppercase tracking-[0.1em] font-semibold opacity-90 mt-1">
-                          {r.status.replace(/_/g, " ")}
-                        </span>
-                      </span>
-                    );
-
-                    if (isHousekeeping) {
-                      return (
-                        <RoomActionPopover
-                          key={r.id}
-                          roomId={r.id}
-                          roomNumber={r.room_number}
-                          status={r.status as "dirty" | "clean" | "inspected" | "maintenance"}
-                          trigger={tile}
-                        />
-                      );
-                    }
-
-                    const tip =
-                      r.status === "available"
-                        ? `Walk-in check-in for room ${r.room_number}`
-                        : (r.status === "occupied" || r.status === "reserved") && r.reservation_id
-                          ? `Open reservation${r.guest_name ? " — " + r.guest_name : ""}`
-                          : `Open room ${r.room_number}`;
-
-                    return (
-                      <button
-                        key={r.id}
-                        onClick={() => {
-                          if (r.status === "available") {
-                            navigate(`/reservations/new?mode=walkin&room=${r.id}`);
-                          } else if (
-                            (r.status === "occupied" || r.status === "reserved") &&
-                            r.reservation_id
-                          ) {
-                            navigate(`/reservations/${r.reservation_id}`);
-                          } else {
-                            navigate(`/rooms/${r.id}`);
-                          }
-                        }}
-                        className={`min-w-[84px] sm:min-w-[112px] px-3 sm:px-4 py-2 sm:py-3 rounded-lg font-mono shadow-sm border-2 hover:scale-105 hover:shadow-md transition-all flex flex-col items-center leading-tight ${gridColor(r.status)}`}
-                        title={tip}
-                      >
-                        <span className="text-2xl font-bold tracking-wide">{r.room_number}</span>
-                        <span className="text-[11px] uppercase tracking-[0.1em] font-semibold opacity-90 mt-1">
-                          {r.status.replace(/_/g, " ")}
-                        </span>
-                      </button>
-                    );
-                  })}
+                <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-7 gap-2.5 mt-4">
+                  {g.rooms.map((r) => (
+                    <RoomTile
+                      key={r.id}
+                      room={r}
+                      onWalkIn={() =>
+                        navigate(`/reservations/new?mode=walkin&room=${r.id}`)
+                      }
+                      onOpenReservation={() => {
+                        // Prefer the human-readable SLDT-RES-NNNN — the
+                        // API resolves either, but a shareable URL is
+                        // the point of this work.
+                        const handle = r.reservation_number ?? r.reservation_id;
+                        if (handle) navigate(`/reservations/${handle}`);
+                      }}
+                      onOpenRoom={() => navigate(`/rooms/${r.room_number}`)}
+                    />
+                  ))}
                 </div>
               </div>
             );
@@ -513,7 +455,7 @@ function TodayRowItem({
       </div>
 
       <button
-        onClick={() => onOpen(row.id)}
+        onClick={() => onOpen(row.reservationNumber || row.id)}
         className={`inline-flex items-center gap-1.5 px-2.5 h-8 text-xs font-semibold rounded-sm border transition-colors shrink-0 ${
           actionTone === "primary"
             ? "bg-brand text-cream border-brand hover:bg-brand-dark"
@@ -550,13 +492,192 @@ function StatCard({
   );
 }
 
+// Single-source tile component. Handles every room status with a
+// consistent card frame so available/occupied/reserved/housekeeping
+// rooms all use the same visual language. Held-tonight rooms get an
+// extra footer band so the desk sees at a glance that the room is
+// free now but locked for an upcoming arrival.
+function RoomTile({
+  room,
+  onWalkIn,
+  onOpenReservation,
+  onOpenRoom,
+}: {
+  room: RoomGridRow;
+  onWalkIn: () => void;
+  onOpenReservation: () => void;
+  onOpenRoom: () => void;
+}) {
+  const isHousekeeping =
+    room.status === "dirty" ||
+    room.status === "clean" ||
+    room.status === "inspected" ||
+    room.status === "maintenance";
+
+  // Hold window: render both edges so staff sees the lock period at a
+  // glance. Same-month windows compress to "02 → 03 Jun"; cross-month
+  // windows show both labels "30 Jun → 02 Jul".
+  const fmtDay = (d: string) =>
+    new Date(d).toLocaleDateString("en-IN", {
+      day: "2-digit",
+      month: "short",
+    });
+  const fmtDayOnly = (d: string) =>
+    new Date(d).toLocaleDateString("en-IN", { day: "2-digit" });
+  const heldFromShort = room.held_from ? fmtDay(room.held_from) : null;
+  const heldRange = (() => {
+    if (!room.held_from) return null;
+    if (!room.held_to) return heldFromShort;
+    const fromMonth = new Date(room.held_from).getMonth();
+    const toMonth = new Date(room.held_to).getMonth();
+    const sameMonth = fromMonth === toMonth;
+    return sameMonth
+      ? `${fmtDayOnly(room.held_from)} → ${fmtDay(room.held_to)}`
+      : `${fmtDay(room.held_from)} → ${fmtDay(room.held_to)}`;
+  })();
+  const showHoldHint = !!room.held_from && room.status === "available";
+
+  // Visual tokens per status. Keeping this in one map (rather than the
+  // utility-class soup we had before) makes the colour story easy to
+  // see at a glance.
+  const STYLES: Record<
+    string,
+    { card: string; statusText: string; statusDot: string; label: string }
+  > = {
+    available: {
+      card: "bg-success/5 border-success/40 text-success",
+      statusText: "text-success",
+      statusDot: "bg-success",
+      label: "Available",
+    },
+    occupied: {
+      card: "bg-brand-dark text-cream border-brand-dark",
+      statusText: "text-cream/90",
+      statusDot: "bg-cream",
+      label: "Occupied",
+    },
+    reserved: {
+      card: "bg-warning/10 border-warning/50 text-warning",
+      statusText: "text-warning",
+      statusDot: "bg-warning",
+      label: "Reserved",
+    },
+    dirty: {
+      card: "bg-[#FBEFD9] border-[#B45309]/40 text-[#B45309]",
+      statusText: "text-[#B45309]",
+      statusDot: "bg-[#B45309]",
+      label: "Dirty",
+    },
+    clean: {
+      card: "bg-yellow-50 border-yellow-300 text-yellow-800",
+      statusText: "text-yellow-800",
+      statusDot: "bg-yellow-500",
+      label: "Clean",
+    },
+    inspected: {
+      card: "bg-success/5 border-success/40 text-success",
+      statusText: "text-success",
+      statusDot: "bg-success",
+      label: "Inspected",
+    },
+    maintenance: {
+      card: "bg-danger/5 border-danger/40 text-danger",
+      statusText: "text-danger",
+      statusDot: "bg-danger",
+      label: "Maintenance",
+    },
+  };
+  const style = STYLES[room.status] ?? STYLES.available!;
+
+  const tile = (
+    <div
+      className={`relative w-full rounded-lg border-2 overflow-hidden shadow-sm hover:shadow-md hover:-translate-y-0.5 transition-all cursor-pointer ${style.card}`}
+      title={
+        room.relet_pending
+          ? `Same-day re-let: walk-in checks out today, ${room.relet_pending.nextGuestName} arrives ${room.relet_pending.nextCheckIn}`
+          : showHoldHint
+            ? `Free tonight. Booked for ${room.guest_name ?? "a guest"} from ${room.held_from}${
+                room.held_to ? ` to ${room.held_to}` : ""
+              }.`
+            : room.guest_name
+              ? room.guest_name
+              : undefined
+      }
+    >
+      {room.relet_pending && (
+        <span
+          className="absolute top-1.5 right-1.5 w-2.5 h-2.5 rounded-full bg-info ring-2 ring-cream animate-pulse"
+          aria-label="Same-day re-let"
+        />
+      )}
+      <div className="px-3 py-3 flex flex-col items-center gap-1">
+        <span className="font-mono text-2xl font-bold tracking-wide">
+          {room.room_number}
+        </span>
+        <span className={`inline-flex items-center gap-1.5 text-[10px] uppercase tracking-[0.12em] font-bold ${style.statusText}`}>
+          <span className={`w-1.5 h-1.5 rounded-full ${style.statusDot}`} />
+          {style.label}
+        </span>
+        {(room.status === "occupied" || room.status === "reserved") &&
+          room.guest_name && (
+            <span className="text-[10px] mt-0.5 truncate w-full text-center opacity-80">
+              {room.guest_name.split(" ")[0]}
+            </span>
+          )}
+      </div>
+      {showHoldHint && heldRange && (
+        <div className="flex items-center justify-center gap-1 px-2 py-1 bg-warning text-cream text-[9px] uppercase tracking-wider font-bold">
+          <CalendarClock className="w-2.5 h-2.5" />
+          Held {heldRange}
+        </div>
+      )}
+    </div>
+  );
+
+  if (isHousekeeping) {
+    return (
+      <RoomActionPopover
+        roomId={room.id}
+        roomNumber={room.room_number}
+        status={room.status as "dirty" | "clean" | "inspected" | "maintenance"}
+        trigger={tile}
+      />
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        if (room.status === "available") onWalkIn();
+        else if (
+          (room.status === "occupied" || room.status === "reserved") &&
+          room.reservation_id
+        )
+          onOpenReservation();
+        else onOpenRoom();
+      }}
+      className="text-left"
+    >
+      {tile}
+    </button>
+  );
+}
+
 interface RoomGridRow {
   reservation_id: string | null;
+  reservation_number: string | null;
   id: string;
   room_number: string;
   room_type: string;
   status: string;
   guest_name: string | null;
+  // Upcoming hold window. Both ends are yyyy-MM-dd. Used to render
+  // "HELD 02 → 03 JUN" on the tile so the desk sees both edges of
+  // the lock at a glance.
+  held_from: string | null;
+  held_to: string | null;
+  relet_pending: { nextGuestName: string; nextCheckIn: string } | null;
 }
 
 function groupByType(rooms: RoomGridRow[]) {
@@ -568,6 +689,10 @@ function groupByType(rooms: RoomGridRow[]) {
       available: number;
       occupied: number;
       reserved: number;
+      // Sellable tonight but locked for an upcoming arrival. Counted
+      // separately so the strip stays accurate (a held room isn't
+      // both "fully available" and "reserved" — it's neither).
+      held: number;
       dirty: number;
       clean: number;
       inspected: number;
@@ -584,6 +709,7 @@ function groupByType(rooms: RoomGridRow[]) {
         available: 0,
         occupied: 0,
         reserved: 0,
+        held: 0,
         dirty: 0,
         clean: 0,
         inspected: 0,
@@ -594,7 +720,12 @@ function groupByType(rooms: RoomGridRow[]) {
     const g = map.get(key)!;
     g.total++;
     g.rooms.push(r);
-    if (r.status === "available") g.available++;
+    // Tile-level effective_status drives the bucket. Available rooms
+    // that have a future hold go to the dedicated 'held' bucket so
+    // the strip stays exclusive (no room counted twice). True
+    // 'reserved' (someone arriving today) keeps its own bucket.
+    if (r.status === "available" && r.held_from) g.held++;
+    else if (r.status === "available") g.available++;
     else if (r.status === "occupied") g.occupied++;
     else if (r.status === "reserved") g.reserved++;
     else if (r.status === "dirty") g.dirty++;

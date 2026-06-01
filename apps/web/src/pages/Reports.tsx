@@ -382,14 +382,22 @@ function exportCsv(filename: string, rows: Record<string, unknown>[]) {
   URL.revokeObjectURL(url);
 }
 
-function ExportBtn({ onClick, disabled }: { onClick: () => void; disabled?: boolean }) {
+function ExportBtn({
+  onClick,
+  disabled,
+  label,
+}: {
+  onClick: () => void;
+  disabled?: boolean;
+  label?: string;
+}) {
   return (
     <button
       className="inline-flex items-center gap-1.5 px-3 h-8 text-xs font-semibold rounded-sm border border-borderc bg-surface text-textSecondary hover:border-brand hover:text-brand transition-colors disabled:opacity-40 disabled:hover:border-borderc disabled:hover:text-textSecondary"
       onClick={onClick}
       disabled={disabled}
     >
-      <Download className="w-3.5 h-3.5" /> Export CSV
+      <Download className="w-3.5 h-3.5" /> {label ?? "Export CSV"}
     </button>
   );
 }
@@ -682,52 +690,90 @@ function InvoicesTab({ from, to }: { from: string; to: string }) {
       }).then((d) => ({ rows: d.data, meta: d.meta })),
   });
 
+  // Totals across the full filtered result set (not just the current
+  // page). Page-only sums lied — billed/collected/outstanding now match
+  // every invoice the filters match. Voided invoices are excluded from
+  // every money column so the identity holds:
+  //   gross = paid + walletCredit + owing
+  const summaryQ = useQuery({
+    queryKey: ["rpt-invoices-summary", from, to, status, scope, q],
+    queryFn: () =>
+      api.get<{
+        count: number;
+        countVoided: number;
+        gross: string;
+        paid: string;
+        walletCredit: string;
+        owing: string;
+      }>("/invoices/summary", {
+        date_from: from,
+        date_to: to,
+        ...(status !== "all" ? { status } : {}),
+        ...(scope !== "all" ? { scope } : {}),
+        ...(q.trim() ? { q: q.trim() } : {}),
+      }),
+  });
+
   const rows = data?.rows ?? [];
   const total = data?.meta?.total ?? 0;
   const perPage = data?.meta?.per_page ?? 50;
   const totalPages = Math.max(1, Math.ceil(total / perPage));
 
-  // Summary tiles. Cheap aggregation over the current page — for property-
-  // wide totals across all pages, point staff at the Revenue tab.
-  const sums = rows.reduce(
-    (acc, r) => {
-      acc.gross += Number(r.grandTotal);
-      acc.paid += Number(r.totalPaid);
-      acc.owing += Number(r.balanceDue);
-      return acc;
-    },
-    { gross: 0, paid: 0, owing: 0 },
-  );
+  const sums = {
+    gross: Number(summaryQ.data?.gross ?? 0),
+    paid: Number(summaryQ.data?.paid ?? 0),
+    walletCredit: Number(summaryQ.data?.walletCredit ?? 0),
+    owing: Number(summaryQ.data?.owing ?? 0),
+  };
+  // "Settled" = everything that's cleared the bill (cash payments +
+  // wallet credit redeemed). This is what staff want when they ask
+  // "how much have we collected?" and it can never exceed gross.
+  const settled = sums.paid + sums.walletCredit;
 
-  function exportCurrentPage() {
-    const data = rows.map((r) => ({
-      invoice_number: r.invoiceNumber,
-      issued_on: format(new Date(r.createdAt), "yyyy-MM-dd HH:mm"),
-      reservation: r.reservationNumber ?? "",
-      guest: r.guestName,
-      gstin: r.guestGstin ?? "",
-      scope: r.scope,
-      status: r.status,
-      grand_total: r.grandTotal,
-      total_paid: r.totalPaid,
-      balance_due: r.balanceDue,
-    }));
-    const csv = Papa.unparse(data);
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `invoices-${from}-${to}-page-${page}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
+  // Full export across the entire filtered result set (every page), with
+  // every invoice field a CA might ask for: reservation + guest + rooms
+  // + GST breakdown + per-line aggregates + payment history + audit.
+  // Hits the server-side /invoices/export so the heavy joins live in
+  // Postgres, not the browser.
+  const [exporting, setExporting] = useState(false);
+  async function exportAll() {
+    setExporting(true);
+    try {
+      const out = await api.get<{
+        rows: Record<string, unknown>[];
+        count: number;
+      }>("/invoices/export", {
+        date_from: from,
+        date_to: to,
+        ...(status !== "all" ? { status } : {}),
+        ...(scope !== "all" ? { scope } : {}),
+        ...(q.trim() ? { q: q.trim() } : {}),
+      });
+      if (out.rows.length === 0) return;
+      const csv = Papa.unparse(out.rows);
+      const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `invoices-${from}-${to}-full.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } finally {
+      setExporting(false);
+    }
   }
 
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <Kpi label="Invoices on page" value={rows.length} Icon={Receipt} />
+        <Kpi label="Invoices" value={total} Icon={Receipt} />
         <Kpi label="Gross billed" value={inr(sums.gross)} Icon={TrendingUp} />
-        <Kpi label="Collected" value={inr(sums.paid)} Icon={Wallet} tone="success" />
+        <Kpi
+          label="Settled"
+          value={inr(settled)}
+          Icon={Wallet}
+          tone="success"
+        />
         <Kpi
           label="Outstanding"
           value={inr(sums.owing)}
@@ -783,7 +829,11 @@ function InvoicesTab({ from, to }: { from: string; to: string }) {
             onChange={(e) => setQ(e.target.value)}
           />
         </div>
-        <ExportBtn onClick={exportCurrentPage} disabled={rows.length === 0} />
+        <ExportBtn
+          onClick={exportAll}
+          disabled={total === 0 || exporting}
+          label={exporting ? "Exporting…" : "Export CSV"}
+        />
       </div>
 
       {isLoading ? (
@@ -816,7 +866,11 @@ function InvoicesTab({ from, to }: { from: string; to: string }) {
                   <tr
                     key={inv.id}
                     className="cursor-pointer"
-                    onClick={() => navigate(`/reservations/${inv.reservationId}`)}
+                    onClick={() =>
+                      navigate(
+                        `/reservations/${inv.reservationNumber ?? inv.reservationId}`,
+                      )
+                    }
                   >
                     <td className="font-mono font-semibold text-brand-dark">
                       {inv.invoiceNumber}
@@ -1230,7 +1284,7 @@ function OutstandingTab() {
                   <tr
                     key={g.guestId}
                     className="cursor-pointer"
-                    onClick={() => navigate(`/guests/${g.guestId}`)}
+                    onClick={() => navigate(`/guests/${g.guestPhone}`)}
                   >
                     <td className="font-medium text-brand-dark">{g.guestName}</td>
                     <td className="font-mono text-textSecondary text-xs">{g.guestPhone}</td>
@@ -1359,7 +1413,7 @@ function OutstandingTab() {
                   <tr
                     key={r.invoiceId}
                     className="cursor-pointer"
-                    onClick={() => navigate(`/reservations/${r.reservationId}`)}
+                    onClick={() => navigate(`/reservations/${r.reservationNumber}`)}
                   >
                     <td className="font-mono text-xs">{r.invoiceNumber}</td>
                     <td className="font-mono text-textSecondary text-xs">
@@ -1503,6 +1557,7 @@ function RoomsTab({ from, to }: { from: string; to: string }) {
 }
 
 function CreditTab({ from, to }: { from: string; to: string }) {
+  const navigate = useNavigate();
   const { data } = useQuery({
     queryKey: ["rpt-credit", from, to],
     queryFn: () =>
@@ -1602,7 +1657,19 @@ function CreditTab({ from, to }: { from: string; to: string }) {
               </thead>
               <tbody>
                 {data.rows.map((r) => (
-                  <tr key={r.id}>
+                  <tr
+                    key={r.id}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => navigate(`/reservations/${r.reservationNumber}`)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        navigate(`/reservations/${r.reservationNumber}`);
+                      }
+                    }}
+                    className="cursor-pointer hover:bg-brand-soft/30 focus:outline-none focus:bg-brand-soft/30"
+                  >
                     <td className="font-mono text-accentBlue text-xs">{r.reservationNumber}</td>
                     <td>
                       <div className="font-medium text-brand-dark">{r.guestName}</div>
@@ -1699,7 +1766,7 @@ function GuestsTab({ from, to }: { from: string; to: string }) {
                   <tr
                     key={g.guestId}
                     className="cursor-pointer"
-                    onClick={() => navigate(`/guests/${g.guestId}`)}
+                    onClick={() => navigate(`/guests/${g.phone}`)}
                   >
                     <td className="font-medium text-brand-dark">{g.fullName}</td>
                     <td className="font-mono text-textSecondary text-xs">{g.phone}</td>

@@ -50,6 +50,16 @@ interface AvailableRoom {
   // so staff doesn't accidentally hand keys to a guest before the room
   // is ready.
   status?: "available" | "occupied" | "reserved" | "maintenance" | "dirty" | "clean" | "inspected";
+  // Same-day re-let: when this room has a future reservation that
+  // starts at or after the current probe's check_out, the server
+  // returns it so the UI can warn "Room reserved for [guest]
+  // arriving [date]." Walk-in must vacate before then.
+  nextReservation?: {
+    reservationId: string;
+    reservationNumber: string;
+    checkInDate: string;
+    guestName: string;
+  } | null;
 }
 
 const todayStr = format(new Date(), "yyyy-MM-dd");
@@ -146,8 +156,20 @@ export default function NewReservation() {
       // picked. Used to revert the price when staff switches "Sell as"
       // back to the native option.
       nativeBaseRate: number;
+      // Same-day re-let: the next reservation that's about to use this
+      // room, surfaced so staff confirm they'll vacate before then.
+      nextReservation?: {
+        reservationId: string;
+        reservationNumber: string;
+        checkInDate: string;
+        guestName: string;
+      } | null;
     }[]
   >([]);
+  // Sticky confirmation: when one or more selected rooms have a
+  // future reservation, staff has to tick a single "I'll vacate
+  // before [date]" box before the create button enables.
+  const [reletConfirmed, setReletConfirmed] = useState(false);
   const [kycFront, setKycFront] = useState<File | null>(null);
   const [kycBack, setKycBack] = useState<File | null>(null);
   const [kycPhoto, setKycPhoto] = useState<File | null>(null);
@@ -574,7 +596,10 @@ export default function NewReservation() {
       const guestId = pendingOtpGuestId;
       if (!guestId) throw new Error("Missing guest context");
 
-      const reservation = await api.post<{ id: string }>("/reservations", {
+      const reservation = await api.post<{
+        id: string;
+        reservationNumber: string;
+      }>("/reservations", {
         guestId,
         checkInDate,
         checkOutDate,
@@ -616,7 +641,8 @@ export default function NewReservation() {
       // so the spinner doesn't blink off mid-flight.
       setPendingOtpGuestId(null);
       invalidateReservationData(qc, { reservationId: reservation.id });
-      if (navigateOnly) navigate(`/reservations/${reservation.id}`);
+      if (navigateOnly)
+        navigate(`/reservations/${reservation.reservationNumber}`);
     },
     onError: (e: Error) => setError(describeApiError(e)),
   });
@@ -789,6 +815,7 @@ export default function NewReservation() {
           soldAsType: null,
           nativeType: room.roomType,
           nativeBaseRate: Number(room.baseRate),
+          nextReservation: room.nextReservation ?? null,
         },
       ];
     });
@@ -821,11 +848,19 @@ export default function NewReservation() {
     );
   }
 
+  // Rooms with a future reservation we'd be re-letting tonight.
+  const reletRooms = selectedRooms.filter((r) => r.nextReservation);
+  // Drop the confirmation when there's nothing to confirm anymore —
+  // prevents stale state if staff removes the only re-let room.
+  useEffect(() => {
+    if (reletRooms.length === 0 && reletConfirmed) setReletConfirmed(false);
+  }, [reletRooms.length, reletConfirmed]);
   const canSubmit =
     canPriceStay &&
     selectedRooms.length > 0 &&
     (selectedGuest || (useNewGuest && newGuest.fullName && newGuest.phone && newGuest.idProofNumber)) &&
-    !advanceTooHigh;
+    !advanceTooHigh &&
+    (reletRooms.length === 0 || reletConfirmed);
 
   return (
     <div className="space-y-4">
@@ -1467,14 +1502,14 @@ export default function NewReservation() {
               <div className="space-y-4">
                 {floors.map((floor) => (
                   <div key={floor}>
-                    <div className="text-[10px] uppercase tracking-wider text-textSecondary font-semibold mb-2">
-                      Floor {floor}{" "}
-                      <span className="text-textSecondary/70">
+                    <div className="text-base font-bold text-brand-dark tracking-wide mb-2 pb-1 border-b border-borderc/60">
+                      Floor {floor}
+                      <span className="ml-2 text-xs font-semibold text-textSecondary uppercase tracking-wider">
                         · {byFloor.get(floor)!.length} room
                         {byFloor.get(floor)!.length === 1 ? "" : "s"}
                       </span>
                     </div>
-                    <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                    <div className="grid grid-cols-2 md:grid-cols-3 gap-3 auto-rows-min items-start">
                       {byFloor.get(floor)!.map((r) => {
               const selected = selectedRooms.find((s) => s.roomId === r.id);
               const isDirty = r.status === "dirty";
@@ -1540,6 +1575,24 @@ export default function NewReservation() {
                       {selected ? inr(selected.ratePerNight) : inr(r.baseRate)}
                     </div>
                   </div>
+                  {/* Same-day re-let warning. Shown for reserved rooms
+                      whose existing booking arrives AFTER the walk-in's
+                      check-out. Staff must confirm via the checkbox
+                      below the room body before submitting. */}
+                  {r.nextReservation && (
+                    <div className="mt-2 rounded-sm border border-warning/40 bg-warning/10 p-2 text-[11px] text-warning">
+                      <div className="flex items-start gap-1.5">
+                        <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                        <div className="leading-snug">
+                          Reserved for{" "}
+                          <strong>{r.nextReservation.guestName}</strong>{" "}
+                          arriving <strong>{r.nextReservation.checkInDate}</strong> ·{" "}
+                          {r.nextReservation.reservationNumber}.
+                          Vacate before then.
+                        </div>
+                      </div>
+                    </div>
+                  )}
 
                   {isDirty && !selected && (
                     <div className="mt-2" onClick={(e) => e.stopPropagation()}>
@@ -1853,6 +1906,45 @@ export default function NewReservation() {
             </div>
           </>
         )}
+        {/* Same-day re-let acknowledgement. Required when one or more
+            picked rooms have a confirmed reservation that arrives AFTER
+            the walk-in vacates. Staff must explicitly confirm they'll
+            free the room in time. */}
+        {reletRooms.length > 0 && (
+          <div className="mt-4 rounded-sm border border-warning/50 bg-warning/10 p-3">
+            <div className="flex items-start gap-2">
+              <AlertTriangle className="w-4 h-4 text-warning shrink-0 mt-0.5" />
+              <div className="flex-1 text-xs leading-snug">
+                <div className="font-semibold text-warning mb-1.5">
+                  Same-day re-let — {reletRooms.length} room
+                  {reletRooms.length === 1 ? "" : "s"} reserved for tomorrow
+                </div>
+                <ul className="space-y-1 mb-2">
+                  {reletRooms.map((r) => (
+                    <li key={r.roomId}>
+                      Room <span className="font-mono font-bold">{r.roomNumber}</span> →{" "}
+                      {r.nextReservation?.guestName} arrives on{" "}
+                      <strong>{r.nextReservation?.checkInDate}</strong>{" "}
+                      ({r.nextReservation?.reservationNumber})
+                    </li>
+                  ))}
+                </ul>
+                <label className="flex items-start gap-2 cursor-pointer text-textPrimary">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5 accent-warning"
+                    checked={reletConfirmed}
+                    onChange={(e) => setReletConfirmed(e.target.checked)}
+                  />
+                  <span>
+                    I confirm the walk-in guest will check out and the room will
+                    be ready before the next reservation arrives.
+                  </span>
+                </label>
+              </div>
+            </div>
+          </div>
+        )}
         {error && <div className="text-danger text-sm mt-3">{error}</div>}
         <div className="flex justify-end gap-2 mt-4">
           <button className="btn-secondary" onClick={() => navigate(-1)}>
@@ -2044,7 +2136,7 @@ function OutstandingBanner({
           <div className="text-xs text-textSecondary mt-1">
             Most recent:{" "}
             <Link
-              to={`/reservations/${data.mostRecent.reservationId}`}
+              to={`/reservations/${data.mostRecent.reservationNumber}`}
               className="font-mono text-accentBlue hover:underline"
             >
               {data.mostRecent.reservationNumber}

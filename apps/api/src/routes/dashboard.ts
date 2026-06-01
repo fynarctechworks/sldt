@@ -1,13 +1,14 @@
-import { and, desc, eq, gte, inArray, lt, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, lt, lte, sql } from "drizzle-orm";
 import { Router } from "express";
 import { db } from "../db/client.js";
 import { activityLog } from "../db/schema/activity.js";
 import { guests } from "../db/schema/guests.js";
-import { payments } from "../db/schema/invoices.js";
+import { invoices, payments } from "../db/schema/invoices.js";
 import { profiles } from "../db/schema/profiles.js";
 import { reservationRooms, reservations } from "../db/schema/reservations.js";
 import { rooms } from "../db/schema/rooms.js";
 import { logger } from "../lib/logger.js";
+import { messaging } from "../lib/messaging.js";
 import { dashboardKey, redis } from "../lib/redis.js";
 import { ok } from "../lib/response.js";
 import { getSettings } from "../lib/settings.js";
@@ -65,6 +66,14 @@ async function buildDashboard() {
   const forecastEnd = propertyDateOffset(6);
   const settings = await getSettings();
 
+  // Pre-arrival reminder window. Confirmed bookings with a check-in
+  // date today + (arrivalReminderHoursBefore / 24) round-up days that
+  // haven't been reminded yet. We send WhatsApp + surface them as
+  // staff alerts.
+  const reminderHours = settings.arrivalReminderHoursBefore ?? 24;
+  const noShowCutoffHours = settings.noShowCutoffHours ?? 6;
+  const reminderWindowEnd = propertyDateOffset(Math.ceil(reminderHours / 24));
+
   const [
     roomRows,
     occupiedRows,
@@ -75,8 +84,12 @@ async function buildDashboard() {
     activity,
     upcomingCheckoutRows,
     mtdRevenueRow,
-    mtdRoomNightsRow,
+    outstandingBalanceRow,
+    pendingCheckoutsTodayRow,
+    roomsOutOfServiceRow,
     forecastRows,
+    upcomingArrivalsRow,
+    likelyNoShowsRow,
   ] = await Promise.all([
       db.select().from(rooms).orderBy(rooms.floor, rooms.roomNumber),
       db
@@ -325,26 +338,49 @@ async function buildDashboard() {
             sql`${reservations.bookingSource} <> 'complimentary'`,
           ),
         ),
-      // Room nights sold MTD (used for ADR + RevPAR). A "room night"
-      // is one reservation_rooms row per night of stay within the
-      // current month. We compute via the parent reservation's date
-      // range clipped to [startOfMonth, today]. Cancelled / no-show
-      // don't count.
+      // Outstanding balance — money the property is still owed. Sum
+      // over every non-cancelled reservation: use the latest non-
+      // voided invoice's balance when one exists, otherwise the
+      // reservation's running balance_due. Mirrors how the guest-
+      // profile balance is computed so the two surfaces never disagree.
+      db.execute<{ total: string }>(sql`
+        SELECT COALESCE(SUM(
+          CASE
+            WHEN r.status = 'cancelled' THEN 0
+            ELSE COALESCE(
+              (SELECT i.balance_due::numeric
+               FROM ${invoices} i
+               WHERE i.reservation_id = r.id AND i.status != 'voided'
+               ORDER BY i.created_at DESC
+               LIMIT 1),
+              r.balance_due::numeric
+            )
+          END
+        ), 0)::text AS total
+        FROM ${reservations} r
+        WHERE r.booking_source <> 'complimentary'
+      `),
+      // Pending check-outs today — reservations whose check-out date
+      // is today AND status is still 'checked_in' (i.e. the guest is
+      // still in-house and needs to be processed). Cancelled bookings
+      // and already checked-out rows are excluded.
       db
-        .select({
-          revenue: sql<string>`COALESCE(SUM(CAST(${reservationRooms.ratePerNight} AS NUMERIC) * GREATEST(0, LEAST(${reservations.checkOutDate}, ${today}::date) - GREATEST(${reservations.checkInDate}, ${sql.raw(`'${propertyToday().slice(0, 7)}-01'::date`)}))), 0)::text`,
-          nights: sql<number>`COALESCE(SUM(GREATEST(0, LEAST(${reservations.checkOutDate}, ${today}::date) - GREATEST(${reservations.checkInDate}, ${sql.raw(`'${propertyToday().slice(0, 7)}-01'::date`)}))), 0)::int`,
-        })
-        .from(reservationRooms)
-        .innerJoin(reservations, eq(reservations.id, reservationRooms.reservationId))
+        .select({ count: sql<number>`count(*)::int` })
+        .from(reservations)
         .where(
           and(
-            inArray(reservations.status, ["confirmed", "checked_in", "checked_out"]),
-            sql`${reservations.bookingSource} <> 'complimentary'`,
-            // Reservation must touch the current month at all.
-            lt(reservations.checkInDate, today),
+            eq(reservations.checkOutDate, today),
+            eq(reservations.status, "checked_in"),
           ),
         ),
+      // Rooms out of service — physically unavailable inventory.
+      // Counts rooms in maintenance + dirty (housekeeping debt). These
+      // can't be sold until the underlying state changes, so the desk
+      // should know how much of the inventory is currently dark.
+      db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(rooms)
+        .where(inArray(rooms.status, ["maintenance", "dirty"])),
       // 7-day forecast: per-day count of reservations occupying a
       // room. We unnest a generate_series over the window and join
       // against reservation_rooms whose parent overlaps the day. The
@@ -378,6 +414,49 @@ async function buildDashboard() {
           ORDER BY d
         `,
       ),
+      // Upcoming arrivals — confirmed bookings due to check in within
+      // the reminder window [today, today + ceil(hoursBefore/24)].
+      // Includes whether the WhatsApp reminder has already been sent.
+      db
+        .select({
+          id: reservations.id,
+          reservationNumber: reservations.reservationNumber,
+          guestName: guests.fullName,
+          guestPhone: guests.phone,
+          checkInDate: reservations.checkInDate,
+          arrivalReminderSentAt: reservations.arrivalReminderSentAt,
+        })
+        .from(reservations)
+        .innerJoin(guests, eq(guests.id, reservations.guestId))
+        .where(
+          and(
+            eq(reservations.status, "confirmed"),
+            gte(reservations.checkInDate, today),
+            lte(reservations.checkInDate, reminderWindowEnd),
+          ),
+        )
+        .orderBy(reservations.checkInDate),
+      // Likely no-shows — confirmed bookings whose check-in date is
+      // today AND the cutoff (hotel check-in time + cutoffHours) has
+      // already passed. Staff sees a red banner asking to verify and
+      // either check-in or mark no-show. No automatic state change.
+      db
+        .select({
+          id: reservations.id,
+          reservationNumber: reservations.reservationNumber,
+          guestName: guests.fullName,
+          guestPhone: guests.phone,
+          checkInDate: reservations.checkInDate,
+        })
+        .from(reservations)
+        .innerJoin(guests, eq(guests.id, reservations.guestId))
+        .where(
+          and(
+            eq(reservations.status, "confirmed"),
+            lte(reservations.checkInDate, today),
+          ),
+        )
+        .orderBy(reservations.checkInDate),
     ]);
 
   const occupiedCount = occupiedRows[0]?.count ?? 0;
@@ -386,27 +465,92 @@ async function buildDashboard() {
 
   const roomResMap = new Map<
     string,
-    { reservationId: string; guestName: string; resStatus: string }
+    {
+      reservationId: string;
+      reservationNumber: string;
+      guestName: string;
+      resStatus: string;
+      checkInDate: string;
+      checkOutDate: string;
+    }
+  >();
+  // Same-day re-let watch. A room is re-let-pending when:
+  //   - A walk-in is currently checked_in AND due to check out today
+  //   - The same room also has a confirmed booking arriving by tomorrow
+  // The dashboard tile shows a small dot so the desk knows the
+  // RESERVED room is actually occupied right now and needs to be
+  // turned over before the next guest arrives.
+  const reletByRoom = new Map<
+    string,
+    { nextGuestName: string; nextCheckIn: string }
   >();
   const liveReservations = await db
     .select({
       roomId: reservationRooms.roomId,
       reservationId: reservations.id,
+      reservationNumber: reservations.reservationNumber,
       guestName: guests.fullName,
       resStatus: reservations.status,
+      checkInDate: reservations.checkInDate,
+      checkOutDate: reservations.checkOutDate,
     })
     .from(reservationRooms)
     .innerJoin(reservations, eq(reservations.id, reservationRooms.reservationId))
     .innerJoin(guests, eq(guests.id, reservations.guestId))
     .where(inArray(reservations.status, ["checked_in", "confirmed"]));
+  const tomorrow = propertyDateOffset(1);
   for (const r of liveReservations) {
-    // Prefer checked_in over confirmed when both exist
+    // Prefer checked_in over confirmed when both exist. Among multiple
+    // confirmed bookings on the same room, prefer the soonest one so
+    // the tile shows the earliest hold date.
     const existing = roomResMap.get(r.roomId);
-    if (!existing || (existing.resStatus !== "checked_in" && r.resStatus === "checked_in")) {
+    const isUpgrade =
+      !existing ||
+      (existing.resStatus !== "checked_in" && r.resStatus === "checked_in") ||
+      (existing.resStatus === r.resStatus &&
+        r.checkInDate < existing.checkInDate);
+    if (isUpgrade) {
       roomResMap.set(r.roomId, {
         reservationId: r.reservationId,
+        reservationNumber: r.reservationNumber,
         guestName: r.guestName,
         resStatus: r.resStatus,
+        checkInDate: r.checkInDate,
+        checkOutDate: r.checkOutDate,
+      });
+    }
+  }
+  // Second pass for re-let. A room qualifies when it has BOTH a
+  // checked_in row whose check_out_date is today or earlier AND a
+  // confirmed row whose check_in_date is today/tomorrow.
+  const checkedInToday = new Set<string>();
+  const futureConfirmed = new Map<
+    string,
+    { guestName: string; checkInDate: string }
+  >();
+  for (const r of liveReservations) {
+    if (r.resStatus === "checked_in" && r.checkOutDate <= tomorrow) {
+      checkedInToday.add(r.roomId);
+    } else if (
+      r.resStatus === "confirmed" &&
+      r.checkInDate >= today &&
+      r.checkInDate <= tomorrow
+    ) {
+      const existing = futureConfirmed.get(r.roomId);
+      if (!existing || r.checkInDate < existing.checkInDate) {
+        futureConfirmed.set(r.roomId, {
+          guestName: r.guestName,
+          checkInDate: r.checkInDate,
+        });
+      }
+    }
+  }
+  for (const roomId of checkedInToday) {
+    const next = futureConfirmed.get(roomId);
+    if (next) {
+      reletByRoom.set(roomId, {
+        nextGuestName: next.guestName,
+        nextCheckIn: next.checkInDate,
       });
     }
   }
@@ -473,36 +617,72 @@ async function buildDashboard() {
     }),
     revenue_today: { total_collected: Number(revenueRow[0]?.total ?? 0) },
     // Industry-standard hospitality KPIs.
-    //   MTD revenue   = total collected since the 1st of this month.
-    //   ADR           = room revenue / room nights sold (this month).
-    //                   Tells the operator the average price they got
-    //                   per occupied room — the price lever.
-    //   RevPAR        = room revenue / available room-nights so far.
-    //                   The single most important PMS metric: combines
-    //                   ADR and occupancy into one number. Compared
-    //                   month-over-month to gauge true performance.
-    //
-    // We compute "available room-nights so far" as total_rooms × days
-    // elapsed this month (inclusive of today). Maintenance days are
-    // not subtracted — the textbook definition keeps the denominator
-    // simple. If we ever want "available excluding OOO", we'd subtract
-    // OOO-days here.
-    revenue_kpis: (() => {
-      const mtdRevenue = Number(mtdRevenueRow[0]?.total ?? 0);
-      const roomNights = Number(mtdRoomNightsRow[0]?.nights ?? 0);
-      const roomRevenue = Number(mtdRoomNightsRow[0]?.revenue ?? 0);
-      const totalRooms = roomRows.length;
-      const dayOfMonth = Number(today.slice(-2));
-      const availableRoomNights = totalRooms * dayOfMonth;
-      const adr = roomNights > 0 ? roomRevenue / roomNights : 0;
-      const revpar = availableRoomNights > 0 ? roomRevenue / availableRoomNights : 0;
-      return {
-        mtd_collected: +mtdRevenue.toFixed(2),
-        mtd_room_revenue: +roomRevenue.toFixed(2),
-        mtd_room_nights: roomNights,
-        adr: +adr.toFixed(2),
-        revpar: +revpar.toFixed(2),
-      };
+    //   MTD revenue          = total collected since the 1st of this month.
+    //   Outstanding balance  = total unpaid across every non-cancelled
+    //                          reservation. Receivables snapshot — the
+    //                          desk knows how much is sitting in
+    //                          uncollected bills right now.
+    revenue_kpis: {
+      mtd_collected: +Number(mtdRevenueRow[0]?.total ?? 0).toFixed(2),
+      outstanding_balance: +Number(
+        (outstandingBalanceRow as unknown as { total: string }[])[0]?.total ?? 0,
+      ).toFixed(2),
+    },
+    // Operational counters shown alongside Revenue MTD on the dashboard.
+    // Visible to everyone (no money). pending_checkouts_today drives the
+    // morning work queue; rooms_out_of_service surfaces housekeeping /
+    // maintenance debt.
+    operations_kpis: {
+      pending_checkouts_today: Number(pendingCheckoutsTodayRow[0]?.count ?? 0),
+      rooms_out_of_service: Number(roomsOutOfServiceRow[0]?.count ?? 0),
+    },
+    // Pre-arrival reminders + no-show watch (migration 0021).
+    //   upcoming_arrivals — confirmed bookings checking in within the
+    //     reminder window. The UI shows them as a sticky banner so the
+    //     desk knows who's expected.
+    //   likely_no_shows — confirmed bookings whose check-in date is
+    //     today and the cutoff time has passed. Staff sees a red row
+    //     and either checks them in (if they walked in late) or hits
+    //     Mark No-show.
+    upcoming_arrivals: upcomingArrivalsRow.map((r) => ({
+      id: r.id,
+      reservationNumber: r.reservationNumber,
+      guestName: r.guestName,
+      guestPhone: r.guestPhone,
+      checkInDate: r.checkInDate,
+      reminderSent: r.arrivalReminderSentAt !== null,
+    })),
+    likely_no_shows: (() => {
+      // Compute the cutoff datetime once. A confirmed booking is
+      // flagged when:
+      //   check_in_date < today (yesterday or earlier, never arrived)
+      //   OR check_in_date == today AND now >= checkInTime + cutoff
+      const [hStr, mStr] = (settings.checkInTime ?? "12:00").split(":");
+      const cutoffMs =
+        (Number(hStr) * 60 + Number(mStr) + noShowCutoffHours * 60) * 60 * 1000;
+      const todayMidnight = new Date(`${today}T00:00:00+05:30`).getTime();
+      const cutoffEpoch = todayMidnight + cutoffMs;
+      const nowEpoch = Date.now();
+      return likelyNoShowsRow
+        .filter((r) => {
+          if (r.checkInDate < today) return true;
+          return nowEpoch >= cutoffEpoch;
+        })
+        .map((r) => ({
+          id: r.id,
+          reservationNumber: r.reservationNumber,
+          guestName: r.guestName,
+          guestPhone: r.guestPhone,
+          checkInDate: r.checkInDate,
+          daysLate: Math.max(
+            0,
+            Math.floor(
+              (new Date(`${today}T00:00:00`).getTime() -
+                new Date(`${r.checkInDate}T00:00:00`).getTime()) /
+                86400000,
+            ),
+          ),
+        }));
     })(),
     // 7-day occupancy + arrivals forecast. Drives the "next week"
     // strip on the dashboard. % is computed client-side so we don't
@@ -519,11 +699,25 @@ async function buildDashboard() {
     },
     room_grid: roomRows.map((r) => {
       const live = roomResMap.get(r.id);
-      const effectiveStatus = live
-        ? live.resStatus === "checked_in"
-          ? "occupied"
-          : "reserved"
-        : r.status;
+      // Effective tile status:
+      //   - checked_in            → occupied (someone is in it now)
+      //   - confirmed, today      → reserved (arriving later today, blocked)
+      //   - confirmed, future     → available (bookable tonight, will be
+      //                             held later) — UI shows a "till [date]"
+      //                             hint so staff sees the upcoming hold
+      //   - no live booking       → fall through to physical room status
+      let effectiveStatus = r.status;
+      if (live) {
+        if (live.resStatus === "checked_in") {
+          effectiveStatus = "occupied";
+        } else if (live.checkInDate <= today) {
+          effectiveStatus = "reserved";
+        } else {
+          // Future-only hold — keep the room visually available so the
+          // front desk doesn't read "RESERVED" as "untouchable today".
+          effectiveStatus = r.status === "reserved" ? "available" : r.status;
+        }
+      }
       return {
         id: r.id,
         room_number: r.roomNumber,
@@ -531,6 +725,25 @@ async function buildDashboard() {
         status: effectiveStatus,
         guest_name: live?.guestName ?? null,
         reservation_id: live?.reservationId ?? null,
+        // Human-readable SLDT-RES-NNNN — preferred for URL building so
+        // navigating to a tile produces a shareable URL.
+        reservation_number: live?.reservationNumber ?? null,
+        // Earliest upcoming hold window for this room (yyyy-MM-dd)
+        // when the next reservation hasn't started yet. The tile uses
+        // both ends to render "HELD 02 → 03 JUN" so the desk sees
+        // exactly when the room is locked.
+        held_from:
+          live && live.resStatus === "confirmed" && live.checkInDate > today
+            ? live.checkInDate
+            : null,
+        held_to:
+          live && live.resStatus === "confirmed" && live.checkInDate > today
+            ? live.checkOutDate
+            : null,
+        // Set when the room has both a same-day walk-in and a
+        // confirmed booking arriving within 24h. The dashboard tile
+        // shows a small blue dot so the desk can spot the conflict.
+        relet_pending: reletByRoom.get(r.id) ?? null,
       };
     }),
     recent_activity: activity.map((a) => ({
@@ -567,6 +780,12 @@ router.get("/", requireAuth, requirePermission("view_dashboard"), async (req, re
   } catch (err) {
     logger.debug({ err: err instanceof Error ? err.message : err }, "dashboard cache write skipped");
   }
+  // Fire-and-forget: send any due arrival reminders. The race lock is
+  // the DB UPDATE — only the row that flips from NULL to now() actually
+  // sends. Concurrent dashboard ticks see "already sent" and skip.
+  void dispatchDueArrivalReminders(data.upcoming_arrivals).catch((err) => {
+    logger.warn({ err: err instanceof Error ? err.message : err }, "arrival reminders dispatch failed");
+  });
   return ok(res, canSeeRevenue ? data : stripRevenue(data));
 });
 
@@ -581,6 +800,69 @@ function stripRevenue<T extends { revenue_today?: unknown; revenue_kpis?: unknow
   void _r1;
   void _r2;
   return rest;
+}
+
+// Pre-arrival reminder dispatcher (migration 0021). Iterates the
+// upcoming-arrivals list from the dashboard build. For each booking
+// without a sent-marker, claim the row via UPDATE…RETURNING (the
+// claim is atomic), then send WhatsApp. If anyone else already
+// claimed the row, the UPDATE returns 0 and we skip — no double-send.
+//
+// Send body is intentionally minimal: hotel name + booking number +
+// check-in date + hotel phone. The exact template is the property's
+// choice via Settings later; default is fine here.
+async function dispatchDueArrivalReminders(
+  arrivals: {
+    id: string;
+    reservationNumber: string;
+    guestName: string;
+    guestPhone: string;
+    checkInDate: string;
+    reminderSent: boolean;
+  }[],
+): Promise<void> {
+  const candidates = arrivals.filter((a) => !a.reminderSent);
+  if (candidates.length === 0) return;
+  const s = await getSettings();
+  for (const a of candidates) {
+    const claim = await db
+      .update(reservations)
+      .set({ arrivalReminderSentAt: new Date() })
+      .where(
+        and(
+          eq(reservations.id, a.id),
+          isNull(reservations.arrivalReminderSentAt),
+        ),
+      )
+      .returning({ id: reservations.id });
+    if (claim.length === 0) continue;
+    try {
+      const text =
+        `Hi ${a.guestName.split(" ")[0]}, your booking at ${s.hotelName} ` +
+        `(${a.reservationNumber}) is for ${a.checkInDate}. ` +
+        `Check-in from ${s.checkInTime ?? "12:00"}. ` +
+        `Questions? ${s.hotelPhone}`;
+      // messaging.sendSms is the WhatsApp-or-SMS channel (see messaging.ts).
+      await messaging.sendSms({ to: a.guestPhone, text });
+    } catch (err) {
+      // Roll back the sent-marker so a future tick can retry. Best-
+      // effort: if THIS update also fails, the marker stays and the
+      // guest gets one fewer reminder than ideal — preferable to a
+      // possible double-send loop.
+      try {
+        await db
+          .update(reservations)
+          .set({ arrivalReminderSentAt: null })
+          .where(eq(reservations.id, a.id));
+      } catch {
+        /* ignore — best-effort */
+      }
+      logger.warn(
+        { err: err instanceof Error ? err.message : err, reservationId: a.id },
+        "arrival reminder WhatsApp failed",
+      );
+    }
+  }
 }
 
 export default router;

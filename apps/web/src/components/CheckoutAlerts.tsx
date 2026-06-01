@@ -271,7 +271,7 @@ export function CheckoutAlerts() {
           it follows staff to every page until resolved. Blinks (via the
           animate-overdue-pulse class) so it's impossible to ignore. */}
       {overdueStays.length > 0 && (
-        <div className="sticky top-0 z-40 border-b-2 border-danger bg-danger text-cream animate-overdue-pulse">
+        <div className="border-b-2 border-danger bg-danger text-cream animate-overdue-pulse">
           <div className="px-4 py-2.5">
             <div className="flex items-center gap-2 mb-2">
               <AlertTriangle className="w-4 h-4 shrink-0" />
@@ -286,11 +286,11 @@ export function CheckoutAlerts() {
                   key={o.id}
                   role="button"
                   tabIndex={0}
-                  onClick={() => navigate(`/reservations/${o.id}`)}
+                  onClick={() => navigate(`/reservations/${o.reservationNumber}`)}
                   onKeyDown={(e) => {
                     if (e.key === "Enter" || e.key === " ") {
                       e.preventDefault();
-                      navigate(`/reservations/${o.id}`);
+                      navigate(`/reservations/${o.reservationNumber}`);
                     }
                   }}
                   className="flex items-center gap-3 px-3 py-2 rounded-md bg-cream/10 border border-cream/30 cursor-pointer hover:bg-cream/20 transition-colors focus:outline-none focus:ring-2 focus:ring-cream/60"
@@ -313,7 +313,7 @@ export function CheckoutAlerts() {
                       // to the same place, but avoiding the double-nav keeps
                       // history clean.
                       e.stopPropagation();
-                      navigate(`/reservations/${o.id}`);
+                      navigate(`/reservations/${o.reservationNumber}`);
                     }}
                     className="inline-flex items-center px-3 h-8 text-xs font-bold rounded-sm bg-cream text-danger hover:opacity-90 transition-colors shrink-0"
                   >
@@ -330,7 +330,7 @@ export function CheckoutAlerts() {
           by *time today*). Only render when there's a same-day alert —
           a pure multi-day-overdue situation shows just the block above. */}
       {decorated.length > 0 && (
-      <div className={`sticky top-0 z-40 border-b-2 ${toneClasses[worst]}`}>
+      <div className={`border-b-2 ${toneClasses[worst]}`}>
         <div className="px-4 py-2.5">
           {/* Headline */}
           <div className="flex items-center gap-2 mb-2">
@@ -347,9 +347,9 @@ export function CheckoutAlerts() {
                 key={d.id}
                 row={d}
                 worstLevel={worst}
-                onOpen={() => navigate(`/reservations/${d.id}`)}
+                onOpen={() => navigate(`/reservations/${d.reservationNumber}`)}
                 onCheckout={() =>
-                  navigate(`/reservations/${d.id}?action=checkout`)
+                  navigate(`/reservations/${d.reservationNumber}?action=checkout`)
                 }
               />
             ))}

@@ -155,7 +155,7 @@ export default function Collections() {
                     <td>
                       <button
                         className="font-mono text-brand hover:underline"
-                        onClick={() => navigate(`/reservations/${p.reservationId}`)}
+                        onClick={() => navigate(`/reservations/${p.reservationNumber}`)}
                       >
                         {p.reservationNumber}
                       </button>

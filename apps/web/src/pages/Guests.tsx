@@ -246,7 +246,7 @@ export default function Guests() {
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
           {guests.map((g) => (
-            <GuestCard key={g.id} g={g} onOpen={() => navigate(`/guests/${g.id}`)} />
+            <GuestCard key={g.id} g={g} onOpen={() => navigate(`/guests/${g.phone}`)} />
           ))}
         </div>
       )}

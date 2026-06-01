@@ -398,7 +398,7 @@ export default function CalendarPage() {
                 return (
                   <li
                     key={b.id}
-                    onClick={() => navigate(`/reservations/${b.id}`)}
+                    onClick={() => navigate(`/reservations/${b.reservationNumber}`)}
                     className="py-2.5 flex items-center gap-3 cursor-pointer hover:bg-bg -mx-2 px-2 rounded-sm"
                   >
                     <span

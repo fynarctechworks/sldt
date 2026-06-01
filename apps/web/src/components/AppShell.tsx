@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import { useEffect, useMemo, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { api } from "@/lib/api";
+import { ArrivalAlerts } from "./ArrivalAlerts";
 import { CheckoutAlerts } from "./CheckoutAlerts";
 import { CommandPalette } from "./CommandPalette";
 import { Sidebar } from "./Sidebar";
@@ -138,7 +139,16 @@ export function AppShell({ children }: { children: ReactNode }) {
           </div>
         </header>
 
-        <CheckoutAlerts />
+        {/* All alert bars pin together as a single header so they
+            don't fight for top-0 individually and overlap on scroll.
+            Children render as plain blocks (no sticky themselves).
+            Cap the stack at 40% of the viewport so a noisy day can't
+            push the rest of the page out of sight — internal scroll
+            handles overflow. */}
+        <div className="sticky top-0 z-40 max-h-[40vh] overflow-y-auto">
+          <CheckoutAlerts />
+          <ArrivalAlerts />
+        </div>
         {/* Main content padding tightens on mobile so cards aren't crammed. */}
         <main className="p-3 sm:p-5 md:p-6">{children}</main>
       </div>

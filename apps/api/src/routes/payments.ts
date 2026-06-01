@@ -16,9 +16,14 @@ import { uploadPublicPdf } from "../lib/storage.js";
 import { fail, ok } from "../lib/response.js";
 import { requireAuth, requirePermission } from "../middleware/auth.js";
 import { idempotent } from "../middleware/idempotency.js";
+import { resolvePaymentId } from "../middleware/resolvePayment.js";
 import { validate } from "../middleware/validate.js";
 
 const router = Router();
+
+// Accept either UUID or SLDT-RCP-NNNN receipt number on every :id
+// route so receipts can be referenced by their human number.
+router.param("id", resolvePaymentId as never);
 
 router.post(
   "/",

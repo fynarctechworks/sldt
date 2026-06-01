@@ -1,7 +1,15 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { ArrowRight, Loader2, Undo2, Wrench, X } from "lucide-react";
+import {
+  ArrowRight,
+  CheckCheck,
+  Loader2,
+  Sparkles,
+  Undo2,
+  Wrench,
+  X,
+} from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { useToast } from "@/components/Toast";
 
@@ -32,6 +40,35 @@ function mutateRoomStatus(old: unknown, roomId: string, next: HkStatus): unknown
   }
 
   return old;
+}
+
+// Status pill colour map for the popover header.
+const STATUS_BADGE: Record<HkStatus, string> = {
+  dirty: "bg-warning/20 text-[#B45309]",
+  clean: "bg-yellow-100 text-yellow-800",
+  inspected: "bg-success/15 text-success",
+  available: "bg-success/15 text-success",
+  maintenance: "bg-danger/15 text-danger",
+};
+
+// Picks the icon that best telegraphs what each action does. We map by
+// target state instead of direction so "Mark Ready" gets a checkmark
+// instead of a generic arrow, and only maintenance gets the wrench.
+function iconForTarget(opt: { to: HkStatus; direction: string }) {
+  switch (opt.to) {
+    case "available":
+      return CheckCheck;
+    case "clean":
+      return Sparkles;
+    case "inspected":
+      return CheckCheck;
+    case "maintenance":
+      return Wrench;
+    case "dirty":
+      return Undo2;
+    default:
+      return opt.direction === "forward" ? ArrowRight : Undo2;
+  }
 }
 
 type TransitionOpt = {
@@ -78,9 +115,9 @@ interface Props {
 
 // Menu dimensions used for viewport-fit math. Width matches w-64 (16rem);
 // height is an estimate generous enough for the tallest 2-option menu.
-const MENU_WIDTH = 256;
-const MENU_MAX_HEIGHT = 220;
-const GAP = 8;
+const MENU_WIDTH = 272;
+const MENU_MAX_HEIGHT = 240;
+const GAP = 6;
 
 export function RoomActionPopover({ roomId, roomNumber, status, trigger, onChanged, invalidateKeys }: Props) {
   const [open, setOpen] = useState(false);
@@ -144,15 +181,28 @@ export function RoomActionPopover({ roomId, roomNumber, status, trigger, onChang
     if (!open || !wrapRef.current) return;
     const place = () => {
       const r = wrapRef.current!.getBoundingClientRect();
+      const triggerCenter = r.left + r.width / 2;
       const spaceBelow = window.innerHeight - r.bottom;
-      const openUp = spaceBelow < MENU_MAX_HEIGHT + GAP && r.top > spaceBelow;
-      const top = openUp ? r.top - GAP - MENU_MAX_HEIGHT : r.bottom + GAP;
-      // Right-align the menu to the trigger, then clamp into the viewport.
-      let left = r.right - MENU_WIDTH;
+      // Measure the actual rendered menu when we can — falls back to the
+      // estimated MENU_MAX_HEIGHT before first paint. Measuring fixes the
+      // "huge visual gap above a small trigger" problem caused by a
+      // pessimistic height estimate.
+      const measuredHeight = menuRef.current?.offsetHeight ?? MENU_MAX_HEIGHT;
+      const openUp = spaceBelow < measuredHeight + GAP && r.top > spaceBelow;
+      const top = openUp
+        ? r.top - GAP - measuredHeight
+        : r.bottom + GAP;
+      // Center the menu horizontally on the trigger so it visually
+      // connects to the room tile, then clamp into the viewport.
+      let left = triggerCenter - MENU_WIDTH / 2;
       left = Math.max(GAP, Math.min(left, window.innerWidth - MENU_WIDTH - GAP));
       setPos({ top: Math.max(GAP, top), left });
     };
     place();
+    // Re-place once the menu is in the DOM so we use its actual
+    // height instead of the pessimistic estimate. Two RAFs ensures
+    // the browser has laid out the portalled content.
+    requestAnimationFrame(() => requestAnimationFrame(place));
     window.addEventListener("scroll", place, true);
     window.addEventListener("resize", place);
     return () => {
@@ -207,38 +257,45 @@ export function RoomActionPopover({ roomId, roomNumber, status, trigger, onChang
           <div
             ref={menuRef}
             style={{ position: "fixed", top: pos.top, left: pos.left, width: MENU_WIDTH }}
-            className="z-[100] bg-surface border border-borderc rounded-md shadow-lg overflow-hidden"
+            className="z-[100] bg-surface border border-borderc rounded-lg shadow-xl ring-1 ring-black/5 overflow-hidden"
           >
-            <div className="px-3 py-2 border-b border-borderc bg-brand-soft/40 flex items-center justify-between">
-              <div className="text-xs">
-                <span className="font-mono font-semibold">{roomNumber}</span>
-                <span className="ml-2 text-textSecondary capitalize">· {status}</span>
+            <div className="px-3 py-2.5 border-b border-borderc bg-brand-soft/60 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="font-mono text-sm font-bold text-brand-dark">
+                  {roomNumber}
+                </span>
+                <span
+                  className={`inline-flex items-center px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider rounded-sm ${STATUS_BADGE[status]}`}
+                >
+                  {status}
+                </span>
               </div>
-              <button onClick={() => setOpen(false)} className="text-textSecondary hover:text-textPrimary">
+              <button
+                onClick={() => setOpen(false)}
+                className="text-textSecondary hover:text-textPrimary"
+                aria-label="Close"
+              >
                 <X className="w-3.5 h-3.5" />
               </button>
             </div>
 
-            <div className="p-1.5 flex flex-col gap-1">
+            <div className="p-2 flex flex-col gap-1.5">
               {options.map((opt) => {
-                const Icon =
-                  opt.direction === "forward"
-                    ? ArrowRight
-                    : opt.direction === "reverse"
-                      ? Undo2
-                      : Wrench;
+                const Icon = iconForTarget(opt);
                 const cls =
                   opt.direction === "forward"
-                    ? "bg-brand text-cream hover:bg-brand-dark"
+                    ? "bg-brand-dark text-cream hover:bg-brand-dark/90 shadow-sm"
                     : opt.direction === "reverse"
                       ? "bg-surface text-textPrimary border border-borderc hover:bg-bg"
-                      : "bg-surface text-warning border border-warning/40 hover:bg-warning/5";
+                      : opt.to === "maintenance"
+                        ? "bg-surface text-danger border border-danger/30 hover:bg-danger/5"
+                        : "bg-surface text-textPrimary border border-borderc hover:bg-bg";
                 return (
                   <button
                     key={opt.to}
                     onClick={() => update.mutate({ to: opt.to, directReady: opt.directReady })}
                     disabled={update.isPending}
-                    className={`w-full flex items-center gap-2 px-3 py-2 text-sm rounded-sm text-left transition-colors disabled:opacity-50 ${cls}`}
+                    className={`w-full flex items-center gap-2.5 px-3 py-2 text-sm font-medium rounded-md text-left transition-colors disabled:opacity-50 ${cls}`}
                   >
                     {update.isPending ? (
                       <Loader2 className="w-4 h-4 animate-spin shrink-0" />
