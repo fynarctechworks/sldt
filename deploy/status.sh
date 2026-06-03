@@ -3,11 +3,13 @@
 # Run on the VPS: bash ~/hoteldesk/deploy/status.sh
 set -euo pipefail
 
-REPO_DIR="${REPO_DIR:-$HOME/hoteldesk}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="${REPO_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 CONTAINER_NAME="hoteldesk-api"
 HEALTH_URL="http://127.0.0.1:${HOTELDESK_HOST_PORT:-3010}/health"
 
 cd "$REPO_DIR"
+echo "Repo: $REPO_DIR"
 echo "Repo commit:        $(git rev-parse --short HEAD)   ($(git log -1 --format=%s | head -c 60))"
 echo "Container running:  $(docker inspect -f '{{.State.Status}}' $CONTAINER_NAME 2>/dev/null || echo 'NOT RUNNING')"
 echo "Container started:  $(docker inspect -f '{{.State.StartedAt}}' $CONTAINER_NAME 2>/dev/null || echo '-')"

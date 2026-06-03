@@ -18,12 +18,19 @@
 
 set -euo pipefail
 
-REPO_DIR="${REPO_DIR:-$HOME/hoteldesk}"
+# Resolve the repo from the script's own location — `deploy/deploy.sh` lives
+# inside the repo, so the repo root is the parent of this file's directory.
+# This means it doesn't matter where you invoke the script from; it always
+# operates on the checkout that owns it. Override with REPO_DIR if you ever
+# need to point it elsewhere.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="${REPO_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 COMPOSE_FILE="$REPO_DIR/deploy/docker-compose.prod.yml"
 CONTAINER_NAME="hoteldesk-api"
 HEALTH_URL="http://127.0.0.1:${HOTELDESK_HOST_PORT:-3010}/health"
 
 cd "$REPO_DIR"
+echo "Repo: $REPO_DIR"
 
 echo "==> 1/6  Pulling latest main"
 git fetch origin main
