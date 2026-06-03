@@ -1,7 +1,8 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 import { db } from "../db/client.js";
+import { maintenanceIssues } from "../db/schema/maintenance.js";
 import { rooms } from "../db/schema/rooms.js";
 import { logActivity } from "../lib/activity.js";
 import { invalidateDashboard } from "../lib/redis.js";
@@ -12,12 +13,12 @@ import { validate } from "../middleware/validate.js";
 const router = Router();
 
 const statusUpdate = z.object({
-  status: z.enum(["dirty", "clean", "inspected", "available"]),
+  status: z.enum(["dirty", "available"]),
   reason: z.string().max(500).optional(),
-  // When true, a single "Mark Ready" action may jump a dirty or clean
-  // room straight to available, skipping the clean→inspected→available
-  // chain. Used by small properties where one person cleans and readies
-  // a room in one go. The step-by-step transitions still work without it.
+  // Kept for backwards-compat with older clients. The single-step
+  // workflow makes it redundant (every dirty → available IS a direct
+  // ready), but accepting the flag avoids breaking any callers that
+  // still send it.
   directReady: z.boolean().optional(),
 });
 
@@ -39,36 +40,61 @@ router.get("/", requireAuth, async (req, res) => {
     .from(rooms)
     .where(conditions.length ? and(...conditions) : undefined)
     .orderBy(rooms.floor, rooms.roomNumber);
-  return ok(res, rows);
+
+  // Per-room open-issue counts so the housekeeping card can render a
+  // small "N issues" pill without N+1 round-trips. Open + in_progress
+  // = actionable work; resolved + cancelled are excluded.
+  const roomIds = rows.map((r) => r.id);
+  const issueCounts = roomIds.length
+    ? await db
+        .select({
+          roomId: maintenanceIssues.roomId,
+          count: sql<number>`COUNT(*)::int`,
+        })
+        .from(maintenanceIssues)
+        .where(
+          and(
+            inArray(maintenanceIssues.roomId, roomIds),
+            inArray(maintenanceIssues.status, ["open", "in_progress"]),
+          ),
+        )
+        .groupBy(maintenanceIssues.roomId)
+    : [];
+  const countMap = new Map(
+    issueCounts.map((c) => [c.roomId, Number(c.count)]),
+  );
+
+  return ok(
+    res,
+    rows.map((r) => ({
+      ...r,
+      openIssueCount: countMap.get(r.id) ?? 0,
+    })),
+  );
 });
 
 router.patch("/:roomId", requireAuth, validate(statusUpdate), async (req, res) => {
   const roomId = req.params.roomId!;
-  const { status, reason, directReady } = req.body as {
+  const { status, reason } = req.body as {
     status: string;
     reason?: string;
-    directReady?: boolean;
   };
 
   const current = await db.select().from(rooms).where(eq(rooms.id, roomId)).limit(1);
   if (!current.length) return fail(res, 404, "NOT_FOUND", "Room not found");
   const room = current[0]!;
 
+  // Single-step cleaning workflow: dirty rooms become available in
+  // one hop. The inspection chain (clean → inspected → available)
+  // was removed in migration 0034; the only valid transitions left
+  // are the operational ones around occupancy + maintenance.
   const validTransitions: Record<string, string[]> = {
-    dirty: ["clean", "maintenance"],
-    clean: ["inspected", "dirty"],
-    inspected: ["available", "dirty"],
+    dirty: ["available", "maintenance"],
     available: ["dirty", "maintenance"],
     occupied: [],
     reserved: [],
     maintenance: ["available", "dirty"],
   };
-  // One-click "Mark Ready": allow a dirty or clean room to go straight to
-  // available, bypassing the inspection chain. Only honoured when the
-  // caller explicitly opts in, so accidental skips can't happen.
-  if (directReady && status === "available" && (room.status === "dirty" || room.status === "clean")) {
-    validTransitions[room.status] = [...(validTransitions[room.status] ?? []), "available"];
-  }
   const allowed = validTransitions[room.status] ?? [];
   if (!allowed.includes(status)) {
     return fail(
@@ -89,7 +115,7 @@ router.patch("/:roomId", requireAuth, validate(statusUpdate), async (req, res) =
     action: "housekeeping_update",
     entityType: "room",
     entityId: roomId,
-    description: `Room ${updated!.roomNumber}: ${room.status} → ${status}${directReady && status === "available" ? " (marked ready)" : ""}${reason ? ` (${reason})` : ""}`,
+    description: `Room ${updated!.roomNumber}: ${room.status} → ${status}${reason ? ` (${reason})` : ""}`,
     performedBy: req.user!.id,
     ipAddress: req.ip,
   });
@@ -100,6 +126,7 @@ router.patch("/:roomId", requireAuth, validate(statusUpdate), async (req, res) =
 router.post(
   "/:roomId/maintenance",
   requireAuth,
+  requirePermission("flag_maintenance"),
   validate(maintenanceFlag),
   async (req, res) => {
     const roomId = req.params.roomId!;

@@ -82,6 +82,18 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
     label: "Record / edit / delete expenses",
   },
 
+  // Maintenance (migration 0032)
+  {
+    key: "view_maintenance",
+    area: "Maintenance",
+    label: "View maintenance issues",
+  },
+  {
+    key: "manage_maintenance",
+    area: "Maintenance",
+    label: "Create / update / resolve maintenance issues",
+  },
+
   // Admin
   { key: "manage_staff", area: "Admin", label: "Manage staff (add / edit / deactivate)" },
   { key: "manage_roles", area: "Admin", label: "Manage roles & permissions" },
@@ -132,6 +144,8 @@ export const SYSTEM_ROLES = {
       "send_reminders",
       "view_invoices",
       "preview_invoice",
+      "view_maintenance",
+      "manage_maintenance",
       "view_activity",
       "view_notifications",
     ],
@@ -144,6 +158,8 @@ export const SYSTEM_ROLES = {
       "view_housekeeping",
       "update_housekeeping",
       "flag_maintenance",
+      "view_maintenance",
+      "manage_maintenance",
       "view_messages",
       "view_notifications",
     ],

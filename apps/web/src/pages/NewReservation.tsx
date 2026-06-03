@@ -49,7 +49,7 @@ interface AvailableRoom {
   // bookable but require a one-tap "Mark clean & select" acknowledgement
   // so staff doesn't accidentally hand keys to a guest before the room
   // is ready.
-  status?: "available" | "occupied" | "reserved" | "maintenance" | "dirty" | "clean" | "inspected";
+  status?: "available" | "occupied" | "reserved" | "maintenance" | "dirty";
   // Same-day re-let: when this room has a future reservation that
   // starts at or after the current probe's check_out, the server
   // returns it so the UI can warn "Room reserved for [guest]
@@ -509,17 +509,19 @@ export default function NewReservation() {
   const [pendingOtpGuestId, setPendingOtpGuestId] = useState<string | null>(null);
   const [pendingCoGuestIds, setPendingCoGuestIds] = useState<string[]>([]);
 
-  // Flip a dirty room straight to "clean" so staff can re-let it without
-  // leaving this page. The optimistic update bumps the cached availability
-  // list immediately; the server PATCH writes through and re-fetches.
+  // Flip a dirty room straight to available so staff can re-let it
+  // without leaving this page. The single-step workflow (migration
+  // 0034) makes dirty→available one hop. The optimistic update bumps
+  // the cached availability list immediately; the server PATCH
+  // writes through and re-fetches.
   const markRoomClean = useMutation({
     mutationFn: (roomId: string) =>
-      api.patch(`/rooms/${roomId}/status`, { status: "clean", reason: "Re-let at booking" }),
+      api.patch(`/rooms/${roomId}/status`, { status: "available", reason: "Re-let at booking" }),
     onSuccess: (_data, roomId) => {
       qc.setQueryData<AvailableRoom[]>(
         ["avail", checkInDate, checkOutDate, isShortStay],
         (cur) =>
-          cur?.map((r) => (r.id === roomId ? { ...r, status: "clean" as const } : r)) ?? cur,
+          cur?.map((r) => (r.id === roomId ? { ...r, status: "available" as const } : r)) ?? cur,
       );
       qc.invalidateQueries({ queryKey: ["rooms"] });
     },
@@ -778,6 +780,7 @@ export default function NewReservation() {
         setWalkInReceipt({
           reservationId,
           reservationNumber: detail.reservationNumber,
+          bookingSource,
           checkInDate: detail.checkInDate,
           checkOutDate: detail.checkOutDate,
           checkedInAt: detail.checkedInAt,
@@ -1691,7 +1694,7 @@ export default function NewReservation() {
                         disabled={cleanInFlight}
                         onClick={() => {
                           markRoomClean.mutate(r.id, {
-                            onSuccess: () => toggleRoom({ ...r, status: "clean" }),
+                            onSuccess: () => toggleRoom({ ...r, status: "available" }),
                           });
                         }}
                         className="w-full inline-flex items-center justify-center gap-1.5 px-2 h-8 rounded-sm border border-warning/50 text-warning hover:bg-warning/10 text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"

@@ -1219,6 +1219,7 @@ export default function ReservationDetail() {
           data={
             {
               reservationNumber: r.reservationNumber,
+              bookingSource: r.bookingSource,
               checkInDate: r.checkInDate,
               checkOutDate: r.checkOutDate,
               checkedInAt: r.checkedInAt,
@@ -1634,21 +1635,15 @@ function RoomRow(props: {
 
   const status = props.room.status;
   const isHousekeeping =
-    status === "dirty" ||
-    status === "clean" ||
-    status === "inspected" ||
-    status === "maintenance" ||
-    status === "available";
+    status === "dirty" || status === "maintenance" || status === "available";
 
   const statusBadge =
     status && status !== "occupied" && status !== "reserved"
       ? {
           dirty: "bg-warning/15 text-warning border-warning/30",
-          clean: "bg-cream text-brand-dark border-brass/40",
-          inspected: "bg-brand/10 text-brand border-brand/30",
           available: "bg-success/10 text-success border-success/30",
           maintenance: "bg-danger/10 text-danger border-danger/30",
-        }[status as "dirty" | "clean" | "inspected" | "available" | "maintenance"]
+        }[status as "dirty" | "available" | "maintenance"]
       : null;
 
   const hasAnyAmenity =
@@ -1802,7 +1797,7 @@ function RoomRow(props: {
                   <RoomActionPopover
                     roomId={props.room.id}
                     roomNumber={props.room.roomNumber}
-                    status={status as "dirty" | "clean" | "inspected" | "available" | "maintenance"}
+                    status={status as "dirty" | "available" | "maintenance"}
                     onChanged={props.onSaved}
                     invalidateKeys={[["reservation"], ["dashboard"]]}
                     trigger={
@@ -2503,7 +2498,7 @@ function AddRoomModal(props: {
     roomType: string;
     floor?: number;
     baseRate: string;
-    status?: "available" | "occupied" | "reserved" | "maintenance" | "dirty" | "clean" | "inspected";
+    status?: "available" | "occupied" | "reserved" | "maintenance" | "dirty";
   };
   const avail = useQuery({
     queryKey: ["availability", startDate, probeEnd],
@@ -2517,16 +2512,16 @@ function AddRoomModal(props: {
     enabled: isShortStay || startDate < probeEnd,
   });
 
-  // Marks a dirty room clean so it can be added to the reservation. Same
-  // pattern as the New Reservation page — no silent booking of a dirty room.
+  // Marks a dirty room available so it can be added to the reservation.
+  // Single-step workflow (migration 0034) — dirty → available in one hop.
   const markClean = useMutation({
     mutationFn: (roomId: string) =>
-      api.patch(`/rooms/${roomId}/status`, { status: "clean", reason: "Re-let mid-stay" }),
+      api.patch(`/rooms/${roomId}/status`, { status: "available", reason: "Re-let mid-stay" }),
     onSuccess: (_data, roomId) => {
       qc.setQueryData<AvailRoom[]>(
         ["availability", startDate, probeEnd],
         (cur) =>
-          cur?.map((r) => (r.id === roomId ? { ...r, status: "clean" as const } : r)) ?? cur,
+          cur?.map((r) => (r.id === roomId ? { ...r, status: "available" as const } : r)) ?? cur,
       );
       qc.invalidateQueries({ queryKey: ["rooms"] });
     },

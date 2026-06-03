@@ -15,8 +15,6 @@ export const ROOM_STATUSES = [
   "reserved",
   "maintenance",
   "dirty",
-  "clean",
-  "inspected",
 ] as const;
 export type RoomStatus = (typeof ROOM_STATUSES)[number];
 

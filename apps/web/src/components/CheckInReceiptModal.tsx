@@ -13,6 +13,11 @@ function formatGender(g: string | null | undefined): string {
 export interface CheckInReceiptData {
   reservationId?: string;
   reservationNumber: string;
+  // Drives whether the "balance due before check-in" note is shown.
+  // Only meaningful for `phone_whatsapp` (pre-booking, guest not yet
+  // on premises). Walk-ins are already at the desk; complimentary
+  // bookings don't carry a balance.
+  bookingSource?: "walkin" | "phone_whatsapp" | "complimentary";
   checkInDate: string;
   checkOutDate: string;
   checkedInAt?: string | null;
@@ -654,15 +659,18 @@ export function CheckInReceiptModal({ data, onClose, variant = "checkin" }: Prop
             })()}
           </div>
 
-          {/* Booking-advance reminder: if money's still owed, surface
-              the exact amount and when it's due. Only shown for the
-              advance variant (a check-in receipt is rendered after
-              balance is settled, so this would be misleading there). */}
-          {isAdvance && Number(data.balanceDue) > 0.009 && (
-            <div className="receipt-section mt-3 px-3 py-2 rounded-sm border border-[#B45309] bg-[#FBEFD9] text-[#7C2D12] text-center text-[11px] font-semibold">
-              Note: The remaining balance of {inr(data.balanceDue)} must be paid on or before check-in.
-            </div>
-          )}
+          {/* Booking-advance reminder: only shown for pre-bookings
+              (phone/WhatsApp) where the guest hasn't arrived yet and
+              needs the reminder. Walk-ins are already at the desk
+              checking in — telling them to "pay before check-in"
+              makes no sense. Complimentary never has a balance. */}
+          {isAdvance &&
+            Number(data.balanceDue) > 0.009 &&
+            data.bookingSource === "phone_whatsapp" && (
+              <div className="receipt-section mt-3 px-3 py-2 rounded-sm border border-[#B45309] bg-[#FBEFD9] text-[#7C2D12] text-center text-[11px] font-semibold">
+                Note: The remaining balance of {inr(data.balanceDue)} must be paid on or before check-in.
+              </div>
+            )}
 
           <div className="receipt-section mt-6 flex justify-between gap-3">
             <div className="text-[10px] text-textSecondary">

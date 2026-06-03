@@ -1,9 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Check, Pencil, X } from "lucide-react";
+import { AlertTriangle, Check } from "lucide-react";
 import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { useAuth } from "@/auth/AuthContext";
-import { useDialog } from "@/components/Dialog";
 import { Loader } from "@/components/Loader";
+import { NewIssueModal } from "@/components/NewIssueModal";
 import { StatusBadge } from "@/components/StatusBadge";
 import { api } from "@/lib/api";
 import { invalidateRoomData } from "@/lib/invalidate";
@@ -15,23 +16,18 @@ interface Room {
   roomType: string;
   status: string;
   notes: string | null;
+  // Open + in_progress maintenance issues. Drives the small "N issues"
+  // pill rendered on each card so staff can see at a glance where the
+  // outstanding work is.
+  openIssueCount: number;
 }
 
-const NEXT_STATUS: Record<string, { label: string; status: string }[]> = {
-  dirty: [{ label: "Mark Clean", status: "clean" }],
-  clean: [{ label: "Mark Inspected", status: "inspected" }],
-  inspected: [{ label: "Ready / Available", status: "available" }],
-  available: [],
-  occupied: [],
-  reserved: [],
-  maintenance: [],
-};
-
+// Single-step cleaning workflow: dirty rooms go straight to
+// available via the "Mark Ready" button below. The intermediate
+// clean / inspected statuses were removed in migration 0034.
 const STATUS_FILTERS = [
   "all",
   "dirty",
-  "clean",
-  "inspected",
   "available",
   "occupied",
   "reserved",
@@ -41,8 +37,6 @@ const STATUS_FILTERS = [
 const STATUS_LABELS: Record<string, string> = {
   all: "All",
   dirty: "Needs Cleaning",
-  clean: "Clean",
-  inspected: "Inspected",
   available: "Available",
   occupied: "Occupied",
   reserved: "Reserved",
@@ -51,15 +45,22 @@ const STATUS_LABELS: Record<string, string> = {
 
 export default function Housekeeping() {
   const qc = useQueryClient();
+  const navigate = useNavigate();
   const { profile } = useAuth();
-  const dialog = useDialog();
   const [floor, setFloor] = useState("");
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [err, setErr] = useState<string | null>(null);
+  // Drives the NewIssueModal when staff clicks Flag — opens with the
+  // chosen room preselected.
+  const [flaggingRoom, setFlaggingRoom] = useState<Room | null>(null);
 
+  // Fetch all rooms; floor filtering is done client-side so the floor
+  // dropdown always has the full property's list (it would otherwise
+  // collapse to only the active floor). Properties are small (10-20
+  // rooms typical), so the extra rows in memory are free.
   const { data: rooms = [], isLoading } = useQuery({
-    queryKey: ["hk", floor],
-    queryFn: () => api.get<Room[]>("/housekeeping", { floor: floor || undefined }),
+    queryKey: ["hk"],
+    queryFn: () => api.get<Room[]>("/housekeeping"),
     refetchInterval: 15_000,
   });
 
@@ -72,26 +73,12 @@ export default function Housekeeping() {
     setErr(null);
   }
 
-  const updateStatus = useMutation({
-    mutationFn: (v: { id: string; status: string }) =>
-      api.patch(`/housekeeping/${v.id}`, { status: v.status }),
-    onSuccess: invalidateRooms,
-    onError: (e: Error) => setErr(e.message),
-  });
-
-  // One-click shortcut: a dirty or clean room jumps straight to available,
-  // skipping the clean → inspected → available chain. directReady tells the
-  // API to allow the skip.
+  // One-click shortcut: a dirty room jumps straight to available.
+  // The intermediate clean / inspected statuses no longer exist
+  // (migration 0034); every dirty→available is a direct ready.
   const markReady = useMutation({
     mutationFn: (id: string) =>
-      api.patch(`/housekeeping/${id}`, { status: "available", directReady: true }),
-    onSuccess: invalidateRooms,
-    onError: (e: Error) => setErr(e.message),
-  });
-
-  const flagMaint = useMutation({
-    mutationFn: (v: { id: string; reason: string }) =>
-      api.post(`/housekeeping/${v.id}/maintenance`, { reason: v.reason }),
+      api.patch(`/housekeeping/${id}`, { status: "available" }),
     onSuccess: invalidateRooms,
     onError: (e: Error) => setErr(e.message),
   });
@@ -102,19 +89,23 @@ export default function Housekeeping() {
     onError: (e: Error) => setErr(e.message),
   });
 
-  const updateNotes = useMutation({
-    mutationFn: (v: { id: string; notes: string | null }) =>
-      api.patch(`/housekeeping/${v.id}/notes`, { notes: v.notes }),
-    onSuccess: invalidateRooms,
-    onError: (e: Error) => setErr(e.message),
-  });
-
   const counts = rooms.reduce<Record<string, number>>((acc, r) => {
     acc[r.status] = (acc[r.status] ?? 0) + 1;
     return acc;
   }, {});
 
-  const filtered = statusFilter === "all" ? rooms : rooms.filter((r) => r.status === statusFilter);
+  // Full floor list, derived from the unfiltered rooms set (the API
+  // returns every room now — see useQuery above).
+  const allFloors = Array.from(new Set(rooms.map((r) => r.floor))).sort(
+    (a, b) => a - b,
+  );
+  // Apply both filters client-side. Floor is a numeric string from
+  // the <select>; empty string means "All floors".
+  const filtered = rooms.filter((r) => {
+    if (statusFilter !== "all" && r.status !== statusFilter) return false;
+    if (floor !== "" && r.floor !== Number(floor)) return false;
+    return true;
+  });
   const sorted = [...filtered].sort((a, b) => {
     if (a.floor !== b.floor) return a.floor - b.floor;
     return a.roomNumber.localeCompare(b.roomNumber, undefined, { numeric: true });
@@ -141,13 +132,18 @@ export default function Housekeeping() {
         <div className="flex items-end gap-3">
           <div>
             <label className="label block mb-1">Floor</label>
-            <input
-              className="input w-24"
-              type="number"
+            <select
+              className="input w-32"
               value={floor}
               onChange={(e) => setFloor(e.target.value)}
-              placeholder="All"
-            />
+            >
+              <option value="">All floors</option>
+              {allFloors.map((f) => (
+                <option key={f} value={String(f)}>
+                  Floor {f}
+                </option>
+              ))}
+            </select>
           </div>
         </div>
       </div>
@@ -196,14 +192,42 @@ export default function Housekeeping() {
                   · {fg.rooms.length} room{fg.rooms.length === 1 ? "" : "s"}
                 </span>
               </div>
-              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+              {/* items-start prevents grid auto-stretching every cell
+                  to the tallest one in the row. Cards without an open
+                  issue badge are naturally shorter — they shouldn't
+                  bloat with empty space just because a sibling has more
+                  to show. */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3 items-start">
           {fg.rooms.map((r) => {
-            const transitions = NEXT_STATUS[r.status] ?? [];
-            const canFlag = r.status !== "maintenance" && r.status !== "occupied" && r.status !== "reserved";
-            // A dirty or clean room can be made bookable in one click.
-            const canMarkReady = r.status === "dirty" || r.status === "clean";
+            // Dirty rooms can be made bookable in one click via Mark
+            // Ready. The intermediate clean/inspected ladder was
+            // removed in migration 0034 — one hop now.
+            const canMarkReady = r.status === "dirty";
             return (
-              <div key={r.id} className="card p-4 flex flex-col gap-3">
+              <div
+                key={r.id}
+                className="card p-4 flex flex-col gap-3 cursor-pointer hover:shadow-md hover:-translate-y-0.5 transition-all"
+                role="button"
+                tabIndex={0}
+                onClick={(e) => {
+                  // The card contains a few action buttons (Mark
+                  // Ready, status transitions, Resolve). If the
+                  // click started on one of those, skip navigation
+                  // — bubbling from a real button means the user
+                  // intended that button's action, not card click.
+                  if ((e.target as HTMLElement).closest("button, a, input, textarea, select")) {
+                    return;
+                  }
+                  navigate(`/rooms/${r.roomNumber}`);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    navigate(`/rooms/${r.roomNumber}`);
+                  }
+                }}
+                title="Open room details + maintenance history"
+              >
                 <div className="flex justify-between items-start">
                   <div>
                     <div className="font-mono text-xl font-bold text-brand-dark leading-none">
@@ -216,46 +240,11 @@ export default function Housekeeping() {
                   <StatusBadge status={r.status} />
                 </div>
 
-                {r.notes && (
-                  <div className="text-xs text-warning bg-warning/5 p-2 rounded border border-warning/20 flex items-start gap-2">
-                    <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
-                    <div className="flex-1 break-words">{r.notes}</div>
-                    <div className="flex items-center gap-1 shrink-0">
-                      <button
-                        className="text-warning/70 hover:text-warning transition-colors"
-                        title="Edit note"
-                        onClick={async () => {
-                          const next = await dialog.prompt({
-                            title: `Edit note · room ${r.roomNumber}`,
-                            message: "Update the issue description.",
-                            placeholder: "e.g. AC not cooling, leaking tap",
-                            okLabel: "Save note",
-                            tone: "warning",
-                            required: true,
-                            multiline: true,
-                            defaultValue: r.notes ?? "",
-                          });
-                          if (next) updateNotes.mutate({ id: r.id, notes: next });
-                        }}
-                      >
-                        <Pencil className="w-3.5 h-3.5" />
-                      </button>
-                      <button
-                        className="text-warning/70 hover:text-danger transition-colors"
-                        title="Clear note"
-                        onClick={async () => {
-                          const ok = await dialog.confirm({
-                            title: `Clear note on room ${r.roomNumber}?`,
-                            message: `"${r.notes}" will be removed.`,
-                            okLabel: "Clear note",
-                            tone: "danger",
-                          });
-                          if (ok) updateNotes.mutate({ id: r.id, notes: null });
-                        }}
-                      >
-                        <X className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
+                {r.openIssueCount > 0 && (
+                  <div className="inline-flex items-center gap-1.5 self-start text-xs font-semibold text-warning bg-warning/10 px-2 py-1 rounded border border-warning/30">
+                    <AlertTriangle className="w-3.5 h-3.5" />
+                    {r.openIssueCount} open issue
+                    {r.openIssueCount === 1 ? "" : "s"}
                   </div>
                 )}
 
@@ -270,47 +259,35 @@ export default function Housekeeping() {
                   </button>
                 )}
 
-                <div className="flex flex-wrap items-center gap-1.5 mt-auto">
-                  {/* Step-by-step transitions, kept as a secondary path for
-                      properties that track cleaning vs inspection separately. */}
-                  {transitions.map((t) => (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {/* Flag — always available except on rooms already
+                      in maintenance status. Opens NewIssueModal so the
+                      reporter records category + severity properly. */}
+                  {r.status !== "maintenance" && (
                     <button
-                      key={t.status}
-                      className="text-xs px-2 py-1 border border-borderc text-brand-dark rounded-sm hover:bg-bg inline-flex items-center gap-1 font-medium"
-                      onClick={() => updateStatus.mutate({ id: r.id, status: t.status })}
-                    >
-                      {t.label}
-                    </button>
-                  ))}
-                  {canFlag && (
-                    <button
-                      className="text-xs px-2 py-1 bg-warning/20 text-[#B45309] rounded-sm hover:bg-warning/30 inline-flex items-center gap-1 font-semibold"
-                      onClick={async () => {
-                        const reason = await dialog.prompt({
-                          title: `Flag room ${r.roomNumber}`,
-                          message: "Describe the issue. Housekeeping will be notified.",
-                          placeholder: "e.g. AC not cooling, leaking tap",
-                          okLabel: "Flag for maintenance",
-                          tone: "warning",
-                          required: true,
-                          multiline: true,
-                        });
-                        if (reason) flagMaint.mutate({ id: r.id, reason });
+                      type="button"
+                      className="w-full text-sm px-3 py-2 bg-[#B45309] text-cream rounded-sm hover:bg-[#92400E] inline-flex items-center justify-center gap-1.5 font-semibold shadow-sm"
+                      onClick={(e) => {
+                        // Stop propagation so the parent card's
+                        // onClick handler doesn't also fire — even
+                        // though it already bails on button targets,
+                        // stopping here removes any ambiguity if a
+                        // future refactor changes the card handler.
+                        e.stopPropagation();
+                        setFlaggingRoom(r);
                       }}
+                      title="Open a maintenance issue for this room"
                     >
-                      <AlertTriangle className="w-3 h-3" /> Flag
+                      <AlertTriangle className="w-4 h-4" /> Flag Issue
                     </button>
                   )}
                   {r.status === "maintenance" && profile?.role === "admin" && (
                     <button
-                      className="text-xs px-2 py-1 bg-success/20 text-success rounded-sm hover:bg-success/30 font-semibold"
+                      className="w-full text-sm px-3 py-2 bg-success text-cream rounded-sm hover:opacity-90 font-semibold inline-flex items-center justify-center gap-1.5 shadow-sm"
                       onClick={() => resolveMaint.mutate(r.id)}
                     >
                       Resolve
                     </button>
-                  )}
-                  {transitions.length === 0 && !canFlag && r.status !== "maintenance" && (
-                    <span className="text-xs text-textSecondary italic">No actions</span>
                   )}
                 </div>
               </div>
@@ -320,6 +297,21 @@ export default function Housekeeping() {
             </section>
           ))}
         </div>
+      )}
+
+      {flaggingRoom && (
+        <NewIssueModal
+          presetRoomId={flaggingRoom.id}
+          onClose={() => setFlaggingRoom(null)}
+          onCreated={(issueId) => {
+            setFlaggingRoom(null);
+            // Refresh the housekeeping list so the new issue's count
+            // bubble appears immediately, then take the user to the
+            // issue's detail page.
+            invalidateRooms();
+            navigate(`/maintenance/${issueId}`);
+          }}
+        />
       )}
     </div>
   );

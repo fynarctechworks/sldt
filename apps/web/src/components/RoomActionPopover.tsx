@@ -5,7 +5,6 @@ import {
   ArrowRight,
   CheckCheck,
   Loader2,
-  Sparkles,
   Undo2,
   Wrench,
   X,
@@ -13,7 +12,7 @@ import {
 import { api, ApiError } from "@/lib/api";
 import { useToast } from "@/components/Toast";
 
-type HkStatus = "dirty" | "clean" | "inspected" | "available" | "maintenance";
+type HkStatus = "dirty" | "available" | "maintenance";
 
 function mutateRoomStatus(old: unknown, roomId: string, next: HkStatus): unknown {
   if (!old || typeof old !== "object") return old;
@@ -45,22 +44,14 @@ function mutateRoomStatus(old: unknown, roomId: string, next: HkStatus): unknown
 // Status pill colour map for the popover header.
 const STATUS_BADGE: Record<HkStatus, string> = {
   dirty: "bg-warning/20 text-[#B45309]",
-  clean: "bg-yellow-100 text-yellow-800",
-  inspected: "bg-success/15 text-success",
   available: "bg-success/15 text-success",
   maintenance: "bg-danger/15 text-danger",
 };
 
-// Picks the icon that best telegraphs what each action does. We map by
-// target state instead of direction so "Mark Ready" gets a checkmark
-// instead of a generic arrow, and only maintenance gets the wrench.
+// Picks the icon that best telegraphs what each action does.
 function iconForTarget(opt: { to: HkStatus; direction: string }) {
   switch (opt.to) {
     case "available":
-      return CheckCheck;
-    case "clean":
-      return Sparkles;
-    case "inspected":
       return CheckCheck;
     case "maintenance":
       return Wrench;
@@ -75,24 +66,15 @@ type TransitionOpt = {
   to: HkStatus;
   label: string;
   direction: "forward" | "reverse" | "side";
-  // Skip the clean→inspected→available chain and make the room bookable now.
-  directReady?: boolean;
 };
 
+// Single-step cleaning workflow (migration 0034). Dirty rooms go
+// straight to available; the intermediate clean / inspected states
+// are gone.
 const TRANSITIONS: Record<HkStatus, TransitionOpt[]> = {
   dirty: [
-    { to: "available", label: "Mark Ready", direction: "forward", directReady: true },
-    { to: "clean", label: "Mark Clean", direction: "side" },
+    { to: "available", label: "Mark Ready", direction: "forward" },
     { to: "maintenance", label: "Send to Maintenance", direction: "side" },
-  ],
-  clean: [
-    { to: "available", label: "Mark Ready", direction: "forward", directReady: true },
-    { to: "inspected", label: "Mark Inspected", direction: "side" },
-    { to: "dirty", label: "Needs Cleaning", direction: "reverse" },
-  ],
-  inspected: [
-    { to: "available", label: "Mark Available", direction: "forward" },
-    { to: "dirty", label: "Needs Cleaning", direction: "reverse" },
   ],
   available: [
     { to: "dirty", label: "Needs Cleaning (turn-down)", direction: "reverse" },
@@ -131,9 +113,9 @@ export function RoomActionPopover({ roomId, roomNumber, status, trigger, onChang
   const { toast } = useToast();
 
   const update = useMutation({
-    mutationFn: (v: { to: HkStatus; directReady?: boolean }) =>
-      api.patch(`/housekeeping/${roomId}`, { status: v.to, directReady: v.directReady }),
-    onMutate: async (v: { to: HkStatus; directReady?: boolean }) => {
+    mutationFn: (v: { to: HkStatus }) =>
+      api.patch(`/housekeeping/${roomId}`, { status: v.to }),
+    onMutate: async (v: { to: HkStatus }) => {
       const keys = invalidateKeys ?? [["dashboard"], ["reservation"]];
       // Cancel any in-flight refetches so they don't overwrite our optimistic update
       await Promise.all(keys.map((k) => qc.cancelQueries({ queryKey: k })));
@@ -293,7 +275,7 @@ export function RoomActionPopover({ roomId, roomNumber, status, trigger, onChang
                 return (
                   <button
                     key={opt.to}
-                    onClick={() => update.mutate({ to: opt.to, directReady: opt.directReady })}
+                    onClick={() => update.mutate({ to: opt.to })}
                     disabled={update.isPending}
                     className={`w-full flex items-center gap-2.5 px-3 py-2 text-sm font-medium rounded-md text-left transition-colors disabled:opacity-50 ${cls}`}
                   >

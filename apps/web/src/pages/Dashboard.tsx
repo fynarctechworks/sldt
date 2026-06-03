@@ -213,8 +213,6 @@ export default function Dashboard() {
           if (floorStats.occupied > 0) chips.push({ label: "Occupied", count: floorStats.occupied, dot: "bg-[#0F3D2E]" });
           if (floorStats.reserved > 0) chips.push({ label: "Reserved", count: floorStats.reserved, dot: "bg-[#B08A4A]" });
           if (floorStats.dirty > 0) chips.push({ label: "Needs Cleaning", count: floorStats.dirty, dot: "bg-[#D9A441]" });
-          if (floorStats.clean > 0) chips.push({ label: "Clean", count: floorStats.clean, dot: "bg-[#5B8BAF]" });
-          if (floorStats.inspected > 0) chips.push({ label: "Inspected", count: floorStats.inspected, dot: "bg-[#3F7D4F]" });
           if (floorStats.maintenance > 0) chips.push({ label: "Maintenance", count: floorStats.maintenance, dot: "bg-[#2A2A2A]" });
 
           return (
@@ -497,10 +495,7 @@ function RoomTile({
   onOpenRoom: () => void;
 }) {
   const isHousekeeping =
-    room.status === "dirty" ||
-    room.status === "clean" ||
-    room.status === "inspected" ||
-    room.status === "maintenance";
+    room.status === "dirty" || room.status === "maintenance";
 
   // Hold window: render both edges so staff sees the lock period at a
   // glance. Same-month windows compress to "02 → 03 Jun"; cross-month
@@ -541,14 +536,20 @@ function RoomTile({
       label: string;
     }
   > = {
+    // Available is the ONLY outlined tile — it's the "blank canvas" /
+    // "ready to sell" state. Every other status is a solid fill with
+    // cream text so it pops against the row of available tiles, and
+    // each status uses a distinct hue so they can't be confused at a
+    // glance.
     available: {
-      card: "bg-success/5 border-success/40 text-success",
+      card: "bg-surface border-success/40 text-success",
       statusText: "text-success",
       statusDot: "bg-success",
       typeText: "text-textSecondary",
       label: "Available",
     },
     occupied: {
+      // Solid brand-dark green — the property's signature "in use" colour.
       card: "bg-brand-dark text-cream border-brand-dark",
       statusText: "text-cream/90",
       statusDot: "bg-cream",
@@ -556,38 +557,31 @@ function RoomTile({
       label: "Occupied",
     },
     reserved: {
-      card: "bg-warning/10 border-warning/50 text-warning",
-      statusText: "text-warning",
-      statusDot: "bg-warning",
-      typeText: "text-warning/80",
+      // Solid brass (#B08A4A) — warm brown, distinct from both
+      // the green hues and the maintenance red.
+      card: "bg-brass text-cream border-brass",
+      statusText: "text-cream/90",
+      statusDot: "bg-cream",
+      typeText: "text-cream/80",
       label: "Reserved",
     },
     dirty: {
-      card: "bg-[#FBEFD9] border-[#B45309]/40 text-[#B45309]",
-      statusText: "text-[#B45309]",
-      statusDot: "bg-[#B45309]",
-      typeText: "text-[#B45309]/80",
+      // Solid amber-brown (#B45309) — the universal "needs attention"
+      // colour, clearly different from reserved-brass.
+      card: "bg-[#B45309] text-cream border-[#B45309]",
+      statusText: "text-cream/90",
+      statusDot: "bg-cream",
+      typeText: "text-cream/80",
       label: "Needs Cleaning",
     },
-    clean: {
-      card: "bg-yellow-50 border-yellow-300 text-yellow-800",
-      statusText: "text-yellow-800",
-      statusDot: "bg-yellow-500",
-      typeText: "text-yellow-800/80",
-      label: "Clean",
-    },
-    inspected: {
-      card: "bg-success/5 border-success/40 text-success",
-      statusText: "text-success",
-      statusDot: "bg-success",
-      typeText: "text-success/80",
-      label: "Inspected",
-    },
     maintenance: {
-      card: "bg-danger/5 border-danger/40 text-danger",
-      statusText: "text-danger",
-      statusDot: "bg-danger",
-      typeText: "text-danger/80",
+      // Solid charcoal-black (#2A2A2A) — "out of service" reads as
+      // unavailable infrastructure, not an emergency. Pairs with the
+      // tape-chart maintenance colour so the two views agree.
+      card: "bg-[#2A2A2A] text-cream border-[#2A2A2A]",
+      statusText: "text-cream/90",
+      statusDot: "bg-cream",
+      typeText: "text-cream/80",
       label: "Maintenance",
     },
   };
@@ -614,31 +608,30 @@ function RoomTile({
           aria-label="Same-day re-let"
         />
       )}
-      <div className="px-3 py-3 flex flex-col items-center gap-1">
-        <span className="font-mono text-2xl font-bold tracking-wide">
+      <div className="px-3 py-3.5 flex flex-col items-center gap-1.5">
+        {/* Room number — largest element, anchors the tile visually. */}
+        <span className="font-mono text-3xl font-bold tracking-wide leading-none">
           {room.room_number}
         </span>
-        {/* Type label — small uppercase strapline so the staff can tell
-            an AC Single from a Luxury without hovering. Sits between
-            the room number and the status pill. Colour follows the
-            tile's status so it stays legible on dark cards too. */}
-        <span className={`text-[9px] uppercase tracking-[0.12em] truncate max-w-full ${style.typeText}`}>
+        {/* Type label — strapline between room number and status pill.
+            Wide tracking + semibold reads cleanly on coloured fills. */}
+        <span className={`text-xs uppercase tracking-wider font-semibold truncate max-w-full ${style.typeText}`}>
           {room.room_type.replace(/_/g, " ")}
         </span>
-        <span className={`inline-flex items-center gap-1.5 text-[10px] uppercase tracking-[0.12em] font-bold ${style.statusText}`}>
-          <span className={`w-1.5 h-1.5 rounded-full ${style.statusDot}`} />
+        <span className={`inline-flex items-center gap-1.5 text-xs uppercase tracking-wider font-bold ${style.statusText}`}>
+          <span className={`w-2 h-2 rounded-full ${style.statusDot}`} />
           {style.label}
         </span>
         {(room.status === "occupied" || room.status === "reserved") &&
           room.guest_name && (
-            <span className="text-[10px] mt-0.5 truncate w-full text-center opacity-80">
+            <span className="text-sm font-semibold mt-0.5 truncate w-full text-center opacity-90">
               {room.guest_name.split(" ")[0]}
             </span>
           )}
       </div>
       {showHoldHint && heldRange && (
-        <div className="flex items-center justify-center gap-1 px-2 py-1 bg-warning text-cream text-[9px] uppercase tracking-wider font-bold">
-          <CalendarClock className="w-2.5 h-2.5" />
+        <div className="flex items-center justify-center gap-1 px-2 py-1 bg-warning text-cream text-[11px] uppercase tracking-wider font-bold">
+          <CalendarClock className="w-3 h-3" />
           Held {heldRange}
         </div>
       )}
@@ -650,7 +643,7 @@ function RoomTile({
       <RoomActionPopover
         roomId={room.id}
         roomNumber={room.room_number}
-        status={room.status as "dirty" | "clean" | "inspected" | "maintenance"}
+        status={room.status as "dirty" | "maintenance"}
         trigger={tile}
       />
     );
@@ -724,8 +717,6 @@ function rollupFloorStats(rooms: RoomGridRow[]) {
     occupied: 0,
     reserved: 0,
     dirty: 0,
-    clean: 0,
-    inspected: 0,
     maintenance: 0,
   };
   for (const r of rooms) {
@@ -735,8 +726,6 @@ function rollupFloorStats(rooms: RoomGridRow[]) {
     else if (r.status === "occupied") s.occupied++;
     else if (r.status === "reserved") s.reserved++;
     else if (r.status === "dirty") s.dirty++;
-    else if (r.status === "clean") s.clean++;
-    else if (r.status === "inspected") s.inspected++;
     else if (r.status === "maintenance") s.maintenance++;
   }
   return s;

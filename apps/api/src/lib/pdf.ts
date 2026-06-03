@@ -1285,7 +1285,14 @@ ${L.showLogo && L.logoUrl ? `<div class="watermark"><img src="${esc(L.logoUrl)}"
   </div>
 
   ${
-    isAdvance && balanceDue > 0.009
+    // Only show the "balance due at check-in" note for pre-bookings —
+    // the guest isn't on premises yet and needs to know to clear the
+    // balance on arrival. For walk-ins the guest is already at the
+    // desk and either pays in full now or signs off at checkout, so
+    // the note is meaningless. Complimentary bookings never bill.
+    isAdvance &&
+    balanceDue > 0.009 &&
+    reservation.bookingSource === "phone_whatsapp"
       ? `<div style="margin-top:10px;padding:8px 10px;border:1px solid #B45309;border-radius:3px;background:#FBEFD9;color:#7C2D12;font-size:10pt;font-weight:600;text-align:center;">
             Note: The remaining balance of ${inr(balanceDue, L.currency)} must be paid on or before check-in.
           </div>`

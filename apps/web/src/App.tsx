@@ -26,6 +26,7 @@ const Credits = lazy(() => import("@/pages/Credits"));
 const Invoices = lazy(() => import("@/pages/Invoices"));
 const Expenses = lazy(() => import("@/pages/Expenses"));
 const ExpenseDetail = lazy(() => import("@/pages/ExpenseDetail"));
+const MaintenanceDetail = lazy(() => import("@/pages/MaintenanceDetail"));
 
 export default function App() {
   return (
@@ -289,6 +290,18 @@ export default function App() {
               <AppShell>
                 <PermissionGuard any={["view_expenses"]}>
                   <ExpenseDetail />
+                </PermissionGuard>
+              </AppShell>
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/maintenance/:id"
+          element={
+            <ProtectedRoute>
+              <AppShell>
+                <PermissionGuard any={["view_maintenance"]}>
+                  <MaintenanceDetail />
                 </PermissionGuard>
               </AppShell>
             </ProtectedRoute>

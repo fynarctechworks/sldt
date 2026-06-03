@@ -338,11 +338,6 @@ function RoomCard({
             </button>
           )}
         </div>
-        {room.notes && (
-          <div className="text-[10px] text-textSecondary italic line-clamp-2 pt-1 border-t border-borderc/60">
-            {room.notes}
-          </div>
-        )}
       </div>
     </div>
   );
@@ -365,7 +360,6 @@ function RoomModal({ room, onClose }: { room: Room | null; onClose: () => void }
     hasAc: room?.hasAc ?? true,
     hasTv: room?.hasTv ?? true,
     hasWifi: room?.hasWifi ?? true,
-    notes: room?.notes ?? "",
   });
   const [err, setErr] = useState<string | null>(null);
 
@@ -546,14 +540,6 @@ function RoomModal({ room, onClose }: { room: Room | null; onClose: () => void }
             />
           </div>
         </div>
-
-        <Field label="Notes">
-          <input
-            className="input"
-            value={form.notes}
-            onChange={(e) => setForm({ ...form, notes: e.target.value })}
-          />
-        </Field>
 
         {err && <div className="text-danger text-xs">{err}</div>}
 

@@ -1,6 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
 import {
-  addDays,
   addMonths,
   eachDayOfInterval,
   endOfMonth,
@@ -12,14 +11,12 @@ import {
   parseISO,
   startOfMonth,
   startOfWeek,
-  subDays,
   subMonths,
 } from "date-fns";
-import { CalendarDays, ChevronLeft, ChevronRight, Gift, LayoutGrid } from "lucide-react";
+import { ChevronLeft, ChevronRight, Gift } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Loader } from "@/components/Loader";
-import { TapeChart, type TapeChartData } from "@/components/TapeChart";
 import { api } from "@/lib/api";
 
 interface CalendarBooking {
@@ -65,31 +62,10 @@ function bookingTouchesDay(b: CalendarBooking, day: Date): boolean {
   return b.checkInDate <= dayStr && b.checkOutDate >= dayStr;
 }
 
-type CalendarView = "month" | "tape";
-// Tape-chart window presets. 14 fits comfortably on a laptop; 30 is the
-// "monthly overview" managers want; 7 is for the front desk's weekly
-// huddle. Stored in URL? No — view choice resets per visit; the user's
-// last cursor sticks via state.
-const TAPE_WINDOWS: { label: string; days: number }[] = [
-  { label: "7", days: 7 },
-  { label: "14", days: 14 },
-  { label: "30", days: 30 },
-];
-
 export default function CalendarPage() {
   const navigate = useNavigate();
-  const [view, setView] = useState<CalendarView>(
-    () => (localStorage.getItem("hd:calendarView") as CalendarView | null) ?? "month",
-  );
-  function changeView(v: CalendarView) {
-    setView(v);
-    localStorage.setItem("hd:calendarView", v);
-  }
-
   const [cursor, setCursor] = useState(() => startOfMonth(new Date()));
   const [selectedDay, setSelectedDay] = useState<Date | null>(new Date());
-  const [tapeAnchor, setTapeAnchor] = useState(() => new Date());
-  const [tapeWindow, setTapeWindow] = useState(14);
 
   const monthParam = format(cursor, "yyyy-MM");
 
@@ -103,19 +79,6 @@ export default function CalendarPage() {
         bookings: CalendarBooking[];
       }>("/calendar", { month: monthParam }),
     refetchInterval: 60_000,
-    enabled: view === "month",
-  });
-
-  // Tape-chart fetch — only when its view is active so we don't burn
-  // a second query in the background.
-  const tapeStart = format(tapeAnchor, "yyyy-MM-dd");
-  const tapeEnd = format(addDays(tapeAnchor, tapeWindow - 1), "yyyy-MM-dd");
-  const tapeQuery = useQuery({
-    queryKey: ["calendar-tape", tapeStart, tapeEnd],
-    queryFn: () =>
-      api.get<TapeChartData>("/calendar/tape", { start: tapeStart, end: tapeEnd }),
-    refetchInterval: 30_000,
-    enabled: view === "tape",
   });
 
   // Wrap in useMemo so the `?? []` fallback returns the SAME array
@@ -161,129 +124,57 @@ export default function CalendarPage() {
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between flex-wrap gap-3">
+      <div className="flex items-start justify-between flex-wrap gap-3">
         <div>
           <h1 className="text-2xl font-bold text-navy">Calendar</h1>
           <div className="text-xs text-textSecondary mt-0.5">
-            {view === "month"
-              ? `${totals.total} booking${totals.total === 1 ? "" : "s"} in ${format(cursor, "MMMM yyyy")}`
-              : `Tape chart · ${tapeStart} → ${tapeEnd}`}
+            {totals.total} booking{totals.total === 1 ? "" : "s"} in {format(cursor, "MMMM yyyy")}
           </div>
         </div>
-        <div className="flex items-center gap-2">
-          {/* View toggle. Persisted to localStorage so each user sticks
-              with their preferred default. */}
-          <div className="inline-flex rounded-sm border border-borderc overflow-hidden">
+        <div className="flex items-center gap-2 flex-wrap justify-end">
+          {/* Prev / Today / Next as a single segmented pill. */}
+          <div className="inline-flex rounded-md border border-borderc overflow-hidden shadow-sm">
             <button
-              onClick={() => changeView("month")}
-              className={`px-3 py-2 text-sm flex items-center gap-1.5 ${view === "month" ? "bg-brand-dark text-cream" : "bg-surface hover:bg-bg"}`}
-              title="Month grid"
+              onClick={() => setCursor((c) => subMonths(c, 1))}
+              className="px-2 py-2 bg-surface text-textSecondary hover:bg-bg hover:text-brand-dark transition-colors"
+              aria-label="Previous month"
+              title="Previous month"
             >
-              <CalendarDays className="w-4 h-4" /> Month
+              <ChevronLeft className="w-4 h-4" />
             </button>
             <button
-              onClick={() => changeView("tape")}
-              className={`px-3 py-2 text-sm flex items-center gap-1.5 border-l border-borderc ${view === "tape" ? "bg-brand-dark text-cream" : "bg-surface hover:bg-bg"}`}
-              title="Tape chart (rooms x dates)"
+              onClick={() => {
+                const today = new Date();
+                setCursor(startOfMonth(today));
+                setSelectedDay(today);
+              }}
+              className="px-3 py-2 text-sm font-medium border-l border-r border-borderc bg-surface text-brand-dark hover:bg-bg transition-colors"
             >
-              <LayoutGrid className="w-4 h-4" /> Tape
+              Today
+            </button>
+            <button
+              onClick={() => setCursor((c) => addMonths(c, 1))}
+              className="px-2 py-2 bg-surface text-textSecondary hover:bg-bg hover:text-brand-dark transition-colors"
+              aria-label="Next month"
+              title="Next month"
+            >
+              <ChevronRight className="w-4 h-4" />
             </button>
           </div>
-
-          {view === "month" ? (
-            <>
-              <button
-                onClick={() => setCursor((c) => subMonths(c, 1))}
-                className="p-2 rounded-sm border border-borderc bg-surface hover:bg-bg"
-                aria-label="Previous month"
-                title="Previous month"
-              >
-                <ChevronLeft className="w-4 h-4" />
-              </button>
-              <button
-                onClick={() => {
-                  const today = new Date();
-                  setCursor(startOfMonth(today));
-                  setSelectedDay(today);
-                }}
-                className="px-3 py-2 text-sm font-medium rounded-sm border border-borderc bg-surface hover:bg-bg"
-              >
-                Today
-              </button>
-              <button
-                onClick={() => setCursor((c) => addMonths(c, 1))}
-                className="p-2 rounded-sm border border-borderc bg-surface hover:bg-bg"
-                aria-label="Next month"
-                title="Next month"
-              >
-                <ChevronRight className="w-4 h-4" />
-              </button>
-              <input
-                type="month"
-                className="input !h-9 text-sm"
-                value={monthParam}
-                onChange={(e) => {
-                  if (!e.target.value) return;
-                  setCursor(parseISO(`${e.target.value}-01`));
-                }}
-              />
-            </>
-          ) : (
-            <>
-              <button
-                onClick={() => setTapeAnchor((d) => subDays(d, tapeWindow))}
-                className="p-2 rounded-sm border border-borderc bg-surface hover:bg-bg"
-                aria-label="Previous window"
-                title={`Back ${tapeWindow} days`}
-              >
-                <ChevronLeft className="w-4 h-4" />
-              </button>
-              <button
-                onClick={() => setTapeAnchor(new Date())}
-                className="px-3 py-2 text-sm font-medium rounded-sm border border-borderc bg-surface hover:bg-bg"
-              >
-                Today
-              </button>
-              <button
-                onClick={() => setTapeAnchor((d) => addDays(d, tapeWindow))}
-                className="p-2 rounded-sm border border-borderc bg-surface hover:bg-bg"
-                aria-label="Next window"
-                title={`Forward ${tapeWindow} days`}
-              >
-                <ChevronRight className="w-4 h-4" />
-              </button>
-              <div className="inline-flex rounded-sm border border-borderc overflow-hidden text-xs">
-                {TAPE_WINDOWS.map((w) => (
-                  <button
-                    key={w.days}
-                    onClick={() => setTapeWindow(w.days)}
-                    className={`px-2.5 py-2 ${tapeWindow === w.days ? "bg-brand-dark text-cream" : "bg-surface hover:bg-bg"} ${w.days !== TAPE_WINDOWS[0]!.days ? "border-l border-borderc" : ""}`}
-                  >
-                    {w.label}d
-                  </button>
-                ))}
-              </div>
-            </>
-          )}
+          {/* Month picker — same height/border/shadow as the nav pill so
+              the two controls visually pair up. */}
+          <input
+            type="month"
+            className="h-[38px] px-3 text-sm rounded-md border border-borderc bg-surface text-brand-dark shadow-sm cursor-pointer hover:bg-bg focus:outline-none focus:ring-2 focus:ring-brand-dark/30"
+            value={monthParam}
+            onChange={(e) => {
+              if (!e.target.value) return;
+              setCursor(parseISO(`${e.target.value}-01`));
+            }}
+            aria-label="Jump to month"
+          />
         </div>
       </div>
-
-      {/* Tape-chart view branch. Keeping it inline (not a sub-component)
-          so the toolbar above can swap controls without prop drilling. */}
-      {view === "tape" && (
-        <>
-          {tapeQuery.isLoading ? (
-            <Loader label="Loading tape chart…" />
-          ) : tapeQuery.data ? (
-            <TapeChart data={tapeQuery.data} />
-          ) : (
-            <div className="card text-sm text-textSecondary">Tape chart unavailable.</div>
-          )}
-        </>
-      )}
-
-      {view === "month" && (
-      <>
       <div className="flex flex-wrap items-center gap-3 text-[11px]">
         {(["confirmed", "checked_in", "checked_out", "cancelled", "no_show"] as const).map((s) => (
           <span key={s} className="inline-flex items-center gap-1.5">
@@ -433,9 +324,6 @@ export default function CalendarPage() {
             </ul>
           )}
         </div>
-      )}
-      {/* end view === "month" */}
-      </>
       )}
     </div>
   );

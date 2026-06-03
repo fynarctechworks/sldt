@@ -7,8 +7,6 @@ const STYLES: Record<RoomStatus, string> = {
   reserved: "bg-warning/15 text-warning",
   dirty: "bg-warning/20 text-[#B45309]",
   maintenance: "bg-danger/15 text-danger",
-  clean: "bg-yellow-100 text-yellow-800",
-  inspected: "bg-success/15 text-success",
 };
 
 // Display labels — keeps the DB enum stable while letting the UI use

@@ -16,3 +16,4 @@ export * from "./idempotencyKeys.js";
 export * from "./amenities.js";
 export * from "./properties.js";
 export * from "./expenses.js";
+export * from "./maintenance.js";
