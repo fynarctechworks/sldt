@@ -21,10 +21,12 @@
 // so the recompute runs against the same snapshot as the payment write
 // it follows.
 
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { invoices, payments } from "../db/schema/invoices.js";
 import { reservations } from "../db/schema/reservations.js";
+import { rooms } from "../db/schema/rooms.js";
+import { generateReceiptNumber } from "./receipt.js";
 
 type Tx = typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0];
 
@@ -151,20 +153,231 @@ export async function recomputeInvoiceTotals(
 // totals and reservation balance. Used at invoice-issue time so an
 // advance collected before the invoice existed (the "Collected at
 // check-out of SLDT-RES-XXXX" flow) lands on the right ledger.
+// Distributes any orphan (invoice_id = NULL) payments on a reservation
+// across its invoices proportionally to each invoice's remaining
+// balance. Used at end-of-checkout to land the booking-time advance
+// against the right invoices.
+//
+// Why proportional, not "all on one":
+// In multi-room checkouts each room gets its own invoice. The advance
+// taken at booking time is for the whole stay, so dumping it on a
+// single invoice (the old behaviour) made INV-0001 look overpaid and
+// INV-0002 look short by the advance amount — even though the
+// reservation total was correct. Proportional split means each invoice
+// reflects what it's actually owed.
+//
+// The fallback parameter is the legacy "all-on-one" target. Kept so
+// the combined-invoice path (single invoice in the reservation) still
+// works trivially — the proportional logic collapses to 100% on that
+// one invoice — and so single-invoice reservations with stray
+// reservation-level payments (refunds, manual entries) still have a
+// concrete attach point.
 export async function attachOrphanPaymentsAndRecompute(
   tx: Tx,
   reservationId: string,
-  attachToInvoiceId: string,
+  fallbackInvoiceId: string,
 ): Promise<void> {
-  await tx
-    .update(payments)
-    .set({ invoiceId: attachToInvoiceId })
+  // 1. Pull every orphan payment for this reservation, in deterministic
+  //    order (oldest first) so the distribution is repeatable. Notes
+  //    come along so we can read a "Room NNN" hint where present.
+  //    Method + propertyId + receivedBy are needed when we split a
+  //    payment across invoices (one row can't straddle two invoices).
+  const orphans = await tx
+    .select({
+      id: payments.id,
+      amount: payments.amount,
+      notes: payments.notes,
+      receiptNumber: payments.receiptNumber,
+      paymentMethod: payments.paymentMethod,
+      propertyId: payments.propertyId,
+      receivedBy: payments.receivedBy,
+      paymentDate: payments.paymentDate,
+    })
+    .from(payments)
     .where(
       and(
         eq(payments.reservationId, reservationId),
         sql`${payments.invoiceId} IS NULL`,
+        eq(payments.voided, false),
       ),
+    )
+    .orderBy(payments.createdAt);
+
+  if (orphans.length === 0) {
+    await recomputeInvoiceTotals(tx, reservationId);
+    await recomputeReservationBalance(tx, reservationId);
+    return;
+  }
+
+  // 2. Snapshot each invoice's owed amount (grand total minus what's
+  //    already attached). Voided invoices are excluded. We work on a
+  //    local copy so we can drain it as we allocate.
+  const invs = await tx
+    .select({
+      id: invoices.id,
+      grandTotal: invoices.grandTotal,
+      walletCreditApplied: invoices.walletCreditApplied,
+      scopeRoomIds: invoices.scopeRoomIds,
+    })
+    .from(invoices)
+    .where(
+      and(
+        eq(invoices.reservationId, reservationId),
+        sql`${invoices.status} <> 'voided'`,
+      ),
+    )
+    .orderBy(invoices.createdAt);
+
+  // Map "201" → invoice UUID so receipt notes that name a room can
+  // route there directly. Built from invoices.scope_room_ids ⨯ rooms.
+  const roomNumberToInvoice = new Map<string, string>();
+  const allRoomIds = invs.flatMap((i) => i.scopeRoomIds ?? []);
+  if (allRoomIds.length > 0) {
+    const roomRows = await tx
+      .select({ id: rooms.id, roomNumber: rooms.roomNumber })
+      .from(rooms)
+      .where(inArray(rooms.id, allRoomIds));
+    const roomNumberById = new Map(roomRows.map((r) => [r.id, r.roomNumber]));
+    for (const inv of invs) {
+      for (const rid of inv.scopeRoomIds ?? []) {
+        const num = roomNumberById.get(rid);
+        if (num) roomNumberToInvoice.set(num, inv.id);
+      }
+    }
+  }
+
+  const owedByInv = new Map<string, number>();
+  for (const inv of invs) {
+    const [attached] = await tx
+      .select({
+        total: sql<string>`COALESCE(SUM(${payments.amount}), 0)::text`,
+      })
+      .from(payments)
+      .where(
+        and(
+          eq(payments.invoiceId, inv.id),
+          eq(payments.voided, false),
+          eq(payments.status, "received"),
+        ),
+      );
+    const owed = Math.max(
+      0,
+      Number(inv.grandTotal) -
+        Number(inv.walletCreditApplied ?? 0) -
+        Number(attached?.total ?? 0),
     );
+    owedByInv.set(inv.id, +owed.toFixed(2));
+  }
+
+  // 3. Walk orphan payments oldest-first and allocate each across the
+  //    invoices that need money. A single payment row can't span
+  //    multiple invoices (the FK is on the row), so when a payment is
+  //    larger than the first targeted invoice's need we SPLIT it:
+  //    reduce the original row to the invoice's need and insert one
+  //    new payment row per spill-over slice. Each new row carries a
+  //    fresh receipt number and a note linking back to the original.
+  //    The reservation-level sum is preserved exactly.
+  for (const op of orphans) {
+    const remaining = Number(op.amount);
+    if (remaining <= 0.009) {
+      // Zero-value receipt (e.g. "Booking — no advance collected"). Park
+      // it on the fallback invoice so it's not left orphaned.
+      await tx
+        .update(payments)
+        .set({ invoiceId: fallbackInvoiceId })
+        .where(eq(payments.id, op.id));
+      continue;
+    }
+
+    // Build the allocation plan first (no writes), so we know how many
+    // parts the payment will end up as before we touch any row.
+    const plan: { invoiceId: string; amount: number }[] = [];
+    let toPlace = remaining;
+
+    // Preferred first hop: the invoice whose room number appears in
+    // the receipt notes. Keeps "Per-room share of check-out collection
+    // (Room 202)" landing on Room 202's invoice.
+    const hint = op.notes?.match(/Room (\d+)/i);
+    if (hint) {
+      const hintedInvId = roomNumberToInvoice.get(hint[1]!);
+      const owed = hintedInvId ? owedByInv.get(hintedInvId) ?? 0 : 0;
+      if (hintedInvId && owed > 0.009) {
+        const consumed = Math.min(toPlace, owed);
+        plan.push({ invoiceId: hintedInvId, amount: consumed });
+        owedByInv.set(hintedInvId, +(owed - consumed).toFixed(2));
+        toPlace = +(toPlace - consumed).toFixed(2);
+      }
+    }
+    // Greedy fill of remaining invoices in creation order.
+    for (const [invId, owed] of owedByInv) {
+      if (toPlace <= 0.009) break;
+      if (owed <= 0.009) continue;
+      const consumed = Math.min(toPlace, owed);
+      plan.push({ invoiceId: invId, amount: consumed });
+      owedByInv.set(invId, +(owed - consumed).toFixed(2));
+      toPlace = +(toPlace - consumed).toFixed(2);
+    }
+    // Anything left over after every invoice is satisfied is an
+    // over-payment. Park it on the fallback so the row keeps a home —
+    // recomputeInvoiceTotals will clamp the invoice balance at 0 and
+    // expose the surplus via the reservation's advance_paid > grand_total.
+    if (toPlace > 0.009) {
+      plan.push({ invoiceId: fallbackInvoiceId, amount: toPlace });
+      toPlace = 0;
+    }
+
+    if (plan.length === 0) {
+      // Defensive: no invoices at all. Park on fallback.
+      await tx
+        .update(payments)
+        .set({ invoiceId: fallbackInvoiceId })
+        .where(eq(payments.id, op.id));
+      continue;
+    }
+
+    // Apply the plan. The first slice updates the original row in
+    // place (preserving its receipt number, created_at, etc.). Each
+    // additional slice is a NEW payment row with a fresh receipt
+    // number and a note pointing back to the original receipt.
+    const total = plan.length;
+    const first = plan[0]!;
+    const baseNote = op.notes ?? "";
+    const firstNote =
+      total === 1
+        ? op.notes
+        : baseNote
+          ? `${baseNote} · part 1/${total}`
+          : `Part 1/${total}`;
+    await tx
+      .update(payments)
+      .set({
+        invoiceId: first.invoiceId,
+        amount: String(first.amount.toFixed(2)),
+        notes: firstNote,
+      })
+      .where(eq(payments.id, op.id));
+
+    for (let i = 1; i < plan.length; i++) {
+      const slice = plan[i]!;
+      const rcpNum = await generateReceiptNumber(tx);
+      const splitNote = baseNote
+        ? `${baseNote} · part ${i + 1}/${total} (split from ${op.receiptNumber})`
+        : `Part ${i + 1}/${total} (split from ${op.receiptNumber})`;
+      await tx.insert(payments).values({
+        receiptNumber: rcpNum,
+        propertyId: op.propertyId,
+        invoiceId: slice.invoiceId,
+        reservationId,
+        amount: String(slice.amount.toFixed(2)),
+        paymentMethod: op.paymentMethod,
+        status: "received",
+        receivedBy: op.receivedBy,
+        paymentDate: op.paymentDate,
+        notes: splitNote,
+      });
+    }
+  }
+
   await recomputeInvoiceTotals(tx, reservationId);
   await recomputeReservationBalance(tx, reservationId);
 }

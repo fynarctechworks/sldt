@@ -22,7 +22,7 @@ import {
   Trash2,
   XCircle,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { CheckInReceiptModal, type CheckInReceiptData } from "@/components/CheckInReceiptModal";
 import { EarlyCheckInModal } from "@/components/EarlyCheckInModal";
@@ -129,6 +129,36 @@ interface Detail {
     effectiveTo?: string | null;
     swapId?: string | null;
     swapReason?: string | null;
+    // 0037 — chain of every in-place swap hop on this row,
+    // oldest-first. The UI renders one virtual closed-leg row per
+    // entry above the active row. Empty for unswapped rows; one
+    // entry for single swaps; N for chains like 202 -> 201 -> 301.
+    swapHistory?: {
+      id: string;
+      fromRoom: {
+        id: string;
+        roomNumber: string;
+        roomType: string;
+        displayType: string;
+        hasAc: boolean;
+        hasTv: boolean;
+        hasWifi: boolean;
+      } | null;
+      toRoomNumber: string | null;
+      reason: string;
+      ratePerNight: string;
+      createdAt: string;
+    }[];
+    // 0036 backwards-compat field — most recent hop.
+    swappedFromRoom?: {
+      id: string;
+      roomNumber: string;
+      roomType: string;
+      displayType: string;
+      hasAc: boolean;
+      hasTv: boolean;
+      hasWifi: boolean;
+    } | null;
     // Same-day re-let pending: a walk-in is currently in this room
     // and due to check out before this reservation's check-in date.
     reletPending?: {
@@ -877,27 +907,50 @@ export default function ReservationDetail() {
                   }
                 }
               }
+              // 0037: full in-place swap chain. For a chain like
+              // 202 -> 201 -> 301 we render two closed-leg rows above
+              // the active 301 row, each showing where that hop went
+              // next. Segmented swaps already have real sibling rows
+              // in `rooms`, so we skip the virtual rows in that case.
+              const virtualHistory =
+                !swapSiblingNumber && (room.swapHistory ?? []).length > 0
+                  ? room.swapHistory ?? []
+                  : [];
               return (
-                <RoomRow
-                  key={room.id}
-                  reservationId={r.id}
-                  room={room}
-                  reservationCheckIn={r.checkInDate}
-                  reservationCheckOut={r.checkOutDate}
-                  isShortStay={r.stayType === "short_stay"}
-                  isSingleNight={r.stayType !== "short_stay" && nights <= 1}
-                  nights={nights}
-                  swapSiblingNumber={swapSiblingNumber}
-                  swapDirection={swapDirection}
-                  onSaved={invalidate}
-                  onInvoiceIssuedNeedsPayment={(inv) =>
-                    setPostIssuePay({
-                      invoiceId: inv.id,
-                      invoiceNumber: inv.invoiceNumber,
-                      balanceDue: inv.balanceDue,
-                    })
-                  }
-                />
+                <Fragment key={room.id}>
+                  {virtualHistory.map((hop) =>
+                    hop.fromRoom ? (
+                      <SwapClosedLegRow
+                        key={hop.id}
+                        fromRoom={hop.fromRoom}
+                        toRoomNumber={hop.toRoomNumber ?? room.roomNumber}
+                        reason={hop.reason}
+                        reservationCheckIn={r.checkInDate}
+                        reservationCheckOut={r.checkOutDate}
+                        nights={nights}
+                      />
+                    ) : null,
+                  )}
+                  <RoomRow
+                    reservationId={r.id}
+                    room={room}
+                    reservationCheckIn={r.checkInDate}
+                    reservationCheckOut={r.checkOutDate}
+                    isShortStay={r.stayType === "short_stay"}
+                    isSingleNight={r.stayType !== "short_stay" && nights <= 1}
+                    nights={nights}
+                    swapSiblingNumber={swapSiblingNumber}
+                    swapDirection={swapDirection}
+                    onSaved={invalidate}
+                    onInvoiceIssuedNeedsPayment={(inv) =>
+                      setPostIssuePay({
+                        invoiceId: inv.id,
+                        invoiceNumber: inv.invoiceNumber,
+                        balanceDue: inv.balanceDue,
+                      })
+                    }
+                  />
+                </Fragment>
               );
             })}
           </tbody>
@@ -1070,12 +1123,12 @@ export default function ReservationDetail() {
               </tr>
             </thead>
             <tbody>
-              {payments.map((p) => (
+              {collapsePaymentsForDisplay(payments).map((row) => (
                 <PaymentRow
-                  key={p.id}
-                  payment={p}
+                  key={row.id}
+                  payment={row}
                   onSaved={invalidate}
-                  onPrintReceipt={() => previewReceipt(p.id, p.receiptNumber)}
+                  onPrintReceipt={() => previewReceipt(row.id, row.receiptNumber)}
                 />
               ))}
             </tbody>
@@ -1479,6 +1532,165 @@ export default function ReservationDetail() {
   );
 }
 
+// Group split-receipt slices for display only.
+//
+// Why: multi-room bookings produce one "per-room share" receipt per
+// invoice plus optional spillover splits from a single advance. To
+// staff/guests that reads as "five receipts for one payment" — very
+// confusing. The DB intentionally keeps the slices distinct (each
+// row attaches to a single invoice) but the Payment History UI
+// should present the original collection event as ONE row.
+//
+// Grouping key: minute-truncated payment_date + method + a "family"
+// label derived from the note. All slices created in the same
+// transaction share these. Voided rows and one-off rows (no family
+// label) pass through untouched.
+type RawPayment = {
+  id: string;
+  amount: string;
+  paymentMethod: string;
+  status?: string;
+  paymentDate: string;
+  notes: string | null;
+  receiptNumber: string | null;
+  voided?: boolean;
+  createdAt: string;
+};
+
+function paymentFamilyLabel(notes: string | null): string | null {
+  if (!notes) return null;
+  const trimmed = notes.trim();
+  if (trimmed.startsWith("Advance at booking")) return "Advance at booking";
+  if (trimmed.startsWith("Advance at check-in")) return "Advance at check-in";
+  if (trimmed.startsWith("Per-room share of check-out collection")) {
+    return "Collected at check-out";
+  }
+  if (trimmed.startsWith("Collected at check-out of")) {
+    // Cross-reservation collection — strip the "(Room X)" suffix and
+    // the " · part Y/Z" trailer so siblings collapse.
+    return trimmed.replace(/\s*·\s*part \d+\/\d+.*$/, "").replace(/\s*\(Room [^)]+\)/, "");
+  }
+  if (trimmed.startsWith("Booking — no advance collected")) {
+    return "Booking — no advance collected";
+  }
+  return null;
+}
+
+function collapsePaymentsForDisplay(raws: RawPayment[]): RawPayment[] {
+  const out: RawPayment[] = [];
+  // groupKey -> index into out
+  const groupIdx = new Map<string, number>();
+  for (const p of raws) {
+    const family = paymentFamilyLabel(p.notes);
+    // Voided rows + pending rows + rows without a recognised family
+    // are passed through one-to-one so void actions / "mark received"
+    // buttons keep working on the right underlying row.
+    if (p.voided || p.status === "pending" || !family) {
+      out.push(p);
+      continue;
+    }
+    // Truncate to the minute so micro-second differences between
+    // sibling inserts in the same transaction still collapse.
+    const minute = p.paymentDate.slice(0, 16);
+    const key = `${family}|${minute}|${p.paymentMethod}`;
+    const existingIdx = groupIdx.get(key);
+    if (existingIdx === undefined) {
+      // First slice of this group. Drive the displayed row from this
+      // payment but replace the noisy notes with the clean family
+      // label.
+      out.push({ ...p, notes: family });
+      groupIdx.set(key, out.length - 1);
+    } else {
+      // Subsequent slice: sum into the displayed row's amount. Drop
+      // the receipt number on the merged row because it now represents
+      // multiple receipts — clicking "Preview" still opens the first
+      // slice's PDF, which is the original receipt.
+      const head = out[existingIdx]!;
+      const merged = +(Number(head.amount) + Number(p.amount)).toFixed(2);
+      out[existingIdx] = { ...head, amount: String(merged) };
+    }
+  }
+  return out;
+}
+
+// Virtual closed-leg row for in-place swaps. The DB doesn't keep a
+// separate row for the original room on a 1-night or day-use swap
+// (the row is re-pointed in place), so this is purely display: a
+// read-only summary that mirrors how segmented swaps look in the UI.
+// No action buttons because there's no underlying reservation_rooms
+// row to act on.
+function SwapClosedLegRow(props: {
+  fromRoom: {
+    roomNumber: string;
+    displayType: string;
+    hasAc: boolean;
+    hasTv: boolean;
+    hasWifi: boolean;
+  };
+  toRoomNumber: string;
+  reason: string | null;
+  reservationCheckIn: string;
+  reservationCheckOut: string;
+  nights: number;
+}) {
+  const segLabel =
+    props.nights === 0
+      ? "Same-day swap"
+      : `${format(new Date(props.reservationCheckIn), "dd MMM")} → ${format(
+          new Date(props.reservationCheckIn),
+          "dd MMM",
+        )} · 0n`;
+  const hasAnyAmenity =
+    props.fromRoom.hasAc || props.fromRoom.hasTv || props.fromRoom.hasWifi;
+  return (
+    <tr className="bg-bg/40">
+      <td className="font-mono">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-textSecondary">{props.fromRoom.roomNumber}</span>
+        </div>
+        <div className="mt-1 flex items-center gap-1.5 flex-wrap">
+          <span className="text-[9px] uppercase tracking-wide font-semibold px-1.5 py-0.5 rounded border bg-textSecondary/10 text-textSecondary border-textSecondary/30">
+            Swapped to Room {props.toRoomNumber}
+          </span>
+          <span className="text-[11px] text-textSecondary font-mono">{segLabel}</span>
+          {props.reason && (
+            <span className="text-[11px] text-textSecondary italic">
+              · {props.reason}
+            </span>
+          )}
+        </div>
+        {hasAnyAmenity && (
+          <div className="flex flex-wrap gap-1 mt-1 opacity-60">
+            {props.fromRoom.hasAc && (
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-sm text-[10px] font-semibold bg-accentBlue/15 text-accentBlue">
+                <Snowflake className="w-2.5 h-2.5" /> AC
+              </span>
+            )}
+            {props.fromRoom.hasTv && (
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-sm text-[10px] font-semibold bg-gray-200 text-textSecondary">
+                <Tv className="w-2.5 h-2.5" /> TV
+              </span>
+            )}
+            {props.fromRoom.hasWifi && (
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-sm text-[10px] font-semibold bg-gray-200 text-textSecondary">
+                <Wifi className="w-2.5 h-2.5" /> Wi-Fi
+              </span>
+            )}
+          </div>
+        )}
+      </td>
+      <td className="capitalize text-textSecondary">{props.fromRoom.displayType}</td>
+      <td className="font-mono tabular-nums text-textSecondary">—</td>
+      <td className="font-mono tabular-nums text-textSecondary">—</td>
+      <td className="text-right">
+        <span className="text-[10px] uppercase tracking-wider font-semibold px-2 py-0.5 rounded-sm bg-textSecondary/10 text-textSecondary">
+          closed
+        </span>
+      </td>
+    </tr>
+  );
+}
+
 function RoomRow(props: {
   reservationId: string;
   room: {
@@ -1505,6 +1717,33 @@ function RoomRow(props: {
     effectiveTo?: string | null;
     swapId?: string | null;
     swapReason?: string | null;
+    // 0037 — full in-place swap chain.
+    swapHistory?: {
+      id: string;
+      fromRoom: {
+        id: string;
+        roomNumber: string;
+        roomType: string;
+        displayType: string;
+        hasAc: boolean;
+        hasTv: boolean;
+        hasWifi: boolean;
+      } | null;
+      toRoomNumber: string | null;
+      reason: string;
+      ratePerNight: string;
+      createdAt: string;
+    }[];
+    // 0036 backwards-compat.
+    swappedFromRoom?: {
+      id: string;
+      roomNumber: string;
+      roomType: string;
+      displayType: string;
+      hasAc: boolean;
+      hasTv: boolean;
+      hasWifi: boolean;
+    } | null;
     // Same-day re-let pending (server-computed). Surface a banner so
     // staff knows a walk-in is in the room right now.
     reletPending?: {
@@ -1689,6 +1928,34 @@ function RoomRow(props: {
             )}
           </div>
         )}
+        {/* In-place swap audit. Shows on the active row of an in-place
+            swap chain (no real segmented siblings exist for these).
+            Prefers the new history table (0037) so multi-hop chains
+            show the immediately-prior room; falls back to the legacy
+            single-slot field (0036) when no history is present. */}
+        {(() => {
+          if (isSegmented) return null;
+          const lastHop =
+            props.room.swapHistory && props.room.swapHistory.length > 0
+              ? props.room.swapHistory[props.room.swapHistory.length - 1]
+              : null;
+          const prevRoomNumber =
+            lastHop?.fromRoom?.roomNumber ??
+            props.room.swappedFromRoom?.roomNumber ??
+            null;
+          if (!prevRoomNumber) return null;
+          // Reason describes what happened to the LEAVING room
+          // ("Maintenance"), so it belongs only on the closed leg.
+          // Showing it on the active row read as if the active room
+          // itself were under maintenance — confusing for staff.
+          return (
+            <div className="mt-1 flex items-center gap-1.5 flex-wrap">
+              <span className="text-[9px] uppercase tracking-wide font-semibold px-1.5 py-0.5 rounded border bg-accentBlue/10 text-accentBlue border-accentBlue/30">
+                Swapped from Room {prevRoomNumber}
+              </span>
+            </div>
+          );
+        })()}
         {/* Segment timeline (0019). Shows the swap direction so staff
             instantly read the row's role — "Swapped TO Room 205" on
             the closed leg, "Swapped FROM Room 203" on the active leg.
@@ -1942,6 +2209,11 @@ function SwapRoomModal(props: {
   const [markOldRoomStatus, setMarkOldRoomStatus] = useState<
     "maintenance" | "dirty" | "available"
   >("maintenance");
+  // Rate override. Defaults to the target room's base rate the moment
+  // a room is picked; staff can edit it (e.g. "honour the original
+  // rate" or "renegotiate due to category bump"). Empty string means
+  // "use the existing rate from the closed segment — send no override".
+  const [rateOverride, setRateOverride] = useState<string>("");
   const [err, setErr] = useState<string | null>(null);
 
   // Availability probe window:
@@ -1978,8 +2250,13 @@ function SwapRoomModal(props: {
   });
 
   const swap = useMutation({
-    mutationFn: () =>
-      api.post(`/reservations/${props.reservationId}/swap-room-segment`, {
+    mutationFn: () => {
+      const parsedRate = rateOverride.trim() === "" ? null : Number(rateOverride);
+      const includeNewRate =
+        parsedRate !== null &&
+        Number.isFinite(parsedRate) &&
+        parsedRate >= 0;
+      return api.post(`/reservations/${props.reservationId}/swap-room-segment`, {
         fromReservationRoomId: props.fromReservationRoomId,
         toRoomId,
         // effectiveDate is only meaningful when we're creating a new
@@ -1988,7 +2265,11 @@ function SwapRoomModal(props: {
         ...(props.inPlace ? {} : { effectiveDate }),
         reason,
         markOldRoomStatus,
-      }),
+        // Only send newRate when staff filled something in. Empty
+        // field = preserve the existing rate (legacy behaviour).
+        ...(includeNewRate ? { newRate: parsedRate } : {}),
+      });
+    },
     onSuccess: props.onDone,
     onError: (e: Error) => setErr(e.message),
   });
@@ -2027,7 +2308,8 @@ function SwapRoomModal(props: {
           {props.isShortStay ? (
             <>
               Day-use guest in room <strong>{props.fromRoomNumber}</strong>.
-              Pick the new room. Charges, GST and the duration are not affected.
+              Pick the new room. The rate auto-fills to the new room's base
+              rate — edit it if needed.
             </>
           ) : props.inPlace ? (
             <>
@@ -2035,7 +2317,8 @@ function SwapRoomModal(props: {
               <strong>1 night</strong> (
               {format(new Date(props.segmentFrom), "dd MMM")} →{" "}
               {format(new Date(props.segmentTo), "dd MMM")}). Pick the new
-              room. Rate, GST and the invoice are not affected.
+              room. The rate auto-fills to the new room's base rate — edit
+              it if needed.
             </>
           ) : (
             <>
@@ -2043,8 +2326,8 @@ function SwapRoomModal(props: {
               from{" "}
               <strong>{format(new Date(props.segmentFrom), "dd MMM")}</strong>{" "}
               to <strong>{format(new Date(props.segmentTo), "dd MMM")}</strong>.
-              Pick the date the guest moves and the new room. Rate, GST,
-              advance and the invoice are not affected.
+              Pick the date the guest moves and the new room. The rate
+              auto-fills to the new room's base rate — edit it if needed.
             </>
           )}
         </div>
@@ -2145,7 +2428,14 @@ function SwapRoomModal(props: {
                     <button
                       key={rm.id}
                       type="button"
-                      onClick={() => setToRoomId(rm.id)}
+                      onClick={() => {
+                        setToRoomId(rm.id);
+                        // Auto-fill the rate with the new room's base
+                        // rate so the most common case (use the listed
+                        // rate) is one click. Staff can edit before
+                        // confirming.
+                        setRateOverride(String(Number(rm.baseRate).toFixed(0)));
+                      }}
                       className={`p-2.5 rounded-sm border-2 text-left transition-colors ${
                         active
                           ? "border-brand-dark bg-brand-soft"
@@ -2158,6 +2448,9 @@ function SwapRoomModal(props: {
                       <div className="text-[11px] text-textSecondary capitalize truncate">
                         {rm.roomType}
                       </div>
+                      <div className="text-[11px] text-textSecondary font-mono mt-0.5">
+                        ₹{Number(rm.baseRate).toFixed(0)}/n
+                      </div>
                     </button>
                   );
                 })}
@@ -2165,6 +2458,58 @@ function SwapRoomModal(props: {
             </div>
           ))}
         </div>
+
+        {/* Rate per room — mirrors AddRoomModal's layout. Auto-fills
+            to the new room's base rate the moment one is picked.
+            Staff can override; submitting with an empty field keeps
+            the existing rate (legacy behaviour). */}
+        {toRoomId && (() => {
+          const picked = avail.data?.find((rm) => rm.id === toRoomId);
+          if (!picked) return null;
+          const rate = Number(rateOverride || 0);
+          const lineTotal = remainingNights > 0 ? rate * remainingNights : 0;
+          return (
+            <div className="border border-borderc rounded p-3 bg-bg/40 space-y-2">
+              <div className="text-xs font-semibold uppercase tracking-wider text-textSecondary">
+                Rate per room
+              </div>
+              <div className="flex items-center gap-3">
+                <div className="flex-1 min-w-0">
+                  <div className="font-mono font-bold text-brand-dark text-sm">
+                    {picked.roomNumber}
+                  </div>
+                  <div className="text-[11px] text-textSecondary capitalize truncate">
+                    {picked.roomType}
+                    {picked.floor !== undefined && (
+                      <span> · Floor {picked.floor}</span>
+                    )}
+                    <span> · base ₹{Number(picked.baseRate).toFixed(0)}/n</span>
+                  </div>
+                </div>
+                <div className="w-32">
+                  <input
+                    className="input"
+                    type="number"
+                    min={0}
+                    step="0.01"
+                    value={rateOverride}
+                    placeholder="0"
+                    onChange={(e) => setRateOverride(e.target.value)}
+                  />
+                </div>
+                <div className="w-24 text-right text-xs font-mono text-textPrimary">
+                  {remainingNights > 0 ? `= ₹${lineTotal.toFixed(2)}` : ""}
+                </div>
+              </div>
+              {remainingNights > 0 && (
+                <div className="text-[11px] text-textSecondary">
+                  Applies to {remainingNights} night{remainingNights === 1 ? "" : "s"}
+                  {props.inPlace ? " (the whole stay)" : " in the new room"}.
+                </div>
+              )}
+            </div>
+          );
+        })()}
 
         {err && (
           <div className="text-sm text-danger bg-danger/5 border border-danger/30 rounded p-2">
@@ -4279,7 +4624,7 @@ function CheckoutModal(props: {
   const previousTotal = +previousItems.reduce((s, i) => s + i.balanceDue, 0).toFixed(2);
   const hasPrevious = previousTotal > 0.009;
 
-  const [collectPrevious, setCollectPrevious] = useState(true);
+  const [collectPrevious, setCollectPrevious] = useState(false);
   const previousToCollect = hasPrevious && collectPrevious ? previousTotal : 0;
   const suggestedTotal = +(Math.max(0, props.balance) + previousToCollect).toFixed(2);
 

@@ -152,8 +152,38 @@ export const reservationRooms = pgTable("reservation_rooms", {
   effectiveTo: date("effective_to"),
   swapId: uuid("swap_id"),
   swapReason: text("swap_reason"),
+  // Migration 0036 — in-place swaps (1-night stays, day-use) re-point
+  // this row to the new room without creating a sibling segment, so
+  // the original room number is otherwise lost. Captured here so the
+  // detail page can render "Swapped from Room 203 (Maintenance)" on
+  // the active row.
+  swappedFromRoomId: uuid("swapped_from_room_id").references(() => rooms.id),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
+
+// Migration 0037 — chain of in-place swap hops on a single row. 0036
+// stored only the immediately-prior room on reservationRooms; a chain
+// of swaps (202 -> 201 -> 301) collapsed to one entry. This table
+// preserves every hop so the UI can render a full closed-leg ladder.
+export const reservationRoomSwapHistory = pgTable(
+  "reservation_room_swap_history",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    reservationRoomId: uuid("reservation_room_id")
+      .notNull()
+      .references(() => reservationRooms.id, { onDelete: "cascade" }),
+    fromRoomId: uuid("from_room_id")
+      .notNull()
+      .references(() => rooms.id),
+    toRoomId: uuid("to_room_id")
+      .notNull()
+      .references(() => rooms.id),
+    reason: text("reason").notNull(),
+    ratePerNight: numeric("rate_per_night", { precision: 10, scale: 2 }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    createdBy: uuid("created_by").references(() => profiles.id),
+  },
+);
 
 // Migration 0020 — co-guest link table. Each row pairs a reservation
 // with a real Guest row that occupies the booking alongside the

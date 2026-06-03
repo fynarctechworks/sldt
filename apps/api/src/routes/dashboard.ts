@@ -476,6 +476,13 @@ async function buildDashboard() {
     string,
     { nextGuestName: string; nextCheckIn: string }
   >();
+  // Segmented mid-stay swaps (0019) produce multiple reservation_rooms
+  // rows with different [effective_from, effective_to) windows. For
+  // tile-status purposes only the currently-active segment matters —
+  // otherwise both the closed-leg room (e.g. 303 yesterday) and the
+  // not-yet-started successor (304 tomorrow) would both light up as
+  // OCCUPIED. NULL bounds mean the row covers the whole stay.
+  const todayDate = propertyDateOffset(0);
   const liveReservations = await db
     .select({
       roomId: reservationRooms.roomId,
@@ -489,7 +496,16 @@ async function buildDashboard() {
     .from(reservationRooms)
     .innerJoin(reservations, eq(reservations.id, reservationRooms.reservationId))
     .innerJoin(guests, eq(guests.id, reservations.guestId))
-    .where(inArray(reservations.status, ["checked_in", "confirmed"]));
+    .where(
+      and(
+        inArray(reservations.status, ["checked_in", "confirmed"]),
+        // Active segment filter — exclude closed-leg rows (effective_to
+        // already passed) and future-leg rows (effective_from not yet
+        // reached). NULL bounds mean "whole stay" so they pass through.
+        sql`(${reservationRooms.effectiveFrom} IS NULL OR ${reservationRooms.effectiveFrom} <= ${todayDate})`,
+        sql`(${reservationRooms.effectiveTo} IS NULL OR ${reservationRooms.effectiveTo} > ${todayDate})`,
+      ),
+    );
   const tomorrow = propertyDateOffset(1);
   for (const r of liveReservations) {
     // Prefer checked_in over confirmed when both exist. Among multiple

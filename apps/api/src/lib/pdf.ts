@@ -550,18 +550,26 @@ function renderInvoiceHtml(data: {
           // tells staff exactly which prior desk visit collected this
           // money). Falls back to the chronological Advance/Later tag.
           const notes = (p.notes ?? "").trim();
+          // Strip the per-room "(Room X)" qualifier and any "part Y/Z
+          // (split from ...)" trailer so guest-facing receipts read
+          // as a single labelled collection, not as N split slices.
+          const cleanedNotes = notes
+            .replace(/\s*·\s*part \d+\/\d+(?:\s*\(split from [^)]+\))?/g, "")
+            .replace(/\s*\(Room [^)]+\)/g, "")
+            // After the (Room X) is gone, "Per-room share of check-out
+            // collection" is redundant — collapse to plain wording.
+            .replace(/^Per-room share of check-out collection/, "Collected at check-out");
           const looksLikeRichNote =
-            notes.length > 0 &&
-            (notes.startsWith("Collected at check-out of") ||
-              notes.startsWith("Advance at booking") ||
-              notes.startsWith("Advance at check-in") ||
-              notes.startsWith("Booking — no advance collected") ||
-              notes.startsWith("Per-room share of check-out collection"));
+            cleanedNotes.length > 0 &&
+            (cleanedNotes.startsWith("Collected at check-out") ||
+              cleanedNotes.startsWith("Advance at booking") ||
+              cleanedNotes.startsWith("Advance at check-in") ||
+              cleanedNotes.startsWith("Booking — no advance collected"));
           const isLater =
             checkedInAtMs !== null &&
             new Date(p.paymentDate).getTime() > checkedInAtMs;
           const tag = looksLikeRichNote
-            ? notes
+            ? cleanedNotes
             : isLater
               ? "Later payment"
               : "Advance at check-in";

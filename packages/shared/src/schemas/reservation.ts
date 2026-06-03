@@ -185,6 +185,13 @@ export const swapRoomSegmentSchema = z.object({
     .enum(["maintenance", "dirty", "available"])
     .optional()
     .default("maintenance"),
+  // Optional: override the per-night rate when swapping to a different
+  // room category (e.g. AC -> Deluxe). Applied to the new segment row
+  // for segmented swaps, or to the re-pointed row for in-place swaps.
+  // When omitted, the existing rate is preserved (legacy behaviour).
+  // The reservation's subtotal/GST/grand_total/balance recompute when
+  // the new rate differs from the old.
+  newRate: z.number().nonnegative().optional(),
 });
 
 export const additionalChargeSchema = z.object({

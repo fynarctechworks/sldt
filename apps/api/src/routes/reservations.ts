@@ -24,7 +24,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { db } from "../db/client.js";
 import { additionalCharges, invoiceLineItems, invoices, payments } from "../db/schema/invoices.js";
-import { reservationCoGuests, reservationRooms, reservations } from "../db/schema/reservations.js";
+import { reservationCoGuests, reservationRoomSwapHistory, reservationRooms, reservations } from "../db/schema/reservations.js";
 import { rooms } from "../db/schema/rooms.js";
 import { roomTypes } from "../db/schema/settings.js";
 import { combinedRoomTypeLabel, type RoomTypeLabelMap } from "../lib/roomTypeLabel.js";
@@ -227,6 +227,62 @@ router.get("/:id", requireAuth, requirePermission("view_reservations"), async (r
     db.select().from(guests).where(eq(guests.id, r[0]!.guestId)).limit(1),
   ]);
 
+  // Resolve the in-place swap history for each row. 0036 stored only
+  // the immediately-prior room — fine for a single swap, but a chain
+  // (202 -> 201 -> 301) collapsed to "from 201". 0037 added a per-row
+  // history table; here we fetch the chain and resolve every hop's
+  // room metadata so the UI can render a closed-leg ladder above the
+  // active row.
+  type RoomMeta = {
+    id: string;
+    roomNumber: string;
+    roomType: string;
+    hasAc: boolean;
+    hasTv: boolean;
+    hasWifi: boolean;
+  };
+  const rrIds = resRooms.map((x) => x.rr.id);
+  const histories = rrIds.length
+    ? await db
+        .select()
+        .from(reservationRoomSwapHistory)
+        .where(inArray(reservationRoomSwapHistory.reservationRoomId, rrIds))
+        .orderBy(reservationRoomSwapHistory.createdAt)
+    : [];
+  // Every room id referenced anywhere in the chain (origin + intermediate
+  // hops), so we can look up metadata in a single query.
+  const historyRoomIds = new Set<string>();
+  for (const h of histories) {
+    historyRoomIds.add(h.fromRoomId);
+    historyRoomIds.add(h.toRoomId);
+  }
+  for (const x of resRooms) {
+    if (x.rr.swappedFromRoomId) historyRoomIds.add(x.rr.swappedFromRoomId);
+  }
+  const roomMetaMap = new Map<string, RoomMeta>();
+  if (historyRoomIds.size > 0) {
+    const fromRows = await db
+      .select({
+        id: rooms.id,
+        roomNumber: rooms.roomNumber,
+        roomType: rooms.roomType,
+        hasAc: rooms.hasAc,
+        hasTv: rooms.hasTv,
+        hasWifi: rooms.hasWifi,
+      })
+      .from(rooms)
+      .where(inArray(rooms.id, Array.from(historyRoomIds)));
+    for (const fr of fromRows) roomMetaMap.set(fr.id, fr);
+  }
+  // Group history hops by reservation_room id so each row can attach
+  // its own ladder.
+  const historyByRR = new Map<string, typeof histories>();
+  for (const h of histories) {
+    const arr = historyByRR.get(h.reservationRoomId) ?? [];
+    arr.push(h);
+    historyByRR.set(h.reservationRoomId, arr);
+  }
+
   // Pull ALL invoices for this reservation. Per-room (0017) means a
   // multi-room booking may have several invoices — one per room plus
   // an optional combined one. `invoice` (singular) stays for back-compat;
@@ -343,6 +399,49 @@ router.get("/:id", requireAuth, requirePermission("view_reservations"), async (r
           effectiveTo: x.rr.effectiveTo,
           swapId: x.rr.swapId,
           swapReason: x.rr.swapReason,
+          // 0037 — every in-place swap hop on this row, ordered
+          // oldest-first. The UI renders one virtual "closed leg" row
+          // per entry above the active row, so a 202 -> 201 -> 301
+          // chain reads as three rows: [202 closed -> 201], [201
+          // closed -> 301], [301 active]. `swappedFromRoom` stays for
+          // backwards-compat callers (Room PDFs etc.) and mirrors the
+          // most recent hop.
+          swapHistory: (historyByRR.get(x.rr.id) ?? []).map((h) => {
+            const fromR = roomMetaMap.get(h.fromRoomId);
+            const toR = roomMetaMap.get(h.toRoomId);
+            return {
+              id: h.id,
+              fromRoom: fromR
+                ? {
+                    id: fromR.id,
+                    roomNumber: fromR.roomNumber,
+                    roomType: fromR.roomType,
+                    displayType: combinedRoomTypeLabel(fromR.roomType, x.rr.soldAsType, m),
+                    hasAc: fromR.hasAc,
+                    hasTv: fromR.hasTv,
+                    hasWifi: fromR.hasWifi,
+                  }
+                : null,
+              toRoomNumber: toR?.roomNumber ?? null,
+              reason: h.reason,
+              ratePerNight: h.ratePerNight,
+              createdAt: h.createdAt,
+            };
+          }),
+          swappedFromRoom: (() => {
+            if (!x.rr.swappedFromRoomId) return null;
+            const src = roomMetaMap.get(x.rr.swappedFromRoomId);
+            if (!src) return null;
+            return {
+              id: src.id,
+              roomNumber: src.roomNumber,
+              roomType: src.roomType,
+              displayType: combinedRoomTypeLabel(src.roomType, x.rr.soldAsType, m),
+              hasAc: src.hasAc,
+              hasTv: src.hasTv,
+              hasWifi: src.hasWifi,
+            };
+          })(),
           occupant: occ
             ? {
                 id: occ.id,
@@ -2775,13 +2874,42 @@ router.post(
         return fail(res, 409, "ROOM_UNAVAILABLE", "Target room is not available for this stay");
       }
 
+      // Optional rate override: when swapping to a different room
+      // category, the staff can change the per-night rate. We apply
+      // the new rate to this re-pointed row and recompute the
+      // reservation's subtotal/GST/grand_total/balance from facts so
+      // the bill reflects what the guest will actually pay.
+      const oldRate = Number(seg.ratePerNight);
+      const hasRateChange =
+        input.newRate !== undefined &&
+        Math.abs(input.newRate - oldRate) > 0.009;
+      const newRate = hasRateChange ? input.newRate! : oldRate;
+
       await db.transaction(async (tx) => {
+        // 0037 — record this hop before we overwrite the row, so a
+        // chain of in-place swaps (202 -> 201 -> 301) leaves a full
+        // ladder behind. Snapshot the rate that *was* on the row
+        // (oldRate) — that's what the closed leg's rate was.
+        await tx.insert(reservationRoomSwapHistory).values({
+          reservationRoomId: seg.id,
+          fromRoomId: seg.roomId,
+          toRoomId: input.toRoomId,
+          reason: input.reason,
+          ratePerNight: String(oldRate),
+          createdBy: req.user!.id,
+        });
+
         await tx
           .update(reservationRooms)
           .set({
             roomId: input.toRoomId,
             swapId,
             swapReason: input.reason,
+            // 0036 — preserve the prior room so the UI can render
+            // "Swapped from Room 203". Without this, an in-place swap
+            // silently overwrites the source room number.
+            swappedFromRoomId: seg.roomId,
+            ratePerNight: String(newRate),
           })
           .where(eq(reservationRooms.id, seg.id));
         await tx
@@ -2792,6 +2920,50 @@ router.post(
           .update(rooms)
           .set({ status: "occupied", updatedAt: now })
           .where(eq(rooms.id, input.toRoomId));
+
+        if (hasRateChange) {
+          // Recompute reservation totals from the new per-row rate.
+          // For in-place swaps the swap covers the full segment, so
+          // the delta in subtotal is (newRate - oldRate) * segNights.
+          const segNights = isShortStay
+            ? 1
+            : Math.max(
+                1,
+                Math.round(
+                  (new Date(reservation.checkOutDate).getTime() -
+                    new Date(reservation.checkInDate).getTime()) /
+                    (24 * 60 * 60 * 1000),
+                ),
+              );
+          const delta = +((newRate - oldRate) * segNights).toFixed(2);
+          const gstMode = reservation.gstMode ?? "exclusive";
+          const gstRate = Number(reservation.gstRate);
+          // In exclusive mode the stored subtotal is net (pre-GST);
+          // shift it by the delta, then recompute GST + grand total
+          // through the same helper so rounding matches every other
+          // path. In inclusive mode the delta arrives gross; bump
+          // grand total instead and let the breakdown extract net.
+          const combinedAmount =
+            gstMode === "inclusive"
+              ? +(Number(reservation.grandTotal) + delta).toFixed(2)
+              : +(Number(reservation.subtotal) + delta).toFixed(2);
+          const { subtotal, gstAmount, grandTotal } = calcGstBreakdown(
+            combinedAmount,
+            gstRate,
+            gstMode,
+          );
+          await tx
+            .update(reservations)
+            .set({
+              subtotal: String(subtotal),
+              gstAmount: String(gstAmount),
+              grandTotal: String(grandTotal),
+              updatedAt: now,
+            })
+            .where(eq(reservations.id, id));
+          // balanceDue follows grandTotal — recompute from facts.
+          await recomputeReservationBalance(tx, id);
+        }
       });
     } else {
       // Overnight + caller provided effectiveDate → segment the row.
@@ -2823,6 +2995,16 @@ router.post(
         return fail(res, 409, "ROOM_UNAVAILABLE", "Target room is not available for the remainder of the stay");
       }
 
+      // Optional rate override for the remainder of the stay. Only
+      // the new segment uses the new rate; the closed leg keeps the
+      // original rate. If the rate changed, recompute reservation
+      // totals from the per-row deltas (new rate × remaining nights).
+      const oldRate = Number(seg.ratePerNight);
+      const hasRateChange =
+        input.newRate !== undefined &&
+        Math.abs(input.newRate - oldRate) > 0.009;
+      const newSegRate = hasRateChange ? input.newRate! : oldRate;
+
       await db.transaction(async (tx) => {
         // 1. Close the old segment at the swap date.
         await tx
@@ -2836,11 +3018,11 @@ router.post(
           .where(eq(reservationRooms.id, seg.id));
 
         // 2. Insert a new segment for the remainder of the stay.
-        // Same rate / guest / invoice — only room_id and dates change.
+        // Rate may differ if staff chose to renegotiate at swap time.
         await tx.insert(reservationRooms).values({
           reservationId: id,
           roomId: input.toRoomId,
-          ratePerNight: seg.ratePerNight,
+          ratePerNight: String(newSegRate),
           soldAsType: seg.soldAsType,
           guestId: seg.guestId,
           status: "checked_in",
@@ -2864,6 +3046,42 @@ router.post(
           .update(rooms)
           .set({ status: "occupied", updatedAt: now })
           .where(eq(rooms.id, input.toRoomId));
+
+        if (hasRateChange) {
+          // Segmented path: the rate applies only to the remainder of
+          // the stay (effectiveDate -> segTo), not the whole segment.
+          const remainingNights = Math.max(
+            1,
+            Math.round(
+              (new Date(segTo).getTime() - new Date(effectiveDate).getTime()) /
+                (24 * 60 * 60 * 1000),
+            ),
+          );
+          const delta = +(
+            (newSegRate - oldRate) * remainingNights
+          ).toFixed(2);
+          const gstMode = reservation.gstMode ?? "exclusive";
+          const gstRate = Number(reservation.gstRate);
+          const combinedAmount =
+            gstMode === "inclusive"
+              ? +(Number(reservation.grandTotal) + delta).toFixed(2)
+              : +(Number(reservation.subtotal) + delta).toFixed(2);
+          const { subtotal, gstAmount, grandTotal } = calcGstBreakdown(
+            combinedAmount,
+            gstRate,
+            gstMode,
+          );
+          await tx
+            .update(reservations)
+            .set({
+              subtotal: String(subtotal),
+              gstAmount: String(gstAmount),
+              grandTotal: String(grandTotal),
+              updatedAt: now,
+            })
+            .where(eq(reservations.id, id));
+          await recomputeReservationBalance(tx, id);
+        }
       });
     }
 

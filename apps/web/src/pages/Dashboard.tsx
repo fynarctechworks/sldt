@@ -622,12 +622,6 @@ function RoomTile({
           <span className={`w-2 h-2 rounded-full ${style.statusDot}`} />
           {style.label}
         </span>
-        {(room.status === "occupied" || room.status === "reserved") &&
-          room.guest_name && (
-            <span className="text-sm font-semibold mt-0.5 truncate w-full text-center opacity-90">
-              {room.guest_name.split(" ")[0]}
-            </span>
-          )}
       </div>
       {showHoldHint && heldRange && (
         <div className="flex items-center justify-center gap-1 px-2 py-1 bg-warning text-cream text-[11px] uppercase tracking-wider font-bold">
