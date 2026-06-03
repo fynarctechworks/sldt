@@ -4,7 +4,7 @@ import { z } from "zod";
 import { db } from "../db/client.js";
 import { activityLog } from "../db/schema/activity.js";
 import { profiles } from "../db/schema/profiles.js";
-import { reservationRooms, reservations } from "../db/schema/reservations.js";
+import { reservationRooms } from "../db/schema/reservations.js";
 import { rooms } from "../db/schema/rooms.js";
 import { ok } from "../lib/response.js";
 import { requireAuth } from "../middleware/auth.js";

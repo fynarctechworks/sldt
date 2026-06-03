@@ -11,8 +11,17 @@ const STYLES: Record<RoomStatus, string> = {
   inspected: "bg-success/15 text-success",
 };
 
+// Display labels — keeps the DB enum stable while letting the UI use
+// staff-friendly wording. Anything not in this map falls back to the
+// raw value with underscores spaced out.
+const LABELS: Partial<Record<RoomStatus, string>> = {
+  dirty: "Needs Cleaning",
+};
+
 export function StatusBadge({ status }: { status: RoomStatus | string }) {
   const cls = STYLES[status as RoomStatus] ?? "bg-gray-200 text-gray-700";
+  const label =
+    LABELS[status as RoomStatus] ?? String(status).replace("_", " ");
   return (
     <span
       className={cn(
@@ -20,7 +29,7 @@ export function StatusBadge({ status }: { status: RoomStatus | string }) {
         cls,
       )}
     >
-      {String(status).replace("_", " ")}
+      {label}
     </span>
   );
 }

@@ -11,6 +11,7 @@ import { rooms } from "../db/schema/rooms.js";
 import { logActivity } from "../lib/activity.js";
 import { loadGuestExtra } from "../lib/guestExtra.js";
 import { renderInvoicePdf } from "../lib/pdf.js";
+import { recomputeReservationBalance } from "../lib/reservationBalance.js";
 import { invalidateDashboard } from "../lib/redis.js";
 import { getSettings } from "../lib/settings.js";
 import { fail, list, ok } from "../lib/response.js";
@@ -538,6 +539,15 @@ router.get("/:id/pdf", requireAuth, requirePermission("view_invoices"), async (r
           checkedInAt: resRow.checkedInAt
             ? resRow.checkedInAt.toISOString()
             : null,
+          // 0023 — pass staff-chosen planned times so the invoice's
+          // Stay block prints the promised window instead of the
+          // generic hotel policy.
+          plannedCheckInAt: resRow.plannedCheckInAt
+            ? resRow.plannedCheckInAt.toISOString()
+            : null,
+          plannedCheckOutAt: resRow.plannedCheckOutAt
+            ? resRow.plannedCheckOutAt.toISOString()
+            : null,
         }
       : undefined,
     guestExtra,
@@ -775,12 +785,10 @@ router.patch(
         patch.balanceDue = String(balanceDue);
         patch.status = status;
 
-        // Keep the reservation's balance_due in sync — it's used by the
-        // dashboard + outstanding banner.
-        await tx
-          .update(reservations)
-          .set({ balanceDue: String(balanceDue), updatedAt: new Date() })
-          .where(eq(reservations.id, original.reservationId));
+        // Keep the reservation's balance_due in sync. Recompute from
+        // facts so multi-invoice bookings don't lose other invoices'
+        // debt when only one invoice was edited.
+        await recomputeReservationBalance(tx, original.reservationId);
       }
 
       // Stay window edits live on the reservation, not the invoice. The

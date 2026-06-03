@@ -25,6 +25,10 @@ const DOMAINS = [
 interface Props {
   value: string;
   onChange: (next: string) => void;
+  // Optional blur hook so callers can probe for duplicates the moment
+  // staff moves on from the field. Fires after the suggestion popover
+  // has closed.
+  onBlur?: () => void;
   placeholder?: string;
   className?: string;
   required?: boolean;
@@ -34,6 +38,7 @@ interface Props {
 export function EmailInput({
   value,
   onChange,
+  onBlur,
   placeholder = "guest@example.com",
   className,
   required,
@@ -153,6 +158,12 @@ export function EmailInput({
           if (suggestions.length > 0) setOpen(true);
         }}
         onKeyDown={onKeyDown}
+        onBlur={() => {
+          // The mouse-down on a suggestion fires before blur, so the
+          // popover-pick still works. Only fire the caller's onBlur
+          // once the suggestion list isn't being interacted with.
+          setTimeout(() => onBlur?.(), 0);
+        }}
       />
       {open && suggestions.length > 0 && (
         <ul

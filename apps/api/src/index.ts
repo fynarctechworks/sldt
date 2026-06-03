@@ -1,7 +1,7 @@
 import cors from "cors";
 import express from "express";
 import helmet from "helmet";
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
+ 
 import pinoHttpImport from "pino-http";
 // pino-http v10 ships odd typings; the runtime export is callable.
 const pinoHttp = pinoHttpImport as unknown as (opts: { logger: typeof logger }) => import("express").RequestHandler;
@@ -18,6 +18,7 @@ import authRoutes from "./routes/auth.js";
 import calendarRoutes from "./routes/calendar.js";
 import creditsRoutes from "./routes/credits.js";
 import dashboardRoutes from "./routes/dashboard.js";
+import expenseRoutes from "./routes/expenses.js";
 import guestRoutes from "./routes/guests.js";
 import housekeepingRoutes from "./routes/housekeeping.js";
 import invoiceRoutes from "./routes/invoices.js";
@@ -126,6 +127,7 @@ v1.use("/credits", creditsRoutes);
 v1.use("/housekeeping", housekeepingRoutes);
 v1.use("/properties", propertiesRoutes);
 v1.use("/dashboard", dashboardRoutes);
+v1.use("/expenses", expenseRoutes);
 v1.use("/reports", reportRoutes);
 v1.use("/settings", settingsRouter);
 v1.use("/staff", staffRouter);

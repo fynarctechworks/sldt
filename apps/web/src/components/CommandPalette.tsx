@@ -17,7 +17,6 @@
 
 import { useQuery } from "@tanstack/react-query";
 import {
-  BedDouble,
   CalendarPlus,
   ChevronRight,
   DoorOpen,
@@ -27,7 +26,6 @@ import {
   Sparkles,
   User,
   UserPlus,
-  Users,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";

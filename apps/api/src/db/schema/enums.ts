@@ -67,6 +67,33 @@ export type InvoiceStatus = (typeof INVOICE_STATUSES)[number];
 export const PAYMENT_METHODS = ["cash", "upi", "card", "bank_transfer", "unpaid"] as const;
 export type PaymentMethod = (typeof PAYMENT_METHODS)[number];
 
+// Expense ledger (migration 0025). Categories are the fixed,
+// reportable buckets; subcategory stays free-text. Adding a value
+// requires a DB enum migration so this list is deliberately small.
+export const EXPENSE_CATEGORIES = [
+  "utilities",
+  "repairs_maintenance",
+  "supplies",
+  "salaries_wages",
+  "food_kitchen",
+  "marketing",
+  "government_compliance",
+  "other",
+] as const;
+export type ExpenseCategory = (typeof EXPENSE_CATEGORIES)[number];
+
+// Distinct from PAYMENT_METHODS because expenses carry a "pending"
+// (bill recorded but not yet paid) state that doesn't make sense for
+// guest payments.
+export const EXPENSE_PAYMENT_METHODS = [
+  "cash",
+  "upi",
+  "card",
+  "bank_transfer",
+  "pending",
+] as const;
+export type ExpensePaymentMethod = (typeof EXPENSE_PAYMENT_METHODS)[number];
+
 export const LINE_ITEM_TYPES = ["room_charge", "additional_charge"] as const;
 export type LineItemType = (typeof LINE_ITEM_TYPES)[number];
 

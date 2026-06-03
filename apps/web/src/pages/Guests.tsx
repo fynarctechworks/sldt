@@ -378,6 +378,7 @@ function GuestCard({ g, onOpen }: { g: Guest; onOpen: () => void }) {
 
 function AddGuestModal({ onClose }: { onClose: () => void }) {
   const qc = useQueryClient();
+  const navigate = useNavigate();
   const [form, setForm] = useState({
     fullName: "",
     phone: "",
@@ -394,18 +395,47 @@ function AddGuestModal({ onClose }: { onClose: () => void }) {
     notes: "",
   });
   const [err, setErr] = useState<string | null>(null);
-  const [dupWarning, setDupWarning] = useState<string | null>(null);
+  // dupMatch carries the FIRST existing guest that already owns any of
+  // the identifiers (phone / email / ID). The form blocks submit when
+  // it's non-null and surfaces a "Use this guest" link so staff can
+  // jump to the existing profile instead of creating a duplicate.
+  type DupMatch = {
+    id: string;
+    fullName: string;
+    phone: string;
+    email: string | null;
+    reasons: ("phone" | "email" | "id")[];
+  };
+  const [dupMatch, setDupMatch] = useState<DupMatch | null>(null);
 
+  // Probe the API with whichever identifiers the staff has filled in
+  // so far. Called on blur of phone / email / ID number. The API
+  // returns ANY existing guest matching any one of the three; we keep
+  // the first match and let the UI show a clickable suggestion.
   async function checkDup() {
-    if (!form.phone || form.phone.length < 10) return;
+    const phoneReady = form.phone.length === 10;
+    const emailReady = form.email.trim().length > 0;
+    const idReady = form.idProofNumber.trim().length >= 4;
+    if (!phoneReady && !emailReady && !idReady) {
+      setDupMatch(null);
+      return;
+    }
     try {
-      const r = await api.get<{ duplicate: boolean; matches: { fullName: string }[] }>(
-        "/guests/check-duplicate",
-        { phone: form.phone },
-      );
-      if (r.duplicate) setDupWarning(`Phone matches existing guest: ${r.matches[0]?.fullName}`);
-      else setDupWarning(null);
-    } catch {}
+      const r = await api.get<{
+        duplicate: boolean;
+        matches: DupMatch[];
+      }>("/guests/check-duplicate", {
+        phone: phoneReady ? form.phone : undefined,
+        email: emailReady ? form.email.trim() : undefined,
+        id_type: idReady ? form.idProofType : undefined,
+        id_number: idReady ? form.idProofNumber.trim() : undefined,
+      });
+      setDupMatch(r.duplicate ? r.matches[0] ?? null : null);
+    } catch {
+      // Probe failures are non-fatal — the server's create endpoint
+      // will still reject true duplicates with a 409, so the worst
+      // case is the staff sees the block at submit instead of inline.
+    }
   }
 
   const create = useMutation({
@@ -457,9 +487,13 @@ function AddGuestModal({ onClose }: { onClose: () => void }) {
               maxLength={10}
               placeholder="9876543210"
               value={form.phone}
-              onChange={(e) =>
-                setForm({ ...form, phone: e.target.value.replace(/\D/g, "").slice(0, 10) })
-              }
+              onChange={(e) => {
+                const next = e.target.value.replace(/\D/g, "").slice(0, 10);
+                setForm({ ...form, phone: next });
+                // Stale-warning cleanup: any edit drops the prior
+                // duplicate match until the next probe completes.
+                if (dupMatch) setDupMatch(null);
+              }}
               onBlur={checkDup}
               required
             />
@@ -472,14 +506,23 @@ function AddGuestModal({ onClose }: { onClose: () => void }) {
           <Field label="Email">
             <EmailInput
               value={form.email}
-              onChange={(v) => setForm({ ...form, email: v })}
+              onChange={(v) => {
+                setForm({ ...form, email: v });
+                if (dupMatch) setDupMatch(null);
+              }}
+              onBlur={checkDup}
             />
           </Field>
           <Field label="ID Proof Type" required>
             <select
               className="input"
               value={form.idProofType}
-              onChange={(e) => setForm({ ...form, idProofType: e.target.value as IdProofType })}
+              onChange={(e) => {
+                setForm({ ...form, idProofType: e.target.value as IdProofType });
+                // Pair changed → drop any stale match; the next blur
+                // on the ID number will re-probe with the new type.
+                if (dupMatch) setDupMatch(null);
+              }}
             >
               {ID_PROOF_TYPES.map((t) => (
                 <option key={t} value={t}>
@@ -492,7 +535,11 @@ function AddGuestModal({ onClose }: { onClose: () => void }) {
             <input
               className="input"
               value={form.idProofNumber}
-              onChange={(e) => setForm({ ...form, idProofNumber: e.target.value })}
+              onChange={(e) => {
+                setForm({ ...form, idProofNumber: e.target.value });
+                if (dupMatch) setDupMatch(null);
+              }}
+              onBlur={checkDup}
               required
             />
           </Field>
@@ -585,8 +632,27 @@ function AddGuestModal({ onClose }: { onClose: () => void }) {
           </Field>
         </div>
 
-        {dupWarning && (
-          <div className="text-warning text-xs bg-warning/10 px-3 py-2 rounded-sm">{dupWarning}</div>
+        {dupMatch && (
+          <div className="text-warning bg-warning/10 border border-warning/30 px-3 py-2 rounded-sm text-xs space-y-1">
+            <div>
+              <strong>{dupMatch.fullName}</strong> already has this{" "}
+              {dupMatch.reasons
+                .map((r) => (r === "id" ? "ID number" : r))
+                .join(" + ")}{" "}
+              ({dupMatch.phone}
+              {dupMatch.email ? ` · ${dupMatch.email}` : ""}).
+            </div>
+            <button
+              type="button"
+              className="text-brand-dark underline font-semibold"
+              onClick={() => {
+                onClose();
+                navigate(`/guests/${dupMatch.phone}`);
+              }}
+            >
+              Open existing guest →
+            </button>
+          </div>
         )}
         {err && <div className="text-danger text-xs">{err}</div>}
 
@@ -602,6 +668,11 @@ function AddGuestModal({ onClose }: { onClose: () => void }) {
               !form.fullName.trim() ||
               form.phone.length !== 10 ||
               !form.idProofNumber.trim() ||
+              // Any matching existing guest (phone / email / ID) is a
+              // hard block — the server enforces the same rule with a
+              // 409, but blocking here avoids a wasted round-trip and
+              // keeps the modal honest about the collision.
+              !!dupMatch ||
               (!!form.gstin && !/^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/.test(form.gstin))
             }
           >

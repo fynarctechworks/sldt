@@ -487,6 +487,11 @@ function renderInvoiceHtml(data: {
     // Null/missing when the reservation isn't checked in yet (advance-
     // receipt rendering path).
     checkedInAt?: string | null;
+    // 0023 — staff-chosen planned clock times. Used to print
+    // "Check-in: 02 Jun 2026 · 4:00 PM" when staff promised a specific
+    // window; falls back to dateless format otherwise.
+    plannedCheckInAt?: string | null;
+    plannedCheckOutAt?: string | null;
   };
   // Guest extras for the Billed To block (migration 0020). gender prints
   // alongside the existing name; coGuests prints as a small "Also
@@ -539,17 +544,34 @@ function renderInvoiceHtml(data: {
     ? payments
         .filter((p) => !p.voided)
         .map((p) => {
+          // Tag precedence: a payment's actual notes win when they
+          // describe a specific scenario the generic Advance/Later
+          // labels can't (e.g. "Collected at check-out of SLDT-RES-0072"
+          // tells staff exactly which prior desk visit collected this
+          // money). Falls back to the chronological Advance/Later tag.
+          const notes = (p.notes ?? "").trim();
+          const looksLikeRichNote =
+            notes.length > 0 &&
+            (notes.startsWith("Collected at check-out of") ||
+              notes.startsWith("Advance at booking") ||
+              notes.startsWith("Advance at check-in") ||
+              notes.startsWith("Booking — no advance collected") ||
+              notes.startsWith("Per-room share of check-out collection"));
           const isLater =
             checkedInAtMs !== null &&
             new Date(p.paymentDate).getTime() > checkedInAtMs;
-          const tag = isLater ? "Later payment" : "Advance at check-in";
+          const tag = looksLikeRichNote
+            ? notes
+            : isLater
+              ? "Later payment"
+              : "Advance at check-in";
           return `
     <tr>
       <td>${format(new Date(p.paymentDate), "dd MMM yyyy")}</td>
       <td class="capitalize">
         ${p.paymentMethod.replace("_", " ")}
         <span style="color:#6B6358;font-size:9.5px;text-transform:none;letter-spacing:0;margin-left:4px;">
-          · ${tag}
+          · ${esc(tag)}
         </span>
       </td>
       <td class="num mono">${inr(p.amount, L.currency)}</td>
@@ -622,13 +644,30 @@ ${L.showLogo && L.logoUrl ? `<div class="watermark"><img src="${esc(L.logoUrl)}"
                 + Math.round(Number(stay.durationHours ?? 0) * 3600 * 1000),
             )
           : null;
+        // Check-in time priority (0023): actual checked-in stamp >
+        // staff-chosen planned time > date-only fallback. The "h:mm a"
+        // format kicks in whenever we have an actual time value.
+        const inHasTime = !!(stay.checkedInAt || stay.plannedCheckInAt);
+        const inDate = stay.checkedInAt
+          ? new Date(stay.checkedInAt)
+          : stay.plannedCheckInAt
+            ? new Date(stay.plannedCheckInAt)
+            : new Date(stay.checkInDate + "T00:00:00");
         const checkInLine = `<div class="sub">Check-in: <strong>${format(
-          stay.checkedInAt ? new Date(stay.checkedInAt) : new Date(stay.checkInDate + "T00:00:00"),
-          isShort && stay.checkedInAt ? "dd MMM yyyy · h:mm a" : "dd MMM yyyy",
+          inDate,
+          (isShort && stay.checkedInAt) || inHasTime
+            ? "dd MMM yyyy · h:mm a"
+            : "dd MMM yyyy",
         )}</strong></div>`;
+        const outHasTime = !!(shortOut || stay.plannedCheckOutAt);
+        const outDate = shortOut
+          ? shortOut
+          : stay.plannedCheckOutAt
+            ? new Date(stay.plannedCheckOutAt)
+            : new Date(stay.checkOutDate + "T00:00:00");
         const checkOutLine = `<div class="sub">Check-out: <strong>${format(
-          shortOut ?? new Date(stay.checkOutDate + "T00:00:00"),
-          shortOut ? "dd MMM yyyy · h:mm a" : "dd MMM yyyy",
+          outDate,
+          outHasTime ? "dd MMM yyyy · h:mm a" : "dd MMM yyyy",
         )}</strong></div>`;
         const durationLine = `<div class="sub" style="color:#6B6358;">${
           isShort
@@ -795,6 +834,10 @@ export async function renderInvoicePdf(data: {
     // Null/missing when the reservation isn't checked in yet (advance-
     // receipt rendering path).
     checkedInAt?: string | null;
+    // 0023 — staff-chosen planned clock times. Same role as above:
+    // surfaced when present so the invoice shows the promised window.
+    plannedCheckInAt?: string | null;
+    plannedCheckOutAt?: string | null;
   };
   // See renderInvoiceHtml signature — pass-through.
   guestExtra?: {
@@ -1071,28 +1114,48 @@ ${L.showLogo && L.logoUrl ? `<div class="watermark"><img src="${esc(L.logoUrl)}"
       <div class="stay-grid">
         <div>
           <div class="stay-tag">Check-in</div>
-          <div class="stay-date">${format(new Date(reservation.checkedInAt ?? reservation.checkInDate), "dd MMM yyyy")}</div>
-          <div class="stay-time">${
-            reservation.checkedInAt
-              ? `at ${format(new Date(reservation.checkedInAt), "h:mm a")}`
-              : settings.checkInTime
-                ? `from ${formatTime(settings.checkInTime)}`
-                : ""
-          }</div>
+          <div class="stay-date">${format(
+            new Date(
+              reservation.checkedInAt ??
+                reservation.plannedCheckInAt ??
+                reservation.checkInDate,
+            ),
+            "dd MMM yyyy",
+          )}</div>
+          <div class="stay-time">${(() => {
+            // Priority (0023): actual checked-in stamp > staff-chosen
+            // planned time > hotel policy default.
+            if (reservation.checkedInAt) {
+              return `at ${format(new Date(reservation.checkedInAt), "h:mm a")}`;
+            }
+            if (reservation.plannedCheckInAt) {
+              return `at ${format(new Date(reservation.plannedCheckInAt), "h:mm a")}`;
+            }
+            return settings.checkInTime
+              ? `from ${formatTime(settings.checkInTime)}`
+              : "";
+          })()}</div>
         </div>
         <div>
           <div class="stay-tag">Check-out</div>
           <div class="stay-date">${format(
-            shortStayCheckoutDate ?? new Date(reservation.checkOutDate),
+            shortStayCheckoutDate ??
+              (reservation.plannedCheckOutAt
+                ? new Date(reservation.plannedCheckOutAt)
+                : new Date(reservation.checkOutDate)),
             "dd MMM yyyy",
           )}</div>
-          ${
-            shortStayCheckoutDate
-              ? `<div class="stay-time">by ${format(shortStayCheckoutDate, "h:mm a")}</div>`
-              : settings.checkOutTime
-                ? `<div class="stay-time">by ${formatTime(settings.checkOutTime)}</div>`
-                : ""
-          }
+          ${(() => {
+            if (shortStayCheckoutDate) {
+              return `<div class="stay-time">by ${format(shortStayCheckoutDate, "h:mm a")}</div>`;
+            }
+            if (reservation.plannedCheckOutAt) {
+              return `<div class="stay-time">by ${format(new Date(reservation.plannedCheckOutAt), "h:mm a")}</div>`;
+            }
+            return settings.checkOutTime
+              ? `<div class="stay-time">by ${formatTime(settings.checkOutTime)}</div>`
+              : "";
+          })()}
         </div>
       </div>
       <div class="stay-occ">${stayUnitLabel} · ${reservation.numAdults} adult${reservation.numAdults === 1 ? "" : "s"}${
@@ -1220,6 +1283,14 @@ ${L.showLogo && L.logoUrl ? `<div class="watermark"><img src="${esc(L.logoUrl)}"
         : esc(L.footerText)
     }
   </div>
+
+  ${
+    isAdvance && balanceDue > 0.009
+      ? `<div style="margin-top:10px;padding:8px 10px;border:1px solid #B45309;border-radius:3px;background:#FBEFD9;color:#7C2D12;font-size:10pt;font-weight:600;text-align:center;">
+            Note: The remaining balance of ${inr(balanceDue, L.currency)} must be paid on or before check-in.
+          </div>`
+      : ""
+  }
 
   ${
     L.showSignature

@@ -88,6 +88,7 @@ export async function findAvailableRooms(checkIn: string, checkOut: string) {
       reservationId: reservations.id,
       reservationNumber: reservations.reservationNumber,
       checkInDate: reservations.checkInDate,
+      checkOutDate: reservations.checkOutDate,
       guestName: guests.fullName,
     })
     .from(reservationRooms)
@@ -108,6 +109,7 @@ export async function findAvailableRooms(checkIn: string, checkOut: string) {
       reservationId: string;
       reservationNumber: string;
       checkInDate: string;
+      checkOutDate: string;
       guestName: string;
     }
   >();
@@ -117,6 +119,7 @@ export async function findAvailableRooms(checkIn: string, checkOut: string) {
       reservationId: r.reservationId,
       reservationNumber: r.reservationNumber,
       checkInDate: r.checkInDate,
+      checkOutDate: r.checkOutDate,
       guestName: r.guestName,
     });
   }

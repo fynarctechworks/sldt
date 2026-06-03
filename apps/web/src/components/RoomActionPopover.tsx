@@ -88,19 +88,19 @@ const TRANSITIONS: Record<HkStatus, TransitionOpt[]> = {
   clean: [
     { to: "available", label: "Mark Ready", direction: "forward", directReady: true },
     { to: "inspected", label: "Mark Inspected", direction: "side" },
-    { to: "dirty", label: "Revert to Dirty", direction: "reverse" },
+    { to: "dirty", label: "Needs Cleaning", direction: "reverse" },
   ],
   inspected: [
     { to: "available", label: "Mark Available", direction: "forward" },
-    { to: "dirty", label: "Revert to Dirty", direction: "reverse" },
+    { to: "dirty", label: "Needs Cleaning", direction: "reverse" },
   ],
   available: [
-    { to: "dirty", label: "Mark Dirty (turn-down)", direction: "reverse" },
+    { to: "dirty", label: "Needs Cleaning (turn-down)", direction: "reverse" },
     { to: "maintenance", label: "Send to Maintenance", direction: "side" },
   ],
   maintenance: [
     { to: "available", label: "Back to Available", direction: "forward" },
-    { to: "dirty", label: "Mark Dirty", direction: "reverse" },
+    { to: "dirty", label: "Needs Cleaning", direction: "reverse" },
   ],
 };
 

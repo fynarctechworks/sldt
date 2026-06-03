@@ -12,7 +12,7 @@
 // invoice" path and the new "per-room invoice" endpoint.
 
 import { combinedRoomTypeLabel, type RoomTypeLabelMap } from "./roomTypeLabel.js";
-import { calcGstBreakdown, getGstRate } from "./gst.js";
+import { calcGstBreakdown } from "./gst.js";
 import type { AdditionalCharge } from "../db/schema/invoices.js";
 import type { ReservationRoom } from "../db/schema/reservations.js";
 import type { Room } from "../db/schema/rooms.js";
@@ -37,13 +37,6 @@ export interface BuilderArgs {
   charges: AdditionalCharge[];
   // Slug → label map for the displayed "Ac Single Bed Rooms" labels.
   labelMap: RoomTypeLabelMap;
-  // Per-property GST slab snapshot for additional-charge GST default.
-  gstSlab: {
-    exemptBelow: number;
-    lowRate: number;
-    lowMax: number;
-    highRate: number;
-  };
 }
 
 export interface BuiltLineItem {
@@ -119,7 +112,7 @@ function parseExtensionDelta(c: AdditionalCharge): ExtensionDelta | null {
 // path, so per-room invoices produce numbers that sum to the
 // combined invoice (give-or-take 1-2 paise rounding per line).
 export function buildInvoice(args: BuilderArgs): BuiltInvoice {
-  const { reservation, rooms, charges, labelMap, gstSlab } = args;
+  const { reservation, rooms, charges, labelMap } = args;
   const isShort = reservation.stayType === "short_stay";
   const shortStayHours = Number(reservation.durationHours ?? 0);
   // For overnight: priced per night. Short-stay: rate IS the per-room
@@ -160,6 +153,45 @@ export function buildInvoice(args: BuilderArgs): BuiltInvoice {
     (a, d) => a + d.extraNights,
     0,
   );
+
+  // Swap chain index. Rows that share a swap_id are sibling segments
+  // of one swap event. Sort them by effective_from so the line
+  // description can say "swapped to Room 205" vs "swapped from
+  // Room 203" instead of a vague "swap" tag — matches the preview
+  // endpoint and the reservation detail page.
+  type ChainEntry = {
+    rowId: string;
+    roomNumber: string;
+    effectiveFrom: string;
+  };
+  const swapChains = new Map<string, ChainEntry[]>();
+  for (const rr of rooms) {
+    if (!rr.swapId || !rr.id) continue;
+    const arr = swapChains.get(rr.swapId) ?? [];
+    arr.push({
+      rowId: rr.id,
+      roomNumber: rr.room.roomNumber,
+      effectiveFrom: rr.effectiveFrom ?? reservation.checkInDate,
+    });
+    swapChains.set(rr.swapId, arr);
+  }
+  for (const arr of swapChains.values()) {
+    arr.sort((a, b) => (a.effectiveFrom < b.effectiveFrom ? -1 : 1));
+  }
+  function swapSibling(
+    rowId: string | null,
+    swapId: string | null,
+  ): { direction: "to" | "from"; roomNumber: string } | null {
+    if (!swapId) return null;
+    const chain = swapChains.get(swapId);
+    if (!chain || chain.length < 2) return null;
+    const idx = chain.findIndex((c) => c.rowId === rowId);
+    if (idx < 0) return null;
+    if (idx === chain.length - 1) {
+      return { direction: "from", roomNumber: chain[idx - 1]!.roomNumber };
+    }
+    return { direction: "to", roomNumber: chain[idx + 1]!.roomNumber };
+  }
 
   for (const rr of rooms) {
     const storedRate = Number(rr.ratePerNight);
@@ -243,10 +275,18 @@ export function buildInvoice(args: BuilderArgs): BuiltInvoice {
     const netRate = isShort ? netRoomSubtotal : netRoomSubtotal / rowNights;
     subtotal += netRoomSubtotal;
     totalGst += roomGst;
+    const sibling = swapSibling(rr.id ?? null, rr.swapId ?? null);
+    const swapTag = sibling
+      ? `swapped ${sibling.direction} Room ${sibling.roomNumber}`
+      : "swapped";
+    // Swap reason ("Maintenance" etc.) describes what happened to the
+    // leaving room, so it belongs only on the closed leg ("swapped
+    // to X"). On the new room the reason is misleading — it makes
+    // 205 read as if 205 itself were sent to maintenance.
+    const reasonSuffix =
+      rr.swapReason && sibling?.direction === "to" ? `: ${rr.swapReason}` : "";
     const overnightSuffix = isSegmented
-      ? `(${formatShortDate(rowFrom)} → ${formatShortDate(rowTo)} · ${rowNights} night${
-          rowNights === 1 ? "" : "s"
-        }${rr.swapReason ? ` · swap: ${rr.swapReason}` : ""})`
+      ? `(${rowNights} night${rowNights === 1 ? "" : "s"}, ${formatShortDate(rowFrom)} → ${formatShortDate(rowTo)} · ${swapTag}${reasonSuffix})`
       : `(${rowNights} nights)`;
     lineItems.push({
       description: isShort
@@ -299,8 +339,6 @@ export function buildInvoice(args: BuilderArgs): BuiltInvoice {
       gstAmount: String(gstAmount),
       itemType: "additional_charge",
     });
-    void gstSlab;
-    void getGstRate;
   }
 
   subtotal = +subtotal.toFixed(2);

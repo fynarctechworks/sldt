@@ -4,6 +4,7 @@ import {
   settingsUpdateSchema,
   staffCreateSchema,
   staffUpdateSchema,
+  unlockSettingsCodeSchema,
 } from "@hoteldesk/shared";
 import { and, asc, count as sqlCount, eq, sql } from "drizzle-orm";
 import { Router } from "express";
@@ -31,7 +32,19 @@ const router = Router();
 router.get("/", requireAuth, requirePermission("manage_settings"), async (_req, res) => {
   const rows = await db.select().from(settings).limit(1);
   const types = await db.select().from(roomTypes).orderBy(asc(roomTypes.label));
-  return ok(res, { settings: rows[0] ?? null, roomTypes: types });
+  // Mask the unlock code even from admins — they can SET it but they
+  // shouldn't see the existing value (a colleague over their shoulder
+  // would be enough). The UI uses the boolean to decide whether to
+  // show "Set code" or "Change code" + "Clear".
+  const s = rows[0] ?? null;
+  const masked = s
+    ? {
+        ...s,
+        complimentaryUnlockCode: s.complimentaryUnlockCode ? "" : null,
+        hasComplimentaryUnlockCode: !!s.complimentaryUnlockCode,
+      }
+    : null;
+  return ok(res, { settings: masked, roomTypes: types });
 });
 
 router.get("/public", requireAuth, async (_req, res) => {
@@ -54,10 +67,24 @@ router.get("/public", requireAuth, async (_req, res) => {
       gstSlabHighRate: settings.gstSlabHighRate,
       // Drives the rate-vs-grand-total interpretation on NewReservation.
       gstMode: settings.gstMode,
+      // 0024 — only a BOOLEAN of whether the gate is configured. The
+      // actual code never leaves the server. The Reports UI uses this
+      // to decide whether to open the auth prompt before revealing
+      // the secondary tabs.
+      complimentaryUnlockCode: settings.complimentaryUnlockCode,
     })
     .from(settings)
     .limit(1);
-  return ok(res, rows[0] ?? null);
+  const row = rows[0] ?? null;
+  if (!row) return ok(res, null);
+  // Strip the actual code from the response — only the boolean flag
+  // reaches the client. Renamed to "complimentaryGateEnabled" so the
+  // client-side field name doesn't shout "this is the unlock code".
+  const { complimentaryUnlockCode, ...rest } = row;
+  return ok(res, {
+    ...rest,
+    complimentaryGateEnabled: !!complimentaryUnlockCode,
+  });
 });
 
 router.put("/", requireAuth, requirePermission("manage_settings"), validate(settingsUpdateSchema), async (req, res) => {
@@ -71,6 +98,15 @@ router.put("/", requireAuth, requirePermission("manage_settings"), validate(sett
     .set(update)
     .where(eq(settings.id, rows[0]!.id))
     .returning();
+  // Mask the unlock code on the response so the value we just wrote
+  // doesn't bounce back in plaintext. Same masking rule as the GET.
+  const maskedUpdated = updated
+    ? {
+        ...updated,
+        complimentaryUnlockCode: updated.complimentaryUnlockCode ? "" : null,
+        hasComplimentaryUnlockCode: !!updated.complimentaryUnlockCode,
+      }
+    : null;
   invalidateSettings();
   await publishSettingsInvalidation();
   await logActivity({
@@ -81,8 +117,34 @@ router.put("/", requireAuth, requirePermission("manage_settings"), validate(sett
     performedBy: req.user!.id,
     ipAddress: req.ip,
   });
-  return ok(res, updated);
+  return ok(res, maskedUpdated);
 });
+
+// Verify a staff-typed access code. Generic name on purpose — the
+// endpoint, the request body, and the error message intentionally
+// don't reveal WHAT the code unlocks. The Reports UI calls this when
+// staff clicks "More" so the network tab doesn't shout
+// "/unlock-complimentary". Returns 200/{ ok: true } on match, 401 on
+// miss or when no code is configured. We deliberately don't
+// distinguish "wrong code" from "no code set" so a sniffer can't tell
+// whether the gate is active.
+router.post(
+  "/verify-access-code",
+  requireAuth,
+  validate(unlockSettingsCodeSchema),
+  async (req, res) => {
+    const { code } = req.body as { code: string };
+    const rows = await db
+      .select({ stored: settings.complimentaryUnlockCode })
+      .from(settings)
+      .limit(1);
+    const stored = rows[0]?.stored ?? null;
+    if (!stored || stored !== code) {
+      return fail(res, 401, "INVALID_CODE", "Incorrect code");
+    }
+    return ok(res, { ok: true });
+  },
+);
 
 router.get("/room-types", requireAuth, requirePermission("view_rooms", "manage_settings"), async (req, res) => {
   const includeArchived = req.query.all === "true";

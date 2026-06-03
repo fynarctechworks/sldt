@@ -63,6 +63,7 @@ interface DashboardData {
     id: string;
     room_number: string;
     room_type: string;
+    floor: number;
     status: string;
     guest_name: string | null;
     reservation_id: string | null;
@@ -194,100 +195,87 @@ export default function Dashboard() {
       )}
 
       <div className="card">
-        <h2 className="font-semibold text-brand-dark mb-4">Availability by Room Type</h2>
-        <div className="grid grid-cols-1 gap-4">
-          {groupByType(data.room_grid).map((g) => {
-            // "Sellable tonight" = truly available + held-tonight-but-
-            // -reserved-for-future. Drives the big headline number so
-            // staff sees what they can actually book.
-            const sellable = g.available + g.held;
-            const pct = g.total > 0 ? Math.round((sellable / g.total) * 100) : 0;
-            const availPct = g.total > 0 ? (g.available / g.total) * 100 : 0;
-            const heldPct = g.total > 0 ? (g.held / g.total) * 100 : 0;
-            const occPct = g.total > 0 ? (g.occupied / g.total) * 100 : 0;
-            const resPct = g.total > 0 ? (g.reserved / g.total) * 100 : 0;
-            const dirtyPct = g.total > 0 ? (g.dirty / g.total) * 100 : 0;
-            const cleanPct = g.total > 0 ? (g.clean / g.total) * 100 : 0;
-            const inspPct = g.total > 0 ? (g.inspected / g.total) * 100 : 0;
-            const maintPct = g.total > 0 ? (g.maintenance / g.total) * 100 : 0;
+        <h2 className="font-semibold text-brand-dark mb-3">Availability by Floor</h2>
+        {/* Floor → number-sorted tile grid. One row per floor; rooms
+            inside a floor are sorted by room number (201, 202, 203…)
+            regardless of type, so the layout mirrors how staff walks
+            the property. The floor-level headline rolls up the same
+            status chips that used to live on per-type strips. */}
+        {groupByFloor(data.room_grid).map((floorGroup, floorIdx) => {
+          const floorStats = rollupFloorStats(floorGroup.rooms);
+          const sellable = floorStats.available + floorStats.held;
+          const pct = floorStats.total > 0
+            ? Math.round((sellable / floorStats.total) * 100)
+            : 0;
+          const chips: { label: string; count: number; dot: string }[] = [];
+          if (floorStats.available > 0) chips.push({ label: "Available", count: floorStats.available, dot: "bg-[#E6B800]" });
+          if (floorStats.held > 0) chips.push({ label: "Held", count: floorStats.held, dot: "bg-warning" });
+          if (floorStats.occupied > 0) chips.push({ label: "Occupied", count: floorStats.occupied, dot: "bg-[#0F3D2E]" });
+          if (floorStats.reserved > 0) chips.push({ label: "Reserved", count: floorStats.reserved, dot: "bg-[#B08A4A]" });
+          if (floorStats.dirty > 0) chips.push({ label: "Needs Cleaning", count: floorStats.dirty, dot: "bg-[#D9A441]" });
+          if (floorStats.clean > 0) chips.push({ label: "Clean", count: floorStats.clean, dot: "bg-[#5B8BAF]" });
+          if (floorStats.inspected > 0) chips.push({ label: "Inspected", count: floorStats.inspected, dot: "bg-[#3F7D4F]" });
+          if (floorStats.maintenance > 0) chips.push({ label: "Maintenance", count: floorStats.maintenance, dot: "bg-[#2A2A2A]" });
 
-            // Always-visible primary chips, then conditional housekeeping chips
-            const chips: { label: string; count: number; bgTint: string; dot: string }[] = [
-              { label: "Available", count: g.available, bgTint: "bg-[#E6B800]/15", dot: "bg-[#E6B800]" },
-              { label: "Occupied", count: g.occupied, bgTint: "bg-[#0F3D2E]/10", dot: "bg-[#0F3D2E]" },
-              { label: "Reserved", count: g.reserved, bgTint: "bg-[#B08A4A]/15", dot: "bg-[#B08A4A]" },
-            ];
-            if (g.held > 0) chips.push({ label: "Held", count: g.held, bgTint: "bg-warning/15", dot: "bg-warning" });
-            if (g.dirty > 0) chips.push({ label: "Dirty", count: g.dirty, bgTint: "bg-[#D9A441]/15", dot: "bg-[#D9A441]" });
-            if (g.clean > 0) chips.push({ label: "Clean", count: g.clean, bgTint: "bg-[#5B8BAF]/10", dot: "bg-[#5B8BAF]" });
-            if (g.inspected > 0) chips.push({ label: "Inspected", count: g.inspected, bgTint: "bg-[#3F7D4F]/15", dot: "bg-[#3F7D4F]" });
-            if (g.maintenance > 0) chips.push({ label: "Maintenance", count: g.maintenance, bgTint: "bg-[#2A2A2A]/10", dot: "bg-[#2A2A2A]" });
-
-            return (
-              <div key={g.type} className="border border-borderc rounded-md p-4 bg-surface">
-                <div className="flex justify-between items-baseline mb-3">
-                  <div className="font-semibold text-brand-dark capitalize">{g.type.replace(/_/g, " ")}</div>
-                  <div className="text-xs text-textSecondary">{g.total} total</div>
-                </div>
-
-                <div className="flex items-baseline gap-2">
-                  <div className="text-3xl font-bold text-brand">{sellable}</div>
-                  <div className="text-xs text-textSecondary">
-                    sellable tonight · {pct}%
-                    {g.held > 0 && (
-                      <span className="ml-1 text-warning font-semibold">
-                        ({g.held} held)
-                      </span>
-                    )}
+          return (
+            <div
+              key={`floor-${floorGroup.floor}`}
+              className={floorIdx === 0 ? "pb-2" : "mt-5 pt-4 border-t-2 border-brand-dark/15 pb-2"}
+            >
+              <div className="flex items-center justify-between gap-3 flex-wrap mb-2">
+                <div className="flex items-baseline gap-3">
+                  <div className="font-semibold text-brand-dark">
+                    Floor {floorGroup.floor}
+                  </div>
+                  <div className="flex items-baseline gap-1.5">
+                    <span className="text-xl font-bold text-brand">{sellable}</span>
+                    <span className="text-[11px] text-textSecondary">
+                      sellable · {pct}%
+                      {floorStats.held > 0 && (
+                        <span className="ml-1 text-warning font-semibold">
+                          ({floorStats.held} held)
+                        </span>
+                      )}
+                    </span>
                   </div>
                 </div>
-
-                <div className="flex h-3 mt-3 rounded-full overflow-hidden bg-borderc/40 ring-1 ring-borderc">
-                  {availPct > 0 && <div className="bg-[#E6B800]" style={{ width: `${availPct}%` }} title={`Available ${g.available}`} />}
-                  {heldPct > 0 && <div className="bg-warning" style={{ width: `${heldPct}%` }} title={`Held tonight ${g.held}`} />}
-                  {occPct > 0 && <div className="bg-[#0F3D2E]" style={{ width: `${occPct}%` }} title={`Occupied ${g.occupied}`} />}
-                  {resPct > 0 && <div className="bg-[#B08A4A]" style={{ width: `${resPct}%` }} title={`Reserved ${g.reserved}`} />}
-                  {dirtyPct > 0 && <div className="bg-[#D9A441]" style={{ width: `${dirtyPct}%` }} title={`Dirty ${g.dirty}`} />}
-                  {cleanPct > 0 && <div className="bg-[#5B8BAF]" style={{ width: `${cleanPct}%` }} title={`Clean ${g.clean}`} />}
-                  {inspPct > 0 && <div className="bg-[#3F7D4F]" style={{ width: `${inspPct}%` }} title={`Inspected ${g.inspected}`} />}
-                  {maintPct > 0 && <div className="bg-[#2A2A2A]" style={{ width: `${maintPct}%` }} title={`Maintenance ${g.maintenance}`} />}
-                </div>
-
-                <div className="grid grid-cols-3 gap-2 mt-3">
+                <div className="flex items-center gap-1.5 flex-wrap">
                   {chips.map((c) => (
-                    <div key={c.label} className={`flex items-center gap-2 px-2 py-1.5 rounded ${c.bgTint}`}>
-                      <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${c.dot}`} />
-                      <div className="min-w-0">
-                        <div className="text-[10px] uppercase tracking-wide text-textSecondary leading-none">{c.label}</div>
-                        <div className="text-sm font-semibold text-brand-dark leading-tight">{c.count}</div>
-                      </div>
-                    </div>
+                    <span
+                      key={c.label}
+                      className="inline-flex items-center gap-1 text-[11px] text-textSecondary"
+                      title={`${c.label} ${c.count}`}
+                    >
+                      <span className={`w-1.5 h-1.5 rounded-full ${c.dot}`} />
+                      <span className="font-semibold text-brand-dark">{c.count}</span>
+                      <span>{c.label}</span>
+                    </span>
                   ))}
-                </div>
-
-                <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-7 gap-2.5 mt-4">
-                  {g.rooms.map((r) => (
-                    <RoomTile
-                      key={r.id}
-                      room={r}
-                      onWalkIn={() =>
-                        navigate(`/reservations/new?mode=walkin&room=${r.id}`)
-                      }
-                      onOpenReservation={() => {
-                        // Prefer the human-readable SLDT-RES-NNNN — the
-                        // API resolves either, but a shareable URL is
-                        // the point of this work.
-                        const handle = r.reservation_number ?? r.reservation_id;
-                        if (handle) navigate(`/reservations/${handle}`);
-                      }}
-                      onOpenRoom={() => navigate(`/rooms/${r.room_number}`)}
-                    />
-                  ))}
+                  <span className="text-[11px] text-textSecondary/70 ml-1">
+                    · {floorStats.total} total
+                  </span>
                 </div>
               </div>
-            );
-          })}
-        </div>
+
+              <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-7 gap-2.5 mt-3">
+                {floorGroup.rooms.map((r) => (
+                  <RoomTile
+                    key={r.id}
+                    room={r}
+                    onWalkIn={() =>
+                      navigate(`/reservations/new?mode=walkin&room=${r.id}`)
+                    }
+                    onOpenReservation={() => {
+                      const handle = r.reservation_number ?? r.reservation_id;
+                      if (handle) navigate(`/reservations/${handle}`);
+                    }}
+                    onOpenRoom={() => navigate(`/rooms/${r.room_number}`)}
+                  />
+                ))}
+              </div>
+            </div>
+          );
+        })}
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -540,50 +528,66 @@ function RoomTile({
   // Visual tokens per status. Keeping this in one map (rather than the
   // utility-class soup we had before) makes the colour story easy to
   // see at a glance.
+  // typeText controls the small "AC SINGLE ROOM" strapline. On dark-
+  // card statuses (occupied) it needs a light tint to stay readable;
+  // on light cards the muted brand colour matches the headline.
   const STYLES: Record<
     string,
-    { card: string; statusText: string; statusDot: string; label: string }
+    {
+      card: string;
+      statusText: string;
+      statusDot: string;
+      typeText: string;
+      label: string;
+    }
   > = {
     available: {
       card: "bg-success/5 border-success/40 text-success",
       statusText: "text-success",
       statusDot: "bg-success",
+      typeText: "text-textSecondary",
       label: "Available",
     },
     occupied: {
       card: "bg-brand-dark text-cream border-brand-dark",
       statusText: "text-cream/90",
       statusDot: "bg-cream",
+      typeText: "text-cream/80",
       label: "Occupied",
     },
     reserved: {
       card: "bg-warning/10 border-warning/50 text-warning",
       statusText: "text-warning",
       statusDot: "bg-warning",
+      typeText: "text-warning/80",
       label: "Reserved",
     },
     dirty: {
       card: "bg-[#FBEFD9] border-[#B45309]/40 text-[#B45309]",
       statusText: "text-[#B45309]",
       statusDot: "bg-[#B45309]",
-      label: "Dirty",
+      typeText: "text-[#B45309]/80",
+      label: "Needs Cleaning",
     },
     clean: {
       card: "bg-yellow-50 border-yellow-300 text-yellow-800",
       statusText: "text-yellow-800",
       statusDot: "bg-yellow-500",
+      typeText: "text-yellow-800/80",
       label: "Clean",
     },
     inspected: {
       card: "bg-success/5 border-success/40 text-success",
       statusText: "text-success",
       statusDot: "bg-success",
+      typeText: "text-success/80",
       label: "Inspected",
     },
     maintenance: {
       card: "bg-danger/5 border-danger/40 text-danger",
       statusText: "text-danger",
       statusDot: "bg-danger",
+      typeText: "text-danger/80",
       label: "Maintenance",
     },
   };
@@ -613,6 +617,13 @@ function RoomTile({
       <div className="px-3 py-3 flex flex-col items-center gap-1">
         <span className="font-mono text-2xl font-bold tracking-wide">
           {room.room_number}
+        </span>
+        {/* Type label — small uppercase strapline so the staff can tell
+            an AC Single from a Luxury without hovering. Sits between
+            the room number and the status pill. Colour follows the
+            tile's status so it stays legible on dark cards too. */}
+        <span className={`text-[9px] uppercase tracking-[0.12em] truncate max-w-full ${style.typeText}`}>
+          {room.room_type.replace(/_/g, " ")}
         </span>
         <span className={`inline-flex items-center gap-1.5 text-[10px] uppercase tracking-[0.12em] font-bold ${style.statusText}`}>
           <span className={`w-1.5 h-1.5 rounded-full ${style.statusDot}`} />
@@ -670,6 +681,7 @@ interface RoomGridRow {
   id: string;
   room_number: string;
   room_type: string;
+  floor: number;
   status: string;
   guest_name: string | null;
   // Upcoming hold window. Both ends are yyyy-MM-dd. Used to render
@@ -680,81 +692,53 @@ interface RoomGridRow {
   relet_pending: { nextGuestName: string; nextCheckIn: string } | null;
 }
 
-function groupByType(rooms: RoomGridRow[]) {
-  const map = new Map<
-    string,
-    {
-      type: string;
-      total: number;
-      available: number;
-      occupied: number;
-      reserved: number;
-      // Sellable tonight but locked for an upcoming arrival. Counted
-      // separately so the strip stays accurate (a held room isn't
-      // both "fully available" and "reserved" — it's neither).
-      held: number;
-      dirty: number;
-      clean: number;
-      inspected: number;
-      maintenance: number;
-      rooms: RoomGridRow[];
-    }
-  >();
+// Group rooms by physical floor so the dashboard mirrors the property's
+// actual layout. Floors render in ascending order (1, 2, 3 …) and
+// rooms within each floor are sorted by room number (201, 202, 203 …)
+// regardless of type — staff scans the floor as if walking the corridor.
+function groupByFloor(rooms: RoomGridRow[]) {
+  const map = new Map<number, RoomGridRow[]>();
   for (const r of rooms) {
-    const key = r.room_type || "untyped";
-    if (!map.has(key)) {
-      map.set(key, {
-        type: key,
-        total: 0,
-        available: 0,
-        occupied: 0,
-        reserved: 0,
-        held: 0,
-        dirty: 0,
-        clean: 0,
-        inspected: 0,
-        maintenance: 0,
-        rooms: [],
-      });
-    }
-    const g = map.get(key)!;
-    g.total++;
-    g.rooms.push(r);
-    // Tile-level effective_status drives the bucket. Available rooms
-    // that have a future hold go to the dedicated 'held' bucket so
-    // the strip stays exclusive (no room counted twice). True
-    // 'reserved' (someone arriving today) keeps its own bucket.
-    if (r.status === "available" && r.held_from) g.held++;
-    else if (r.status === "available") g.available++;
-    else if (r.status === "occupied") g.occupied++;
-    else if (r.status === "reserved") g.reserved++;
-    else if (r.status === "dirty") g.dirty++;
-    else if (r.status === "clean") g.clean++;
-    else if (r.status === "inspected") g.inspected++;
-    else if (r.status === "maintenance") g.maintenance++;
+    const f = r.floor ?? 0;
+    if (!map.has(f)) map.set(f, []);
+    map.get(f)!.push(r);
   }
-  return Array.from(map.values())
-    .map((g) => ({ ...g, rooms: g.rooms.sort((a, b) => a.room_number.localeCompare(b.room_number, undefined, { numeric: true })) }))
-    .sort((a, b) => a.type.localeCompare(b.type));
+  return Array.from(map.entries())
+    .map(([floor, rs]) => ({
+      floor,
+      rooms: rs.sort((a, b) =>
+        a.room_number.localeCompare(b.room_number, undefined, { numeric: true }),
+      ),
+    }))
+    .sort((a, b) => a.floor - b.floor);
 }
 
-function gridColor(status: string): string {
-  switch (status) {
-    case "available":
-      return "bg-[#E6B800] text-[#3A2A0A] border-[#E6B800] hover:opacity-90";
-    case "occupied":
-      return "bg-[#0F3D2E] text-white border-[#0F3D2E] hover:opacity-90";
-    case "reserved":
-      return "bg-[#B08A4A] text-white border-[#B08A4A] hover:opacity-90";
-    case "dirty":
-      return "bg-white text-[#A87724] border-[#D9A441] hover:bg-[#FFF7E2]";
-    case "clean":
-      return "bg-white text-[#3F6B8C] border-[#5B8BAF] hover:bg-[#EAF2F8]";
-    case "inspected":
-      return "bg-[#3F7D4F] text-white border-[#3F7D4F] hover:opacity-90";
-    case "maintenance":
-      return "bg-[#2A2A2A] text-white border-[#2A2A2A] hover:opacity-90";
-    default:
-      return "bg-white text-textSecondary border-borderc";
+// Roll status counts up to floor level so the floor headline can show
+// the same Available/Held/Occupied/etc. chips that used to sit on the
+// per-type strip. Mirrors the per-type bucket logic exactly.
+function rollupFloorStats(rooms: RoomGridRow[]) {
+  const s = {
+    total: 0,
+    available: 0,
+    held: 0,
+    occupied: 0,
+    reserved: 0,
+    dirty: 0,
+    clean: 0,
+    inspected: 0,
+    maintenance: 0,
+  };
+  for (const r of rooms) {
+    s.total++;
+    if (r.status === "available" && r.held_from) s.held++;
+    else if (r.status === "available") s.available++;
+    else if (r.status === "occupied") s.occupied++;
+    else if (r.status === "reserved") s.reserved++;
+    else if (r.status === "dirty") s.dirty++;
+    else if (r.status === "clean") s.clean++;
+    else if (r.status === "inspected") s.inspected++;
+    else if (r.status === "maintenance") s.maintenance++;
   }
+  return s;
 }
+

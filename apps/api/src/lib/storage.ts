@@ -148,6 +148,106 @@ export async function deleteKycFile(path: string): Promise<void> {
   await supabaseAdmin.storage.from(BUCKET).remove([path]);
 }
 
+// ============ EXPENSE ATTACHMENTS (vendor bills / receipts) ============
+// Private bucket — only senior staff (manage_expenses) should ever
+// see a property bill. Same access pattern as KYC: signed URLs.
+//
+// Bills may legitimately be PDFs (utility invoices) AND images
+// (phone photos of paper bills), so the whitelist is broader than
+// KYC. Sharp is NOT used here — we don't want to lossy-recompress a
+// scanned PDF tax invoice. Inputs are still magic-byte sniffed and
+// size-capped at the multer layer before they ever reach us.
+
+const EXPENSE_BUCKET = "expense-bills";
+const EXPENSE_ALLOWED_MIME = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "application/pdf",
+]);
+const EXPENSE_MAX_BYTES = 10 * 1024 * 1024; // 10 MB — PDFs run bigger than KYC
+
+export function validateExpenseAttachment(file: {
+  mimetype: string;
+  size: number;
+}): string | null {
+  if (!EXPENSE_ALLOWED_MIME.has(file.mimetype))
+    return "File must be JPEG, PNG, WEBP, or PDF";
+  if (file.size > EXPENSE_MAX_BYTES) return "File must be under 10 MB";
+  return null;
+}
+
+let expenseBucketEnsured = false;
+async function ensureExpenseBucket() {
+  if (expenseBucketEnsured) return;
+  const { data: buckets, error: listErr } =
+    await supabaseAdmin.storage.listBuckets();
+  if (listErr) {
+    logger.warn({ err: listErr.message }, "storage listBuckets failed");
+    return;
+  }
+  if (!buckets?.some((b) => b.name === EXPENSE_BUCKET)) {
+    const { error: createErr } = await supabaseAdmin.storage.createBucket(
+      EXPENSE_BUCKET,
+      { public: false },
+    );
+    if (createErr) {
+      logger.warn({ err: createErr.message }, "expense bucket create failed");
+      return;
+    }
+    logger.info("created expense-bills bucket");
+  }
+  expenseBucketEnsured = true;
+}
+
+export async function uploadExpenseAttachment(
+  expenseId: string,
+  file: { buffer: Buffer; mimetype: string; originalName?: string },
+): Promise<string> {
+  await ensureExpenseBucket();
+  // Random suffix so even a leaked storage listing doesn't enumerate
+  // bills by predictable filename. Extension comes from the mimetype
+  // (not the original name) so a renamed `bill.pdf.exe` can't sneak
+  // through.
+  const ext =
+    file.mimetype === "application/pdf"
+      ? "pdf"
+      : file.mimetype === "image/png"
+        ? "png"
+        : file.mimetype === "image/webp"
+          ? "webp"
+          : "jpg";
+  const token = randomBytes(16).toString("hex");
+  const path = `${expenseId}/bill-${token}.${ext}`;
+  const { error } = await supabaseAdmin.storage
+    .from(EXPENSE_BUCKET)
+    .upload(path, file.buffer, {
+      contentType: file.mimetype,
+      upsert: true,
+      cacheControl: "private, max-age=0, no-store",
+    });
+  if (error)
+    throw new Error(`Expense attachment upload failed: ${error.message}`);
+  return path;
+}
+
+export async function signedExpenseAttachmentUrl(
+  path: string,
+  expiresInSeconds = 300,
+): Promise<string | null> {
+  if (!path) return null;
+  const { data, error } = await supabaseAdmin.storage
+    .from(EXPENSE_BUCKET)
+    .createSignedUrl(path, expiresInSeconds);
+  if (error) return null;
+  return data.signedUrl;
+}
+
+export async function deleteExpenseAttachment(path: string): Promise<void> {
+  if (!path) return;
+  await supabaseAdmin.storage.from(EXPENSE_BUCKET).remove([path]);
+}
+
 // ============ DOCUMENT LINKS (invoices, receipts, slips) ============
 // Public bucket so the link works in WhatsApp without auth.
 const DOCS_BUCKET = "documents";

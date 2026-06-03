@@ -24,7 +24,6 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { useAuth } from "@/auth/AuthContext";
 import { CheckInReceiptModal, type CheckInReceiptData } from "@/components/CheckInReceiptModal";
 import { EarlyCheckInModal } from "@/components/EarlyCheckInModal";
 import { EditInvoiceModal } from "@/components/EditInvoiceModal";
@@ -58,6 +57,14 @@ interface Detail {
   // already 'complimentary') and the booking-source pill on the page.
   bookingSource?: "walkin" | "phone_whatsapp" | "complimentary";
   checkedInAt: string | null;
+  // Actual check-out timestamp — set when staff completes checkout.
+  // The dates card prefers this over plannedCheckOutAt / policy
+  // default once it's available.
+  checkedOutAt?: string | null;
+  // 0023 — staff-chosen arrival / departure clock times. Planned/
+  // display-only; NULL falls back to hotel policy.
+  plannedCheckInAt?: string | null;
+  plannedCheckOutAt?: string | null;
   specialRequests: string | null;
   subtotal: string;
   grandTotal: string;
@@ -177,7 +184,6 @@ export default function ReservationDetail() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const qc = useQueryClient();
-  const { profile } = useAuth();
   const dialog = useDialog();
   const [err, setErr] = useState<string | null>(null);
 
@@ -447,7 +453,6 @@ export default function ReservationDetail() {
     const diffMs = Date.now() - effectiveOut.getTime();
     return diffMs > 0 ? Math.floor(diffMs / 60_000) : 0;
   })();
-  const isOverdue = minutesOverdue > 0;
 
   return (
     <div className="space-y-4">
@@ -563,28 +568,59 @@ export default function ReservationDetail() {
             <div>
               <strong>In:</strong>{" "}
               {format(
-                r.checkedInAt ? new Date(r.checkedInAt) : new Date(r.checkInDate),
+                r.checkedInAt
+                  ? new Date(r.checkedInAt)
+                  : r.plannedCheckInAt
+                    ? new Date(r.plannedCheckInAt)
+                    : new Date(r.checkInDate),
                 "dd MMM yyyy",
               )}{" "}
               <span className="text-textSecondary">
                 ·{" "}
+                {/* Priority: actual checked-in stamp > staff-chosen
+                    planned time (0023) > hotel policy default. */}
                 {r.checkedInAt
                   ? format(new Date(r.checkedInAt), "h:mm a")
-                  : formatTime(r.hotelCheckInTime)}
+                  : r.plannedCheckInAt
+                    ? format(new Date(r.plannedCheckInAt), "h:mm a")
+                    : formatTime(r.hotelCheckInTime)}
               </span>
+              {r.checkedInAt && (
+                <span className="ml-1.5 inline-flex items-center gap-1 text-[10px] uppercase tracking-wider text-success font-semibold">
+                  · actual
+                </span>
+              )}
             </div>
             <div>
               <strong>Out:</strong>{" "}
               {format(
-                shortStayCheckoutAt ?? new Date(r.checkOutDate),
+                // Priority: actual checked-out stamp (post-checkout) >
+                // short-stay computed exit > staff-chosen planned time >
+                // hotel policy default. Once a real checkout exists,
+                // we show that exact moment instead of the schedule.
+                r.checkedOutAt
+                  ? new Date(r.checkedOutAt)
+                  : shortStayCheckoutAt ??
+                      (r.plannedCheckOutAt
+                        ? new Date(r.plannedCheckOutAt)
+                        : new Date(r.checkOutDate)),
                 "dd MMM yyyy",
               )}{" "}
               <span className="text-textSecondary">
                 ·{" "}
-                {shortStayCheckoutAt
-                  ? format(shortStayCheckoutAt, "h:mm a")
-                  : formatTime(r.hotelCheckOutTime)}
+                {r.checkedOutAt
+                  ? format(new Date(r.checkedOutAt), "h:mm a")
+                  : shortStayCheckoutAt
+                    ? format(shortStayCheckoutAt, "h:mm a")
+                    : r.plannedCheckOutAt
+                      ? format(new Date(r.plannedCheckOutAt), "h:mm a")
+                      : formatTime(r.hotelCheckOutTime)}
               </span>
+              {r.checkedOutAt && (
+                <span className="ml-1.5 inline-flex items-center gap-1 text-[10px] uppercase tracking-wider text-success font-semibold">
+                  · actual
+                </span>
+              )}
             </div>
             <div className="text-textSecondary text-xs mt-1">
               {isShortStay
@@ -807,26 +843,63 @@ export default function ReservationDetail() {
             </tr>
           </thead>
           <tbody>
-            {rooms.map((room) => (
-              <RoomRow
-                key={room.id}
-                reservationId={r.id}
-                room={room}
-                reservationCheckIn={r.checkInDate}
-                reservationCheckOut={r.checkOutDate}
-                isShortStay={r.stayType === "short_stay"}
-                isSingleNight={r.stayType !== "short_stay" && nights <= 1}
-                nights={nights}
-                onSaved={invalidate}
-                onInvoiceIssuedNeedsPayment={(inv) =>
-                  setPostIssuePay({
-                    invoiceId: inv.id,
-                    invoiceNumber: inv.invoiceNumber,
-                    balanceDue: inv.balanceDue,
-                  })
+            {rooms.map((room) => {
+              // Swap chain context. Rows that share a swap_id are
+              // sibling segments of the same swap event. Sort them by
+              // effective_from to figure out who's the predecessor
+              // and who's the successor — so each row can show
+              // "Swapped to Room X" or "Swapped from Room X" instead
+              // of a vague "Swapped" pill, and we can hide write
+              // actions on closed legs.
+              let swapSiblingNumber: string | null = null;
+              let swapDirection: "to" | "from" | null = null;
+              if (room.swapId) {
+                const siblings = rooms
+                  .filter((rr) => rr.swapId === room.swapId)
+                  .slice()
+                  .sort((a, b) =>
+                    String(a.effectiveFrom ?? r.checkInDate) <
+                    String(b.effectiveFrom ?? r.checkInDate)
+                      ? -1
+                      : 1,
+                  );
+                const idx = siblings.findIndex((s) => s.id === room.id);
+                if (idx >= 0 && siblings.length > 1) {
+                  // Last in the chain = current/active leg ("swapped
+                  // from" its predecessor). Anything earlier = closed
+                  // leg ("swapped to" its successor).
+                  if (idx === siblings.length - 1) {
+                    swapDirection = "from";
+                    swapSiblingNumber = siblings[idx - 1]!.roomNumber;
+                  } else {
+                    swapDirection = "to";
+                    swapSiblingNumber = siblings[idx + 1]!.roomNumber;
+                  }
                 }
-              />
-            ))}
+              }
+              return (
+                <RoomRow
+                  key={room.id}
+                  reservationId={r.id}
+                  room={room}
+                  reservationCheckIn={r.checkInDate}
+                  reservationCheckOut={r.checkOutDate}
+                  isShortStay={r.stayType === "short_stay"}
+                  isSingleNight={r.stayType !== "short_stay" && nights <= 1}
+                  nights={nights}
+                  swapSiblingNumber={swapSiblingNumber}
+                  swapDirection={swapDirection}
+                  onSaved={invalidate}
+                  onInvoiceIssuedNeedsPayment={(inv) =>
+                    setPostIssuePay({
+                      invoiceId: inv.id,
+                      invoiceNumber: inv.invoiceNumber,
+                      balanceDue: inv.balanceDue,
+                    })
+                  }
+                />
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -912,17 +985,27 @@ export default function ReservationDetail() {
                     scopeRoomIds.includes((rm as { id: string }).id),
                   )
                 : null;
+              // The "Per room" vs "Combined" badge is only meaningful on
+              // multi-room bookings — it tells staff whether each room has
+              // its own bill or one bill covers them all. On a single-room
+              // reservation the distinction doesn't exist and the legacy
+              // scope='combined' default would otherwise mislabel a plain
+              // one-room invoice as COMBINED.
+              const totalRoomsOnRes = (data.rooms ?? []).length;
+              const showScopeBadge = totalRoomsOnRes > 1;
               return (
                 <li key={inv.id} className="px-4 py-3 flex items-start justify-between gap-3">
                   <div className="min-w-0">
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="font-mono font-bold text-navy">{richInv.invoiceNumber}</span>
                       <StatusBadge status={richInv.status} />
-                      <span
-                        className={`text-[10px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded border ${scope === "room" ? "bg-brand-soft text-brand-dark border-brand-dark/30" : "bg-accentBlue/10 text-accentBlue border-accentBlue/30"}`}
-                      >
-                        {scope === "room" ? "Per room" : "Combined"}
-                      </span>
+                      {showScopeBadge && (
+                        <span
+                          className={`text-[10px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded border ${scope === "room" ? "bg-brand-soft text-brand-dark border-brand-dark/30" : "bg-accentBlue/10 text-accentBlue border-accentBlue/30"}`}
+                        >
+                          {scope === "room" ? "Per room" : "Combined"}
+                        </span>
+                      )}
                     </div>
                     <div className="text-xs text-textSecondary mt-0.5">
                       Grand Total{" "}
@@ -1442,6 +1525,11 @@ function RoomRow(props: {
   // sub-range to segment when the segment is exactly one night long.
   isSingleNight: boolean;
   nights: number;
+  // Swap chain context, computed by the parent so each row can label
+  // itself "Swapped to/from Room X" and we can suppress write actions
+  // on closed legs.
+  swapSiblingNumber?: string | null;
+  swapDirection?: "to" | "from" | null;
   onSaved: () => void;
   // Called when a per-room invoice was just issued AND it still has a
   // balance to collect. The parent uses this to surface the Record
@@ -1464,6 +1552,26 @@ function RoomRow(props: {
   const segFrom = props.room.effectiveFrom ?? props.reservationCheckIn;
   const segTo = props.room.effectiveTo ?? props.reservationCheckOut;
   const isSegmented = !!(props.room.effectiveFrom || props.room.effectiveTo);
+  // Closed leg of a swap = an earlier segment in the same swap chain.
+  // The guest is no longer in this room (they moved to the sibling).
+  // We surface this as a status pill instead of "checked in", and we
+  // suppress every write action (Check Out, Issue Invoice, Swap)
+  // because there's nothing to act on here — the room is history.
+  const isClosedSwapLeg = props.swapDirection === "to";
+  // Per-row nights honour the segment window when the row was created
+  // by a mid-stay swap (0019). Without this, both halves of a swap
+  // would multiply the rate by the parent's total nights and the
+  // subtotal column would visually double-bill staff (matches the
+  // same fix in invoiceBuilder + invoice preview).
+  const rowNights = isSegmented
+    ? Math.max(
+        1,
+        Math.round(
+          (new Date(segTo).getTime() - new Date(segFrom).getTime()) /
+            (24 * 60 * 60 * 1000),
+        ),
+      )
+    : props.nights;
 
   // Per-room invoice. The API uses migration 0017's invoices.scope='room'.
   const issueRoomInvoice = useMutation({
@@ -1556,15 +1664,19 @@ function RoomRow(props: {
           {props.room.roomNumber}
           {/* Per-room (0017) reservation state pill. Distinct from
               the physical-room status pill below; e.g. a room can be
-              checked_out AND dirty at the same time. */}
-          {props.room.roomStatus && (
+              checked_out AND dirty at the same time.
+              Hidden on the closed leg of a swap because the guest is
+              no longer in this room — the "Swapped to Room X" pill
+              below already tells the story, and showing "CHECKED IN"
+              on a vacated room confuses staff. */}
+          {props.room.roomStatus && !isClosedSwapLeg && (
             <span
               className={`text-[9px] uppercase tracking-wide font-semibold px-1.5 py-0.5 rounded border ${roomStatusBadge[props.room.roomStatus]}`}
             >
               {props.room.roomStatus.replace("_", " ")}
             </span>
           )}
-          {statusBadge && (
+          {statusBadge && !isClosedSwapLeg && (
             <span className={`text-[9px] uppercase tracking-wide font-semibold px-1.5 py-0.5 rounded border ${statusBadge}`}>
               {status}
             </span>
@@ -1582,15 +1694,39 @@ function RoomRow(props: {
             )}
           </div>
         )}
-        {/* Segment timeline (0019). Shown when the row covers only a
-            sub-range of the parent reservation (i.e. a swap happened
-            and this row is one half of it). */}
+        {/* Segment timeline (0019). Shows the swap direction so staff
+            instantly read the row's role — "Swapped TO Room 205" on
+            the closed leg, "Swapped FROM Room 203" on the active leg.
+            Falls back to a plain "Swapped" pill when the sibling
+            isn't on the response (e.g. data races, legacy rows). */}
         {isSegmented && (
-          <div className="text-[11px] text-textSecondary mt-1 font-mono">
-            {format(new Date(segFrom), "dd MMM")} →{" "}
-            {format(new Date(segTo), "dd MMM")}
-            {props.room.swapReason && (
-              <span className="ml-1 italic">· {props.room.swapReason}</span>
+          <div className="mt-1 flex items-center gap-1.5 flex-wrap">
+            <span
+              className={`text-[9px] uppercase tracking-wide font-semibold px-1.5 py-0.5 rounded border ${
+                props.swapDirection === "to"
+                  ? "bg-textSecondary/10 text-textSecondary border-textSecondary/30"
+                  : "bg-accentBlue/10 text-accentBlue border-accentBlue/30"
+              }`}
+            >
+              {props.swapDirection === "to" && props.swapSiblingNumber
+                ? `Swapped to Room ${props.swapSiblingNumber}`
+                : props.swapDirection === "from" && props.swapSiblingNumber
+                  ? `Swapped from Room ${props.swapSiblingNumber}`
+                  : "Swapped"}
+            </span>
+            <span className="text-[11px] text-textSecondary font-mono">
+              {format(new Date(segFrom), "dd MMM")} →{" "}
+              {format(new Date(segTo), "dd MMM")} · {rowNights}n
+            </span>
+            {/* The swap reason describes what happened to the LEAVING
+                room (e.g. "Maintenance"). Showing it on the new room's
+                row makes 205 read as if 205 itself were broken — it's
+                not, 203 is. So we only render the reason on the closed
+                leg ("Swapped to ..."). */}
+            {props.room.swapReason && props.swapDirection === "to" && (
+              <span className="text-[11px] text-textSecondary italic">
+                · {props.room.swapReason}
+              </span>
             )}
           </div>
         )}
@@ -1635,81 +1771,98 @@ function RoomRow(props: {
       <td className="font-mono tabular-nums">
         {inr(props.room.ratePerNight)}
       </td>
-      <td className="font-mono tabular-nums">{inr(rate * props.nights)}</td>
+      <td className="font-mono tabular-nums">{inr(rate * rowNights)}</td>
       <td className="text-right">
-        <div className="inline-flex gap-1 items-center">
-          {/* Hide the housekeeping Status changer once the room is
-              checked out (or cancelled) from this reservation's
-              perspective. A finished room's clean/dirty/available state
-              is managed from the Rooms / Housekeeping pages — letting
-              staff flip it back to "Available" from a closed booking
-              created a confusing "un-check-out" path. */}
-          {isHousekeeping &&
-            status &&
-            props.room.roomStatus !== "checked_out" &&
-            props.room.roomStatus !== "cancelled" && (
-              <RoomActionPopover
-                roomId={props.room.id}
-                roomNumber={props.room.roomNumber}
-                status={status as "dirty" | "clean" | "inspected" | "available" | "maintenance"}
-                onChanged={props.onSaved}
-                invalidateKeys={[["reservation"], ["dashboard"]]}
-                trigger={
-                  <span
-                    className="inline-block !h-7 !px-2 text-xs font-medium rounded-sm border border-borderc bg-surface hover:bg-bg cursor-pointer leading-[1.5rem] capitalize"
-                    title="Change room status"
+        {isClosedSwapLeg ? (
+          // Closed leg of a swap. No actions — the row is historical,
+          // the guest moved to the sibling room. Showing Check Out /
+          // Swap / Issue Invoice here would let staff act on a vacated
+          // segment, which is meaningless and confusing. We keep the
+          // row visible (for billing transparency) but render it
+          // read-only.
+          <span
+            className="text-[10px] font-mono text-textSecondary px-1.5 py-0.5 rounded bg-textSecondary/10 border border-textSecondary/20"
+            title={`Vacated on ${format(new Date(segTo), "dd MMM yyyy")} — guest moved to Room ${props.swapSiblingNumber}`}
+          >
+            closed
+          </span>
+        ) : (
+          <>
+            <div className="inline-flex gap-1 items-center">
+              {/* Hide the housekeeping Status changer once the room is
+                  checked out (or cancelled) from this reservation's
+                  perspective. A finished room's clean/dirty/available state
+                  is managed from the Rooms / Housekeeping pages — letting
+                  staff flip it back to "Available" from a closed booking
+                  created a confusing "un-check-out" path. */}
+              {isHousekeeping &&
+                status &&
+                props.room.roomStatus !== "checked_out" &&
+                props.room.roomStatus !== "cancelled" && (
+                  <RoomActionPopover
+                    roomId={props.room.id}
+                    roomNumber={props.room.roomNumber}
+                    status={status as "dirty" | "clean" | "inspected" | "available" | "maintenance"}
+                    onChanged={props.onSaved}
+                    invalidateKeys={[["reservation"], ["dashboard"]]}
+                    trigger={
+                      <span
+                        className="inline-block !h-7 !px-2 text-xs font-medium rounded-sm border border-borderc bg-surface hover:bg-bg cursor-pointer leading-[1.5rem] capitalize"
+                        title="Change room status"
+                      >
+                        Status…
+                      </span>
+                    }
+                  />
+                )}
+              {props.room.roomStatus === "checked_in" && !props.room.roomInvoiceId && (
+                <button
+                  className="btn-secondary !h-7 !px-2 text-xs"
+                  onClick={() => setShowSwap(true)}
+                  title={
+                    props.isShortStay
+                      ? "Move this guest to a different room (same day)"
+                      : "Move this guest to a different room"
+                  }
+                >
+                  Swap
+                </button>
+              )}
+              {props.room.roomStatus === "checked_in" && (
+                <button
+                  className="btn-secondary !h-7 !px-2 text-xs"
+                  disabled={perRoomBusy !== null}
+                  onClick={() => setShowRoomCheckout(true)}
+                  title="Check this guest out & collect payment"
+                >
+                  Check Out
+                </button>
+              )}
+              {(props.room.roomStatus === "checked_in" ||
+                props.room.roomStatus === "checked_out") &&
+                !props.room.roomInvoiceId && (
+                  <button
+                    className="btn-primary !h-7 !px-2 text-xs"
+                    disabled={perRoomBusy !== null}
+                    onClick={confirmAndIssueInvoice}
+                    title="Generate a separate invoice for this room"
                   >
-                    Status…
-                  </span>
-                }
-              />
+                    {perRoomBusy === "invoice" ? "…" : "Issue Invoice"}
+                  </button>
+                )}
+              {props.room.roomInvoiceId && (
+                <span
+                  className="text-[10px] font-mono text-success px-1.5 py-0.5 rounded bg-success/10 border border-success/30"
+                  title="A per-room invoice exists for this room — see Invoices section"
+                >
+                  invoiced
+                </span>
+              )}
+            </div>
+            {perRoomError && (
+              <div className="text-[11px] text-danger mt-1 font-normal">{perRoomError}</div>
             )}
-          {props.room.roomStatus === "checked_in" && !props.room.roomInvoiceId && (
-            <button
-              className="btn-secondary !h-7 !px-2 text-xs"
-              onClick={() => setShowSwap(true)}
-              title={
-                props.isShortStay
-                  ? "Move this guest to a different room (same day)"
-                  : "Move this guest to a different room"
-              }
-            >
-              Swap
-            </button>
-          )}
-          {props.room.roomStatus === "checked_in" && (
-            <button
-              className="btn-secondary !h-7 !px-2 text-xs"
-              disabled={perRoomBusy !== null}
-              onClick={() => setShowRoomCheckout(true)}
-              title="Check this guest out & collect payment"
-            >
-              Check Out
-            </button>
-          )}
-          {(props.room.roomStatus === "checked_in" ||
-            props.room.roomStatus === "checked_out") &&
-            !props.room.roomInvoiceId && (
-              <button
-                className="btn-primary !h-7 !px-2 text-xs"
-                disabled={perRoomBusy !== null}
-                onClick={confirmAndIssueInvoice}
-                title="Generate a separate invoice for this room"
-              >
-                {perRoomBusy === "invoice" ? "…" : "Issue Invoice"}
-              </button>
-            )}
-          {props.room.roomInvoiceId && (
-            <span
-              className="text-[10px] font-mono text-success px-1.5 py-0.5 rounded bg-success/10 border border-success/30"
-              title="A per-room invoice exists for this room — see Invoices section"
-            >
-              invoiced
-            </span>
-          )}
-        </div>
-        {perRoomError && (
-          <div className="text-[11px] text-danger mt-1 font-normal">{perRoomError}</div>
+          </>
         )}
       </td>
     </tr>
@@ -1957,7 +2110,7 @@ function SwapRoomModal(props: {
                   checked={markOldRoomStatus === s}
                   onChange={() => setMarkOldRoomStatus(s)}
                 />
-                {s}
+                {s === "dirty" ? "Needs Cleaning" : s}
               </label>
             ))}
           </div>

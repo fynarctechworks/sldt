@@ -730,6 +730,12 @@ interface HotelSettings {
   // already contains GST; 'exclusive' = GST is added on top. Only
   // affects NEW bookings; existing reservations keep their own snapshot.
   gstMode: "exclusive" | "inclusive";
+  // Soft access gate for the Complimentary report (0024). The API
+  // never sends the actual code — `complimentaryUnlockCode` is "" when
+  // a code IS set, null when it's not. The boolean tells the UI
+  // whether to render "Set" or "Change / Clear" controls.
+  complimentaryUnlockCode?: string | null;
+  hasComplimentaryUnlockCode?: boolean;
 }
 
 function HotelTab() {
@@ -768,6 +774,18 @@ function HotelTab() {
         wifiPassword: f.wifiPassword && f.wifiPassword.trim() !== "" ? f.wifiPassword : null,
         gstMode: f.gstMode,
       };
+      // Reports access code (0024). API returns "" when a code is set
+      // (so the value never reaches the client), and null when not set.
+      // We only include the field in the PUT when staff has typed a
+      // new value or explicitly cleared it — otherwise the server's
+      // "v !== undefined" check would overwrite the stored value with
+      // an empty string.
+      if (typeof f.complimentaryUnlockCode === "string") {
+        payload.complimentaryUnlockCode =
+          f.complimentaryUnlockCode.trim() === ""
+            ? null
+            : f.complimentaryUnlockCode.trim();
+      }
       for (const k of Object.keys(payload)) {
         if (payload[k] === "" || payload[k] === undefined) delete payload[k];
       }
@@ -1006,6 +1024,58 @@ function HotelTab() {
               onChange={(e) => set("wifiPassword", e.target.value)}
             />
           </Field>
+        </div>
+      </div>
+
+      {/* Soft access gate for a sensitive report (0024). Generic label
+          on purpose — "Reports access code" doesn't reveal which
+          specific report it gates. Admins can set or clear it; the
+          API never returns the actual value back so a clearable
+          masked field is the right pattern. */}
+      <div className="border-t border-borderc pt-4 mt-2 space-y-3">
+        <h3 className="font-semibold text-brand-dark">Reports access code</h3>
+        <p className="text-xs text-textSecondary -mt-2">
+          Front-desk staff must type this code before they can open
+          certain sensitive reports. Leave blank to disable the gate.
+          {form.hasComplimentaryUnlockCode ? (
+            <span className="ml-1 text-success font-semibold">
+              · Code is set
+            </span>
+          ) : (
+            <span className="ml-1 text-textSecondary">· No code set</span>
+          )}
+        </p>
+        <div className="grid grid-cols-1 sm:grid-cols-[1fr_auto] gap-3 items-end">
+          <Field
+            label={
+              form.hasComplimentaryUnlockCode
+                ? "Change code (leave blank to keep current)"
+                : "Set code"
+            }
+          >
+            <input
+              className="input font-mono"
+              type="password"
+              autoComplete="new-password"
+              placeholder={
+                form.hasComplimentaryUnlockCode ? "••••••••" : "min 4 characters"
+              }
+              value={form.complimentaryUnlockCode ?? ""}
+              onChange={(e) => set("complimentaryUnlockCode", e.target.value)}
+            />
+          </Field>
+          {form.hasComplimentaryUnlockCode && (
+            <button
+              type="button"
+              className="btn-secondary"
+              onClick={() => {
+                // Send an explicit null to clear the gate on save.
+                set("complimentaryUnlockCode", "");
+              }}
+            >
+              Clear on save
+            </button>
+          )}
         </div>
       </div>
 

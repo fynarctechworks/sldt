@@ -16,6 +16,11 @@ export interface CheckInReceiptData {
   checkInDate: string;
   checkOutDate: string;
   checkedInAt?: string | null;
+  // 0023 — staff-chosen planned arrival / departure times. Surface on
+  // the receipt when present so the printed slip matches what staff
+  // promised the guest. Fall through to hotel policy when null.
+  plannedCheckInAt?: string | null;
+  plannedCheckOutAt?: string | null;
   numNights: number;
   // Day-use bookings hold hours, not nights. When set, the receipt shows
   // "Day use · N hours" instead of "N night(s)" everywhere.
@@ -420,14 +425,25 @@ export function CheckInReceiptModal({ data, onClose, variant = "checkin" }: Prop
                 <div>
                   <div className="text-[9px] uppercase tracking-wider text-brass font-bold">Check-in</div>
                   <div className="font-semibold text-brand-dark text-[12px] leading-tight">
-                    {format(new Date(data.checkedInAt ?? data.checkInDate), "dd MMM yyyy")}
+                    {format(
+                      new Date(
+                        data.checkedInAt ??
+                          data.plannedCheckInAt ??
+                          data.checkInDate,
+                      ),
+                      "dd MMM yyyy",
+                    )}
                   </div>
                   <div className="text-[10px] text-textSecondary leading-tight mt-0.5">
+                    {/* Priority (0023): actual checked-in stamp > staff-
+                        chosen planned time > hotel policy default. */}
                     {data.checkedInAt
                       ? `at ${format(new Date(data.checkedInAt), "h:mm a")}`
-                      : data.hotel.checkInTime
-                        ? `from ${formatTime(data.hotel.checkInTime)}`
-                        : ""}
+                      : data.plannedCheckInAt
+                        ? `at ${format(new Date(data.plannedCheckInAt), "h:mm a")}`
+                        : data.hotel.checkInTime
+                          ? `from ${formatTime(data.hotel.checkInTime)}`
+                          : ""}
                   </div>
                 </div>
                 <div>
@@ -440,14 +456,25 @@ export function CheckInReceiptModal({ data, onClose, variant = "checkin" }: Prop
                     const shortOut = isShort && data.checkedInAt && dur > 0
                       ? new Date(new Date(data.checkedInAt).getTime() + Math.round(dur * 3600 * 1000))
                       : null;
+                    // Priority (0023): short-stay computed > staff-chosen
+                    // planned time > hotel policy.
+                    const outDate =
+                      shortOut ??
+                      (data.plannedCheckOutAt
+                        ? new Date(data.plannedCheckOutAt)
+                        : new Date(data.checkOutDate));
                     return (
                       <>
                         <div className="font-semibold text-brand-dark text-[12px] leading-tight">
-                          {format(shortOut ?? new Date(data.checkOutDate), "dd MMM yyyy")}
+                          {format(outDate, "dd MMM yyyy")}
                         </div>
                         {shortOut ? (
                           <div className="text-[10px] text-textSecondary leading-tight mt-0.5">
                             by {format(shortOut, "h:mm a")}
+                          </div>
+                        ) : data.plannedCheckOutAt ? (
+                          <div className="text-[10px] text-textSecondary leading-tight mt-0.5">
+                            by {format(new Date(data.plannedCheckOutAt), "h:mm a")}
                           </div>
                         ) : data.hotel.checkOutTime ? (
                           <div className="text-[10px] text-textSecondary leading-tight mt-0.5">
@@ -626,6 +653,16 @@ export function CheckInReceiptModal({ data, onClose, variant = "checkin" }: Prop
               return `Welcome to ${data.hotel.name}. Please retain this slip for reference. Final invoice will be issued at check-out${byLabel}. For any assistance, contact the front desk.`;
             })()}
           </div>
+
+          {/* Booking-advance reminder: if money's still owed, surface
+              the exact amount and when it's due. Only shown for the
+              advance variant (a check-in receipt is rendered after
+              balance is settled, so this would be misleading there). */}
+          {isAdvance && Number(data.balanceDue) > 0.009 && (
+            <div className="receipt-section mt-3 px-3 py-2 rounded-sm border border-[#B45309] bg-[#FBEFD9] text-[#7C2D12] text-center text-[11px] font-semibold">
+              Note: The remaining balance of {inr(data.balanceDue)} must be paid on or before check-in.
+            </div>
+          )}
 
           <div className="receipt-section mt-6 flex justify-between gap-3">
             <div className="text-[10px] text-textSecondary">

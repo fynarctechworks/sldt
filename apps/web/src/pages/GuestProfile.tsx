@@ -1,8 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { format } from "date-fns";
-import { BedDouble, Bell, CalendarPlus, CheckCircle2, ExternalLink, FileImage, Pencil, Plus, ShieldCheck, Tag as TagIcon, Trash2, Upload, Wallet, X } from "lucide-react";
+import { BedDouble, Bell, CalendarPlus, CheckCircle2, ExternalLink, FileImage, Pencil, Plus, ShieldCheck, Trash2, Upload, Wallet, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { Can } from "@/auth/Can";
 import { useDialog } from "@/components/Dialog";
 import { KycModal } from "@/components/KycModal";
 import { Loader } from "@/components/Loader";
@@ -13,7 +14,6 @@ import { citiesForState } from "@/lib/indianCities";
 import { INDIAN_STATES, INDIAN_UNION_TERRITORIES } from "@/lib/indianStates";
 import { invalidateReservationData } from "@/lib/invalidate";
 import { inr } from "@/lib/utils";
-import { GUEST_TAGS } from "@hoteldesk/shared";
 
 interface GuestStats {
   totalStays: number;
@@ -100,6 +100,8 @@ interface GuestReservation {
 export default function GuestProfile() {
   const { id } = useParams();
   const navigate = useNavigate();
+  const qc = useQueryClient();
+  const dialog = useDialog();
   const [tab, setTab] = useState<Tab>("profile");
   const [editing, setEditing] = useState(false);
 
@@ -108,6 +110,37 @@ export default function GuestProfile() {
     queryFn: () => api.get<Guest>(`/guests/${id}`),
     enabled: !!id,
   });
+
+  // Delete a guest with no stay history. The server enforces the
+  // "no stays" rule too; here we just rely on it returning 409 with
+  // a clear message if anything has changed since the screen loaded.
+  const remove = useMutation({
+    mutationFn: () => api.del(`/guests/${data!.id}`),
+    onSuccess: async () => {
+      await qc.invalidateQueries({ queryKey: ["guests"] });
+      qc.removeQueries({ queryKey: ["guest", id] });
+      navigate("/guests");
+    },
+    onError: async (e: Error) => {
+      await dialog.alert({
+        title: "Can't delete this guest",
+        message: e.message,
+      });
+    },
+  });
+
+  async function handleDelete() {
+    if (!data) return;
+    const ok = await dialog.confirm({
+      title: `Delete ${data.fullName}?`,
+      message:
+        `This permanently removes the guest record + KYC photos. ` +
+        `It cannot be undone. The server will refuse if any stays are linked.`,
+      okLabel: "Delete",
+      tone: "danger",
+    });
+    if (ok) remove.mutate();
+  }
 
   // Old-phone redirect. The API resolver accepts both UUIDs and any
   // phone the guest has historically had (via guest_phone_history).
@@ -167,6 +200,26 @@ export default function GuestProfile() {
           </div>
         </div>
         <div className="flex gap-2 shrink-0">
+          <Can do="delete_guests">
+            <button
+              className="btn-secondary inline-flex items-center gap-2 text-danger hover:bg-danger/5 disabled:text-textSecondary disabled:hover:bg-transparent"
+              onClick={handleDelete}
+              // Only allow deletion of guests with no stay history.
+              // The server enforces the same rule, but disabling here
+              // avoids a round-trip + dialog for the obvious case.
+              disabled={
+                remove.isPending || (data.stats?.totalStays ?? 0) > 0
+              }
+              title={
+                (data.stats?.totalStays ?? 0) > 0
+                  ? "Guest has stay history — cancel or void those bookings first"
+                  : "Delete this guest"
+              }
+            >
+              <Trash2 className="w-4 h-4" />
+              {remove.isPending ? "Deleting…" : "Delete"}
+            </button>
+          </Can>
           <button
             className="btn-secondary inline-flex items-center gap-2"
             onClick={() => setEditing(true)}
@@ -1167,114 +1220,48 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   );
 }
 
-function TagsEditor({ guestId, tags }: { guestId: string; tags: string[] }) {
-  const qc = useQueryClient();
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState<string[]>(tags);
-  const [custom, setCustom] = useState("");
+// Lifecycle tags are computed server-side from stay count + spend
+// (see apps/api/src/lib/guestTags.ts) so they can't drift from the
+// underlying numbers. The UI is display-only — no edit affordance,
+// no add-custom input. System-managed names render in the brand
+// colour; anything else (legacy manual tag) renders muted so it's
+// visually obvious which pills the system owns.
+const SYSTEM_TAG_SET = new Set([
+  "first time",
+  "new customer",
+  "repeat",
+  "vip",
+  "high value",
+  "corporate",
+  "blacklist",
+]);
 
-  const save = useMutation({
-    mutationFn: () => api.patch(`/guests/${guestId}/tags`, { tags: draft }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["guest", guestId] });
-      qc.invalidateQueries({ queryKey: ["guests"] });
-      setEditing(false);
-    },
-  });
-
-  function toggle(t: string) {
-    setDraft((d) => (d.includes(t) ? d.filter((x) => x !== t) : [...d, t]));
-  }
-  function addCustom() {
-    const v = custom.trim().toLowerCase();
-    if (!v || draft.includes(v)) return;
-    setDraft([...draft, v]);
-    setCustom("");
-  }
-
-  if (!editing) {
+function TagsEditor({ tags }: { guestId: string; tags: string[] }) {
+  if (tags.length === 0) {
     return (
-      <div className="flex items-center gap-1.5 flex-wrap">
-        {tags.map((t) => (
-          <span
-            key={t}
-            className="text-xs font-semibold px-2 py-1 rounded-sm bg-brand-soft text-brand-dark capitalize"
-          >
-            {t.replace("_", " ")}
-          </span>
-        ))}
-        <button
-          onClick={() => {
-            setDraft(tags);
-            setEditing(true);
-          }}
-          className="text-xs font-semibold inline-flex items-center gap-1 px-2 py-1 rounded-sm border border-borderc text-textSecondary hover:border-brand-dark hover:text-brand-dark transition-colors"
-        >
-          <TagIcon className="w-3 h-3" />
-          {tags.length === 0 ? "Add tags" : "Edit"}
-        </button>
+      <div className="text-xs text-textSecondary italic">
+        No tags yet — they appear automatically after the first stay.
       </div>
     );
   }
-
   return (
-    <div className="card w-full max-w-md space-y-2">
-      <div className="flex items-center justify-between">
-        <div className="label">Edit Tags</div>
-        <button onClick={() => setEditing(false)} className="text-textSecondary hover:text-brand-dark">
-          <X className="w-4 h-4" />
-        </button>
-      </div>
-      <div className="flex flex-wrap gap-1.5">
-        {GUEST_TAGS.map((t) => (
-          <button
+    <div className="flex items-center gap-1.5 flex-wrap">
+      {tags.map((t) => {
+        const isSystem = SYSTEM_TAG_SET.has(t.trim().toLowerCase());
+        return (
+          <span
             key={t}
-            onClick={() => toggle(t)}
-            className={`text-xs px-2 py-1 rounded-sm border-2 capitalize transition-colors ${
-              draft.includes(t)
-                ? "bg-brand-dark text-cream border-brand-dark"
-                : "border-borderc text-textSecondary hover:border-brand-dark"
+            className={`text-xs font-semibold px-2 py-1 rounded-sm capitalize ${
+              isSystem
+                ? "bg-brand-soft text-brand-dark"
+                : "bg-cream text-textSecondary border border-borderc"
             }`}
+            title={isSystem ? "Set automatically by stay history" : "Custom tag"}
           >
             {t.replace("_", " ")}
-          </button>
-        ))}
-        {draft
-          .filter((t) => !GUEST_TAGS.includes(t as typeof GUEST_TAGS[number]))
-          .map((t) => (
-            <button
-              key={t}
-              onClick={() => toggle(t)}
-              className="text-xs px-2 py-1 rounded-sm border-2 bg-brand-dark text-cream border-brand-dark capitalize"
-            >
-              {t.replace("_", " ")} ×
-            </button>
-          ))}
-      </div>
-      <div className="flex gap-2">
-        <input
-          className="input h-8 text-sm"
-          placeholder="Custom tag"
-          value={custom}
-          onChange={(e) => setCustom(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && addCustom()}
-        />
-        <button onClick={addCustom} className="btn-secondary !h-8 !px-3 text-xs">
-          Add
-        </button>
-      </div>
-      <div className="flex justify-end gap-2">
-        <button className="btn-secondary !h-8 text-xs" onClick={() => setEditing(false)}>
-          Cancel
-        </button>
-        <button
-          className="btn-primary !h-8 text-xs"
-          disabled={save.isPending}
-          onClick={() => save.mutate()}
-        >
-          {save.isPending ? "Saving…" : "Save"}
-        </button>
-      </div>
+          </span>
+        );
+      })}
     </div>
   );
 }

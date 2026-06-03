@@ -5,13 +5,11 @@ import { db } from "../db/client.js";
 import { guests } from "../db/schema/guests.js";
 import { reservationRooms, reservations } from "../db/schema/reservations.js";
 import { rooms } from "../db/schema/rooms.js";
-import { RESERVATION_BLOCKING_STATUSES } from "../db/schema/enums.js";
 import { ok } from "../lib/response.js";
 import { requireAuth, requirePermission } from "../middleware/auth.js";
 import { validate } from "../middleware/validate.js";
 
 const router = Router();
-const BLOCKING_STATUSES = [...RESERVATION_BLOCKING_STATUSES];
 
 // month: "YYYY-MM". We expand it on the server into the day-range that
 // captures every reservation that *touches* that month — i.e. anything whose

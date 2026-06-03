@@ -72,6 +72,16 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   { key: "view_activity", area: "Activity", label: "View activity log" },
   { key: "view_notifications", area: "Notifications", label: "View notifications" },
 
+  // Expenses (migration 0025) — property-side overheads ledger.
+  // Senior-staff scope by default; receptionists / housekeeping
+  // don't get either key out of the box.
+  { key: "view_expenses", area: "Expenses", label: "View expenses" },
+  {
+    key: "manage_expenses",
+    area: "Expenses",
+    label: "Record / edit / delete expenses",
+  },
+
   // Admin
   { key: "manage_staff", area: "Admin", label: "Manage staff (add / edit / deactivate)" },
   { key: "manage_roles", area: "Admin", label: "Manage roles & permissions" },

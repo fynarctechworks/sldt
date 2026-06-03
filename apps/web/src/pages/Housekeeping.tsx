@@ -40,7 +40,7 @@ const STATUS_FILTERS = [
 
 const STATUS_LABELS: Record<string, string> = {
   all: "All",
-  dirty: "Dirty",
+  dirty: "Needs Cleaning",
   clean: "Clean",
   inspected: "Inspected",
   available: "Available",
@@ -119,6 +119,15 @@ export default function Housekeeping() {
     if (a.floor !== b.floor) return a.floor - b.floor;
     return a.roomNumber.localeCompare(b.roomNumber, undefined, { numeric: true });
   });
+  // Group by floor so housekeeping works one level at a time. Each
+  // floor renders its own header + grid, with floors separated by a
+  // divider so the page mirrors the property's physical layout.
+  const byFloor: { floor: number; rooms: typeof sorted }[] = [];
+  for (const r of sorted) {
+    const last = byFloor[byFloor.length - 1];
+    if (last && last.floor === r.floor) last.rooms.push(r);
+    else byFloor.push({ floor: r.floor, rooms: [r] });
+  }
 
   return (
     <div className="space-y-4">
@@ -175,8 +184,20 @@ export default function Housekeeping() {
           <div className="text-sm">No rooms match this filter.</div>
         </div>
       ) : (
-        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
-          {sorted.map((r) => {
+        <div className="space-y-5">
+          {byFloor.map((fg, idx) => (
+            <section
+              key={`hk-floor-${fg.floor}`}
+              className={idx === 0 ? "" : "pt-4 border-t-2 border-brand-dark/15"}
+            >
+              <div className="text-[10px] uppercase tracking-[0.18em] text-brand font-bold mb-2">
+                Floor {fg.floor}
+                <span className="ml-2 text-textSecondary font-semibold">
+                  · {fg.rooms.length} room{fg.rooms.length === 1 ? "" : "s"}
+                </span>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+          {fg.rooms.map((r) => {
             const transitions = NEXT_STATUS[r.status] ?? [];
             const canFlag = r.status !== "maintenance" && r.status !== "occupied" && r.status !== "reserved";
             // A dirty or clean room can be made bookable in one click.
@@ -295,6 +316,9 @@ export default function Housekeeping() {
               </div>
             );
           })}
+              </div>
+            </section>
+          ))}
         </div>
       )}
     </div>

@@ -15,7 +15,7 @@
 // walk-in pre-filled with that room + that arrival date.
 
 import { differenceInCalendarDays, format, isToday, parseISO } from "date-fns";
-import { useMemo } from "react";
+import { Fragment, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 
 interface TapeRoom {
@@ -136,18 +136,31 @@ export function TapeChart({ data }: { data: TapeChartData }) {
           })}
         </div>
 
-        {/* Room rows */}
-        {data.rooms.map((room) => {
+        {/* Room rows, grouped by floor. The chart keeps one continuous
+            grid (so absolute-positioned segments stay aligned), but
+            inserts a thin "Floor N" divider row whenever the floor
+            changes so the property's physical layout is visible. */}
+        {data.rooms.map((room, idx) => {
           const segs = segmentsByRoom.get(room.id) ?? [];
+          const prevFloor = idx > 0 ? data.rooms[idx - 1]!.floor : null;
+          const startsNewFloor = prevFloor === null || prevFloor !== room.floor;
           return (
-            <div
-              key={room.id}
-              className="relative grid border-b border-borderc/60"
-              style={{
-                gridTemplateColumns: `${ROOM_COL_W}px repeat(${data.days.length}, ${COL_W}px)`,
-                minHeight: ROW_H,
-              }}
-            >
+            <Fragment key={room.id}>
+              {startsNewFloor && (
+                <div
+                  className="sticky left-0 z-20 bg-brand-soft/60 border-y border-brand-dark/30 px-3 py-1.5 text-[10px] uppercase tracking-[0.18em] text-brand font-bold"
+                  style={{ width: ROOM_COL_W + data.days.length * COL_W }}
+                >
+                  Floor {room.floor}
+                </div>
+              )}
+              <div
+                className="relative grid border-b border-borderc/60"
+                style={{
+                  gridTemplateColumns: `${ROOM_COL_W}px repeat(${data.days.length}, ${COL_W}px)`,
+                  minHeight: ROW_H,
+                }}
+              >
               {/* Sticky room label */}
               <button
                 onClick={() => navigate(`/rooms/${room.roomNumber}`)}
@@ -180,9 +193,6 @@ export function TapeChart({ data }: { data: TapeChartData }) {
               {/* Reservation segments, absolutely positioned over the cells. */}
               {segs.map((seg) => {
                 const startCol = Math.max(0, dayIndex.get(seg.checkInDate) ?? 0);
-                const endIndex =
-                  dayIndex.get(seg.checkOutDate) ??
-                  (seg.checkOutDate > data.end ? data.days.length : 0);
                 // Overnight: span = checkOut - checkIn (half-open, so last
                 // visible day is checkOut - 1). Day-use: span = 1 cell.
                 const isDayUse = seg.stayType === "short_stay";
@@ -231,7 +241,8 @@ export function TapeChart({ data }: { data: TapeChartData }) {
                   </button>
                 );
               })}
-            </div>
+              </div>
+            </Fragment>
           );
         })}
 

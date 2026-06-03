@@ -62,9 +62,13 @@ export default function Messages() {
   const [draft, setDraft] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  // Hoist the message count so the dep array stays statically
+  // analysable. ESLint can't follow the `?? []` inside the array,
+  // and the extracted local lets the rule see exactly what changes.
+  const messageCount = msgsQ.data?.items?.length ?? 0;
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-  }, [(msgsQ.data?.items ?? []).length, activeId]);
+  }, [messageCount, activeId]);
 
   const activeStaff = (staffQ.data?.items ?? []).find((s) => s.id === activeId);
 

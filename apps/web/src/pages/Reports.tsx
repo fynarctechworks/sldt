@@ -19,6 +19,7 @@ import {
   Gift,
   Hourglass,
   Inbox,
+  MoreHorizontal,
   Percent,
   Receipt,
   TrendingUp,
@@ -26,7 +27,7 @@ import {
   Wallet,
 } from "lucide-react";
 import Papa from "papaparse";
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Bar,
@@ -63,7 +64,12 @@ interface TabDef {
   Icon: typeof Percent;
 }
 
-const TABS: TabDef[] = [
+// Tabs split into two groups. PRIMARY_TABS always render in the strip;
+// SECONDARY_TABS live behind a "More" dropdown so rarely-used reports
+// (like Complimentary, where comping is an exception not a routine)
+// don't clutter the bar. The split is purely UX — every tab is still
+// reachable via the URL (?tab=credit) and via the dropdown.
+const PRIMARY_TABS: TabDef[] = [
   { id: "occupancy", label: "Occupancy", caption: "Daily room fill rate", Icon: Percent },
   { id: "revenue", label: "Revenue", caption: "Earnings + room-type mix", Icon: TrendingUp },
   { id: "invoices", label: "Invoices", caption: "Every tax invoice on the property", Icon: Receipt },
@@ -72,8 +78,15 @@ const TABS: TabDef[] = [
   { id: "outstanding", label: "Outstanding", caption: "Unpaid invoices & promises", Icon: AlertTriangle },
   { id: "rooms", label: "Rooms", caption: "Per-room bookings & revenue", Icon: BedDouble },
   { id: "guests", label: "Top Guests", caption: "Most-frequent stayers", Icon: Users },
+];
+
+const SECONDARY_TABS: TabDef[] = [
   { id: "credit", label: "Complimentary", caption: "Comp & credit bookings", Icon: Gift },
 ];
+
+// Full list — used for caption lookup ("Reports → Comp & credit
+// bookings · 01 Jan → 31 Dec") regardless of which group the tab is in.
+const TABS: TabDef[] = [...PRIMARY_TABS, ...SECONDARY_TABS];
 
 // ============================================================
 // Date presets
@@ -112,6 +125,106 @@ function fmtDate(d: Date): string {
   return format(d, "yyyy-MM-dd");
 }
 
+// Generic "type the access code" prompt. The labels deliberately
+// don't mention what's behind the gate — same reason the API endpoint
+// is named "verify-access-code" rather than "unlock-complimentary".
+// Used by the Reports tab strip's More button.
+function AccessCodePrompt({
+  onSuccess,
+  onClose,
+}: {
+  onSuccess: () => void;
+  onClose: () => void;
+}) {
+  const [code, setCode] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function submit() {
+    if (!code.trim()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.post("/settings/verify-access-code", { code: code.trim() });
+      onSuccess();
+    } catch (e) {
+      // Generic error — we deliberately don't differentiate "no code
+      // configured" from "wrong code" so a sniffer can't probe the
+      // state of the gate.
+      setError(e instanceof Error ? e.message : "Incorrect code");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Esc closes, Enter submits. Listeners only attach while mounted
+  // so we never trap focus globally.
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") onClose();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-[100] grid place-items-center bg-brand-dark/50 p-4"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div className="w-full max-w-sm bg-surface rounded-md shadow-2xl border border-borderc overflow-hidden">
+        <div className="px-5 py-3 border-b border-borderc bg-bg/50 font-semibold text-brand-dark">
+          Authorisation required
+        </div>
+        <div className="p-5 space-y-3">
+          <p className="text-sm text-textSecondary">
+            Enter the access code to continue.
+          </p>
+          <input
+            autoFocus
+            type="password"
+            inputMode="numeric"
+            className="input font-mono"
+            value={code}
+            onChange={(e) => {
+              setCode(e.target.value);
+              setError(null);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") submit();
+            }}
+            placeholder="Code"
+          />
+          {error && (
+            <div className="text-xs text-danger" role="alert">
+              {error}
+            </div>
+          )}
+          <div className="flex justify-end gap-2 pt-1">
+            <button
+              type="button"
+              className="btn-secondary !h-8 text-xs"
+              onClick={onClose}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="btn-primary !h-8 text-xs"
+              disabled={busy || !code.trim()}
+              onClick={submit}
+            >
+              {busy ? "Checking…" : "Continue"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function Reports() {
   const [tab, setTab] = useState<Tab>("occupancy");
 
@@ -120,6 +233,26 @@ export default function Reports() {
   const [to, setTo] = useState(fmtDate(initial.to));
   const [preset, setPreset] = useState<PresetKey>("month");
   const [showCustom, setShowCustom] = useState(false);
+
+  // Access gate for the secondary tabs (Complimentary). When the gate
+  // is configured server-side, clicking the More toggle opens the
+  // generic auth prompt; only after the code verifies does the row
+  // expand. Re-clicking the toggle (now "Hide") locks immediately —
+  // staff has to re-enter the code next time. By design ephemeral:
+  // navigating away or reloading drops the state.
+  const [secondaryUnlocked, setSecondaryUnlocked] = useState(false);
+  const [showAuthPrompt, setShowAuthPrompt] = useState(false);
+  // Does the property even have a code configured? If not, the toggle
+  // behaves like the previous "show/hide" without any prompt. Pulled
+  // from /settings/public so even non-admins can know whether to ask
+  // staff for a code.
+  const settingsPublic = useQuery({
+    queryKey: ["settings-public"],
+    queryFn: () =>
+      api.get<{ complimentaryGateEnabled?: boolean }>("/settings/public"),
+    staleTime: 60_000,
+  });
+  const gateEnabled = !!settingsPublic.data?.complimentaryGateEnabled;
 
   function applyPreset(p: Preset) {
     const r = p.range();
@@ -168,7 +301,45 @@ export default function Reports() {
         }}
       />
 
-      <TabBar tabs={TABS} active={tab} onChange={setTab} />
+      <TabBar
+        primary={PRIMARY_TABS}
+        secondary={SECONDARY_TABS}
+        active={tab}
+        onChange={setTab}
+        secondaryVisible={secondaryUnlocked}
+        onAttemptShow={() => {
+          // No gate configured? Just reveal the row without prompting
+          // — same behaviour as the previous show/hide toggle. This
+          // path is the default for fresh installs and any property
+          // that hasn't opted into the gate.
+          if (!gateEnabled) {
+            setSecondaryUnlocked(true);
+            return;
+          }
+          setShowAuthPrompt(true);
+        }}
+        onHide={() => {
+          // Re-lock immediately and snap off any secondary tab so
+          // staff aren't stranded on an invisible view. Conservative
+          // default — staff explicitly chose to hide.
+          setSecondaryUnlocked(false);
+          if (SECONDARY_TABS.some((t) => t.id === tab) && PRIMARY_TABS.length > 0) {
+            setTab(PRIMARY_TABS[0]!.id);
+          }
+        }}
+      />
+
+      {/* Generic authorisation prompt — see AccessCodePrompt for why
+          the wording deliberately avoids naming Complimentary. */}
+      {showAuthPrompt && (
+        <AccessCodePrompt
+          onClose={() => setShowAuthPrompt(false)}
+          onSuccess={() => {
+            setSecondaryUnlocked(true);
+            setShowAuthPrompt(false);
+          }}
+        />
+      )}
 
       {tab === "occupancy" && <OccupancyTab from={from} to={to} />}
       {tab === "revenue" && <RevenueTab from={from} to={to} />}
@@ -272,17 +443,37 @@ function DateToolbar({
 }
 
 function TabBar({
-  tabs,
+  primary,
+  secondary,
   active,
   onChange,
+  secondaryVisible,
+  onAttemptShow,
+  onHide,
 }: {
-  tabs: TabDef[];
+  primary: TabDef[];
+  secondary: TabDef[];
   active: Tab;
   onChange: (t: Tab) => void;
+  // Controlled visibility for the secondary tabs. The parent owns
+  // this state so it can interpose an auth prompt before flipping
+  // it on. `onAttemptShow` fires when staff clicks the (currently
+  // closed) More button; `onHide` fires when they click "Hide".
+  secondaryVisible: boolean;
+  onAttemptShow: () => void;
+  onHide: () => void;
 }) {
+  function toggleSecondary() {
+    if (secondaryVisible) {
+      onHide();
+    } else {
+      onAttemptShow();
+    }
+  }
+
   return (
-    <div className="flex gap-1.5 flex-wrap">
-      {tabs.map((t) => {
+    <div className="flex gap-1.5 flex-wrap items-center">
+      {primary.map((t) => {
         const on = t.id === active;
         return (
           <button
@@ -300,6 +491,51 @@ function TabBar({
           </button>
         );
       })}
+
+      {/* Show / hide toggle for the secondary row. Click reveals the
+          rarely-used tabs (currently just Complimentary) inline; click
+          again hides them. */}
+      {secondary.length > 0 && (
+        <button
+          onClick={toggleSecondary}
+          title={
+            secondaryVisible
+              ? "Hide rarely-used reports"
+              : "Show more reports (Complimentary, etc.)"
+          }
+          aria-pressed={secondaryVisible}
+          className={`inline-flex items-center gap-1.5 px-3 h-9 text-sm font-medium rounded-sm border transition-colors ${
+            secondaryVisible
+              ? "bg-bg text-brand-dark border-brand-dark/30"
+              : "bg-surface text-textSecondary border-borderc hover:border-brand hover:text-brand"
+          }`}
+        >
+          <MoreHorizontal className="w-3.5 h-3.5" />
+          {secondaryVisible ? "Hide" : "More"}
+        </button>
+      )}
+
+      {/* Secondary tabs render as siblings only when the toggle is on.
+          Once on, they behave exactly like primary pills. */}
+      {secondaryVisible &&
+        secondary.map((t) => {
+          const on = t.id === active;
+          return (
+            <button
+              key={t.id}
+              onClick={() => onChange(t.id)}
+              title={t.caption}
+              className={`inline-flex items-center gap-1.5 px-3 h-9 text-sm font-medium rounded-sm border transition-colors ${
+                on
+                  ? "bg-brand text-cream border-brand"
+                  : "bg-surface text-textSecondary border-borderc hover:border-brand hover:text-brand"
+              }`}
+            >
+              <t.Icon className="w-3.5 h-3.5" />
+              {t.label}
+            </button>
+          );
+        })}
     </div>
   );
 }
@@ -673,8 +909,11 @@ function InvoicesTab({ from, to }: { from: string; to: string }) {
   const [q, setQ] = useState("");
   const [page, setPage] = useState(1);
   // Reset to page 1 whenever any filter changes — otherwise we'd land on
-  // an empty page after narrowing the result set.
-  useMemo(() => setPage(1), [status, scope, q, from, to]);
+  // an empty page after narrowing the result set. useEffect (not
+  // useMemo) is the right hook for a pure side-effect like this.
+  useEffect(() => {
+    setPage(1);
+  }, [status, scope, q, from, to]);
 
   const { data, isLoading } = useQuery({
     queryKey: ["rpt-invoices", from, to, status, scope, q, page],

@@ -12,6 +12,11 @@ import {
 import Papa from "papaparse";
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
+import {
+  DatePresetBar,
+  rangeForPreset,
+  type DatePresetKey,
+} from "@/components/DatePresetBar";
 import { Loader } from "@/components/Loader";
 import { Money } from "@/components/Money";
 import { PdfPreviewModal } from "@/components/PdfPreviewModal";
@@ -62,8 +67,13 @@ export default function Invoices() {
   const [status, setStatus] = useState("");
   const [scope, setScope] = useState("");
   const [q, setQ] = useState("");
-  const [dateFrom, setDateFrom] = useState("");
-  const [dateTo, setDateTo] = useState("");
+  // Default to This Month — financial views usually start there.
+  // The preset bar swaps dateFrom/dateTo when staff picks another
+  // preset; the `preset` key keeps the right pill active.
+  const initialRange = rangeForPreset("month")!;
+  const [preset, setPreset] = useState<DatePresetKey>("month");
+  const [dateFrom, setDateFrom] = useState(initialRange.from);
+  const [dateTo, setDateTo] = useState(initialRange.to);
   const [page, setPage] = useState(1);
 
   const [preview, setPreview] = useState<{
@@ -157,7 +167,10 @@ export default function Invoices() {
     }
   }
 
-  const filtersActive = !!(status || scope || q || dateFrom || dateTo);
+  // "Active" when any non-default filter is set. The date range is
+  // always populated by the preset bar, so we treat it as active only
+  // when the user moved off the default Month preset.
+  const filtersActive = !!(status || scope || q || preset !== "month");
 
   return (
     <div className="space-y-4">
@@ -204,6 +217,22 @@ export default function Invoices() {
           <Money value={totals.balance} className="block text-2xl font-bold text-danger font-mono mt-1" />
           <div className="text-xs text-textSecondary mt-0.5">balance due</div>
         </div>
+      </div>
+
+      {/* Date range presets. Sits on its own row so the buttons stay
+          readable; the filter card below holds search / status / scope. */}
+      <div className="card !py-2.5">
+        <DatePresetBar
+          preset={preset}
+          from={dateFrom}
+          to={dateTo}
+          onChange={(next) => {
+            setPreset(next.preset);
+            setDateFrom(next.from);
+            setDateTo(next.to);
+            setPage(1);
+          }}
+        />
       </div>
 
       <div className="card flex flex-wrap gap-3 items-end">
@@ -258,43 +287,25 @@ export default function Invoices() {
             ))}
           </select>
         </div>
-        <div className="flex-1 min-w-[140px] sm:flex-none">
-          <label className="label block mb-1">Issued From</label>
-          <input
-            className="input sm:w-40"
-            type="date"
-            value={dateFrom}
-            onChange={(e) => {
-              setDateFrom(e.target.value);
-              setPage(1);
-            }}
-          />
-        </div>
-        <div className="flex-1 min-w-[140px] sm:flex-none">
-          <label className="label block mb-1">Issued To</label>
-          <input
-            className="input sm:w-40"
-            type="date"
-            value={dateTo}
-            onChange={(e) => {
-              setDateTo(e.target.value);
-              setPage(1);
-            }}
-          />
-        </div>
+        {/* Issued-date range now driven by the preset bar below. The
+            inline From/To inputs are gone in favour of one-click Today/
+            Week/Month/Year; Custom expands the same two fields when
+            needed. */}
         {filtersActive && (
           <button
             onClick={() => {
               setStatus("");
               setScope("");
               setQ("");
-              setDateFrom("");
-              setDateTo("");
+              const r = rangeForPreset("month")!;
+              setPreset("month");
+              setDateFrom(r.from);
+              setDateTo(r.to);
               setPage(1);
             }}
             className="text-xs text-accentBlue hover:underline self-end pb-2"
           >
-            Clear all
+            Reset filters
           </button>
         )}
       </div>

@@ -24,6 +24,8 @@ const Notifications = lazy(() => import("@/pages/Notifications"));
 const Collections = lazy(() => import("@/pages/Collections"));
 const Credits = lazy(() => import("@/pages/Credits"));
 const Invoices = lazy(() => import("@/pages/Invoices"));
+const Expenses = lazy(() => import("@/pages/Expenses"));
+const ExpenseDetail = lazy(() => import("@/pages/ExpenseDetail"));
 
 export default function App() {
   return (
@@ -263,6 +265,30 @@ export default function App() {
               <AppShell>
                 <PermissionGuard any={["view_invoices"]}>
                   <Invoices />
+                </PermissionGuard>
+              </AppShell>
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/expenses"
+          element={
+            <ProtectedRoute>
+              <AppShell>
+                <PermissionGuard any={["view_expenses"]}>
+                  <Expenses />
+                </PermissionGuard>
+              </AppShell>
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/expenses/:id"
+          element={
+            <ProtectedRoute>
+              <AppShell>
+                <PermissionGuard any={["view_expenses"]}>
+                  <ExpenseDetail />
                 </PermissionGuard>
               </AppShell>
             </ProtectedRoute>

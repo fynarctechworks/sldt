@@ -58,12 +58,24 @@ interface AvailableRoom {
     reservationId: string;
     reservationNumber: string;
     checkInDate: string;
+    checkOutDate: string;
     guestName: string;
   } | null;
 }
 
 const todayStr = format(new Date(), "yyyy-MM-dd");
 const tomorrowStr = format(addDays(new Date(), 1), "yyyy-MM-dd");
+
+// Combine yyyy-MM-dd + HH:mm into an ISO timestamp with the IST
+// offset baked in. The server stores these in plannedCheckInAt /
+// plannedCheckOutAt and the rendering surfaces (receipt, invoice,
+// detail page) just format them in the same zone. Returns null when
+// either side is empty so the caller can drop the field from the
+// request body instead of sending an invalid value.
+function combineDateAndTimeISO(date: string, time: string): string | null {
+  if (!date || !time) return null;
+  return `${date}T${time}:00+05:30`;
+}
 
 function normalizeIndianPhone(raw: string): string {
   const digits = raw.replace(/\D/g, "");
@@ -102,6 +114,14 @@ export default function NewReservation() {
   const isShortStay = stayType === "short_stay";
   const [checkInDate, setCheckInDate] = useState(todayStr);
   const [checkOutDate, setCheckOutDate] = useState(tomorrowStr);
+  // 0023 — staff-chosen clock times. Empty string means "use property
+  // policy default" (rendered on the booking summary, receipt, and
+  // invoice). When set, these are sent to the server as ISO timestamps
+  // and stored as plannedCheckInAt / plannedCheckOutAt. UI shows them
+  // alongside the date inputs so staff can promise a specific window
+  // ("4 PM arrival, 10 AM next-day departure").
+  const [checkInTime, setCheckInTime] = useState("");
+  const [checkOutTime, setCheckOutTime] = useState("");
   const [adults, setAdults] = useState(1);
   const [children, setChildren] = useState(0);
   const [purpose, setPurpose] = useState<"business" | "leisure" | "transit" | "other">("leisure");
@@ -544,15 +564,31 @@ export default function NewReservation() {
         await api.upload(`/guests/${guestId}/kyc`, form);
       }
 
-      // Co-guest (2nd occupant). Required when adults >= 2.
+      // Co-guest (2nd occupant). OPTIONAL — front-desk policy decides
+      // when to collect KYC for the second guest. If staff didn't pick
+      // an existing co-guest AND didn't start a new one, we just let
+      // the booking through. If they DID start one, we still require
+      // the bare minimum (name + phone + ID number) so we don't write
+      // a malformed guest row.
       const coGuestIds: string[] = [];
       if (needsCoGuest) {
         let coGuestId = coGuest?.id;
-        if (coGuestUseNew) {
+        // "Started a new co-guest" = any of the identifying fields
+        // is non-empty. Picking up a partial half-record would write
+        // junk to the guests table, so we ask staff to either complete
+        // it or clear it.
+        const startedNew =
+          coGuestUseNew &&
+          (coGuestForm.fullName.trim() !== "" ||
+            coGuestForm.phone.trim() !== "" ||
+            coGuestForm.idProofNumber.trim() !== "");
+        if (startedNew) {
+          if (!coGuestForm.fullName || !coGuestForm.phone || !coGuestForm.idProofNumber)
+            throw new Error(
+              "Fill in the second guest's name, phone and ID number — or clear all three to skip",
+            );
           if (!coGuestForm.gender)
             throw new Error("Gender is required for the second guest");
-          if (!coGuestForm.fullName || !coGuestForm.phone || !coGuestForm.idProofNumber)
-            throw new Error("Fill in the second guest's name, phone, and ID number");
           const g2 = await api.post<Guest>("/guests", {
             ...coGuestForm,
             phone: normalizeIndianPhone(coGuestForm.phone),
@@ -567,11 +603,13 @@ export default function NewReservation() {
             await api.upload(`/guests/${coGuestId}/kyc`, form);
           }
         }
-        if (!coGuestId)
-          throw new Error("A second guest with KYC is required for 2+ adults");
-        if (coGuestId === guestId)
-          throw new Error("Booker can't also be the second guest");
-        coGuestIds.push(coGuestId);
+        // Only push the co-guest id when we actually have one — empty
+        // array is fine, the server schema allows it.
+        if (coGuestId) {
+          if (coGuestId === guestId)
+            throw new Error("Booker can't also be the second guest");
+          coGuestIds.push(coGuestId);
+        }
       }
 
       return { guestId, coGuestIds };
@@ -603,6 +641,14 @@ export default function NewReservation() {
         guestId,
         checkInDate,
         checkOutDate,
+        // Staff-chosen clock times (0023). Sent only when staff filled
+        // them in; omitted otherwise so the server stores NULL and
+        // every surface falls back to hotel policy defaults.
+        plannedCheckInAt:
+          combineDateAndTimeISO(checkInDate, checkInTime) ?? undefined,
+        plannedCheckOutAt: isShortStay
+          ? undefined
+          : (combineDateAndTimeISO(checkOutDate, checkOutTime) ?? undefined),
         stayType,
         durationHours: isShortStay ? shortStayHours : undefined,
         shortStayLabel: isShortStay
@@ -655,6 +701,9 @@ export default function NewReservation() {
             checkInDate: string;
             checkOutDate: string;
             checkedInAt: string | null;
+            // 0023 — staff-chosen planned arrival / departure times.
+            plannedCheckInAt: string | null;
+            plannedCheckOutAt: string | null;
             numNights?: number;
             stayType?: "overnight" | "short_stay";
             durationHours?: string | null;
@@ -732,6 +781,10 @@ export default function NewReservation() {
           checkInDate: detail.checkInDate,
           checkOutDate: detail.checkOutDate,
           checkedInAt: detail.checkedInAt,
+          // 0023 — pass staff-chosen planned times so the on-screen
+          // receipt reflects what was promised to the guest.
+          plannedCheckInAt: detail.plannedCheckInAt ?? null,
+          plannedCheckOutAt: detail.plannedCheckOutAt ?? null,
           numNights: detail.numNights ?? fallbackNights,
           stayType: detail.stayType,
           durationHours: detail.durationHours ? Number(detail.durationHours) : null,
@@ -948,11 +1001,22 @@ export default function NewReservation() {
                 }
               }}
             />
-            {publicSettings.data?.checkInTime && (
-              <div className="text-[11px] text-textSecondary mt-1">
-                at {formatTime(publicSettings.data.checkInTime)} (hotel policy)
-              </div>
-            )}
+            {/* Time picker (0023). Optional — blank means "use hotel
+                policy". When filled, the chosen time flows through to
+                the receipt, invoice and reservation detail page. */}
+            <input
+              className="input mt-1"
+              type="time"
+              value={checkInTime}
+              onChange={(e) => setCheckInTime(e.target.value)}
+            />
+            <div className="text-[11px] text-textSecondary mt-1">
+              {checkInTime
+                ? `Custom: ${formatTime(checkInTime)}`
+                : publicSettings.data?.checkInTime
+                  ? `at ${formatTime(publicSettings.data.checkInTime)} (hotel policy)`
+                  : "at hotel policy"}
+            </div>
           </div>
           <div>
             <label className="label block mb-1">
@@ -972,9 +1036,22 @@ export default function NewReservation() {
               }
               onChange={(e) => setCheckOutDate(e.target.value)}
             />
+            {/* Time picker (0023). For short_stay the end time follows
+                from duration so we hide it; overnight allows an explicit
+                checkout-time promise. */}
+            {!isShortStay && (
+              <input
+                className="input mt-1"
+                type="time"
+                value={checkOutTime}
+                onChange={(e) => setCheckOutTime(e.target.value)}
+              />
+            )}
             {publicSettings.data?.checkOutTime && !isShortStay && (
               <div className="text-[11px] text-textSecondary mt-1">
-                by {formatTime(publicSettings.data.checkOutTime)} (hotel policy)
+                {checkOutTime
+                  ? `Custom: ${formatTime(checkOutTime)}`
+                  : `by ${formatTime(publicSettings.data.checkOutTime)} (hotel policy)`}
               </div>
             )}
             {isShortStay && (
@@ -1586,9 +1663,22 @@ export default function NewReservation() {
                         <div className="leading-snug">
                           Reserved for{" "}
                           <strong>{r.nextReservation.guestName}</strong>{" "}
-                          arriving <strong>{r.nextReservation.checkInDate}</strong> ·{" "}
-                          {r.nextReservation.reservationNumber}.
-                          Vacate before then.
+                          from{" "}
+                          <strong>
+                            {format(
+                              new Date(r.nextReservation.checkInDate),
+                              "dd MMM yyyy",
+                            )}
+                          </strong>{" "}
+                          to{" "}
+                          <strong>
+                            {format(
+                              new Date(r.nextReservation.checkOutDate),
+                              "dd MMM yyyy",
+                            )}
+                          </strong>{" "}
+                          · {r.nextReservation.reservationNumber}. Vacate
+                          before then.
                         </div>
                       </div>
                     </div>
@@ -2033,7 +2123,6 @@ function KycOnFileCard({
     <div className="space-y-3">
       <div className="flex items-start gap-3">
         {photoUrl ? (
-          // eslint-disable-next-line @next/next/no-img-element
           <img
             src={photoUrl}
             alt={`KYC photo of ${guestName}`}
@@ -2317,7 +2406,10 @@ function SecondOccupantCard(props: {
     <div className="card space-y-3">
       <div className="flex items-center justify-between flex-wrap gap-2">
         <h2 className="font-semibold text-navy">
-          2.5 Second Guest <span className="text-danger">*</span>
+          2.5 Second Guest{" "}
+          <span className="text-xs text-textSecondary font-normal">
+            (optional — skip to book without 2nd guest KYC)
+          </span>
         </h2>
         <div className="text-xs">
           <button
@@ -2504,7 +2596,7 @@ function SecondOccupantCard(props: {
 
           <div className="pt-2 border-t border-borderc">
             <div className="text-[11px] uppercase tracking-wider text-textSecondary font-semibold mb-2">
-              KYC Documents · Second Guest (required)
+              KYC Documents · Second Guest (optional)
             </div>
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
               <KycFilePicker

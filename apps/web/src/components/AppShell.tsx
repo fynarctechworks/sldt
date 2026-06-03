@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { Menu } from "lucide-react";
+import { Maximize2, Menu, Minimize2 } from "lucide-react";
 import type { ReactNode } from "react";
 import { useEffect, useMemo, useState } from "react";
 import { useLocation } from "react-router-dom";
@@ -22,6 +22,13 @@ export function AppShell({ children }: { children: ReactNode }) {
   // Mobile drawer is independent of the desktop collapsed state. We
   // open it via the hamburger and auto-close on route change.
   const [mobileOpen, setMobileOpen] = useState(false);
+  // Focus mode hides the sidebar entirely and lets the main column
+  // span the full viewport. Useful for the front desk on small
+  // screens or when projecting onto a TV. Persisted so a reload
+  // keeps you where you were.
+  const [focusMode, setFocusMode] = useState(
+    () => localStorage.getItem("hd:focusMode") === "1",
+  );
   const location = useLocation();
 
   function toggleCollapsed() {
@@ -31,6 +38,48 @@ export function AppShell({ children }: { children: ReactNode }) {
       return next;
     });
   }
+
+  function toggleFocusMode(opts?: { requestBrowserFullscreen?: boolean }) {
+    setFocusMode((f) => {
+      const next = !f;
+      localStorage.setItem("hd:focusMode", next ? "1" : "0");
+      // Optional: also drive the browser's Fullscreen API (Shift+click
+      // or programmatic). On exit, release fullscreen if we held it.
+      try {
+        if (opts?.requestBrowserFullscreen && next && document.fullscreenEnabled) {
+          void document.documentElement.requestFullscreen();
+        } else if (!next && document.fullscreenElement) {
+          void document.exitFullscreen();
+        }
+      } catch {
+        /* swallow — browser may refuse; UI focus mode still toggles */
+      }
+      return next;
+    });
+  }
+
+  // Keyboard shortcut: F to toggle focus mode. Ignored while the
+  // user is typing in a text field. Shift+F also requests browser
+  // fullscreen at the same time.
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key !== "f" && e.key !== "F") return;
+      const t = e.target as HTMLElement | null;
+      if (
+        t &&
+        (t.tagName === "INPUT" ||
+          t.tagName === "TEXTAREA" ||
+          t.tagName === "SELECT" ||
+          t.isContentEditable)
+      )
+        return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      e.preventDefault();
+      toggleFocusMode({ requestBrowserFullscreen: e.shiftKey });
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   // Auto-close the mobile drawer whenever the route changes so a tap
   // on a nav link doesn't leave the drawer hanging open.
@@ -93,27 +142,32 @@ export function AppShell({ children }: { children: ReactNode }) {
             toggle button is hidden on mobile via Sidebar's own md: guards. */}
         <Sidebar collapsed={false} onToggle={() => setMobileOpen(false)} mobile />
       </div>
-      <div className="hidden md:block">
-        <Sidebar collapsed={collapsed} onToggle={toggleCollapsed} />
-      </div>
+      {!focusMode && (
+        <div className="hidden md:block">
+          <Sidebar collapsed={collapsed} onToggle={toggleCollapsed} />
+        </div>
+      )}
 
-      {/* Watermark — hidden on phones (too noisy on small screens). */}
-      <div
-        aria-hidden
-        className={`hidden md:grid pointer-events-none fixed inset-0 ${
-          collapsed ? "pl-16" : "pl-60"
-        } place-items-center select-none transition-[padding] duration-200 ease-out`}
-      >
-        <img
-          src="/logo.jpg"
-          alt=""
-          className="w-[min(70vw,640px)] h-auto opacity-[0.06] mix-blend-multiply"
-        />
-      </div>
+      {/* Watermark — hidden on phones (too noisy on small screens), and
+          hidden in focus mode where the content goes edge-to-edge. */}
+      {!focusMode && (
+        <div
+          aria-hidden
+          className={`hidden md:grid pointer-events-none fixed inset-0 ${
+            collapsed ? "pl-16" : "pl-60"
+          } place-items-center select-none transition-[padding] duration-200 ease-out`}
+        >
+          <img
+            src="/logo.jpg"
+            alt=""
+            className="w-[min(70vw,640px)] h-auto opacity-[0.06] mix-blend-multiply"
+          />
+        </div>
+      )}
 
       <div
         className={`relative transition-[margin] duration-200 ease-out ${
-          collapsed ? "md:ml-16" : "md:ml-60"
+          focusMode ? "md:ml-0" : collapsed ? "md:ml-16" : "md:ml-60"
         }`}
       >
         {/* Mobile top bar with hamburger. Only visible <md. Sticky so
@@ -152,6 +206,45 @@ export function AppShell({ children }: { children: ReactNode }) {
         {/* Main content padding tightens on mobile so cards aren't crammed. */}
         <main className="p-3 sm:p-5 md:p-6">{children}</main>
       </div>
+
+      {/* Focus-mode toggle. Floats over the bottom-right corner so it's
+          always reachable on any page. Click toggles in-app focus mode
+          (sidebar hidden, content edge-to-edge). Shift+click also
+          requests the browser's true fullscreen API on top.
+          Keyboard: F (Shift+F for browser fullscreen). */}
+      <button
+        type="button"
+        onClick={(e) =>
+          toggleFocusMode({ requestBrowserFullscreen: e.shiftKey })
+        }
+        // Position depends on layout state so we never sit underneath
+        // the sidebar (left rail) or the toast stack (bottom-right).
+        // In focus mode the sidebar is gone, so we anchor bottom-left.
+        // In normal mode we clear the sidebar by shifting right based
+        // on its current width, and we sit ABOVE the toast stack so
+        // notifications never bury the toggle.
+        style={
+          focusMode
+            ? { left: "1rem", bottom: "1rem" }
+            : {
+                left: `calc(${collapsed ? "4rem" : "15rem"} + 1rem)`,
+                bottom: "1rem",
+              }
+        }
+        className="fixed z-[60] grid place-items-center w-11 h-11 rounded-full bg-brand-dark text-cream shadow-lg ring-1 ring-brass/30 hover:bg-brand-mid hover:text-brass transition-[left] duration-200 ease-out"
+        aria-label={focusMode ? "Exit focus mode" : "Enter focus mode"}
+        title={
+          focusMode
+            ? "Exit focus mode (F) — Shift+click also exits browser fullscreen"
+            : "Focus mode (F) — hides sidebar. Shift+click also goes browser fullscreen."
+        }
+      >
+        {focusMode ? (
+          <Minimize2 className="w-5 h-5" />
+        ) : (
+          <Maximize2 className="w-5 h-5" />
+        )}
+      </button>
     </div>
   );
 }

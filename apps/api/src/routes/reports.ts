@@ -250,6 +250,13 @@ router.get("/outstanding", requireAuth, requirePermission("view_revenue"), async
         ne(invoices.status, "voided"),
         ne(invoices.status, "paid"),
         sql`${reservations.bookingSource} <> 'complimentary'`,
+        // Skip invoices whose parent reservation is fully settled. This
+        // happens on multi-invoice bookings (per-room + combined, or
+        // swap-leg + main stay) where one invoice is paid in isolation
+        // but a sibling invoice on the same reservation looks unpaid
+        // — actual money the property is owed is the reservation-level
+        // balance, which is the single source of truth.
+        sql`${reservations.balanceDue}::numeric > 0.009`,
       ),
     )
     .orderBy(desc(invoices.createdAt));
@@ -341,8 +348,38 @@ router.get("/outstanding", requireAuth, requirePermission("view_revenue"), async
       });
     }
   }
-  for (const r of rows) addToGuest(r, Number(r.balanceDue), new Date(r.issuedAt));
-  for (const r of preInvoiceRows) addToGuest(r, Number(r.balanceDue), new Date(r.createdAt));
+  // Aggregate by RESERVATION (not by invoice) so multi-invoice bookings
+  // don't double-count. A reservation contributes its own balanceDue
+  // exactly once, regardless of how many invoices hang off it. The
+  // oldest invoice's issued-at is kept as the "ageing" anchor when
+  // available, otherwise the reservation's createdAt.
+  //
+  // We also need the reservation's authoritative balance_due — the
+  // single source of truth — instead of summing per-invoice balances
+  // which can drift on multi-invoice bookings. Pull it inline.
+  const reservationBalances = await db
+    .select({
+      id: reservations.id,
+      balanceDue: reservations.balanceDue,
+    })
+    .from(reservations)
+    .where(sql`${reservations.balanceDue}::numeric > 0.009`);
+  const resBalanceMap = new Map(
+    reservationBalances.map((r) => [r.id, Number(r.balanceDue)]),
+  );
+
+  const seenReservations = new Set<string>();
+  for (const r of rows) {
+    if (seenReservations.has(r.reservationId)) continue;
+    seenReservations.add(r.reservationId);
+    const bal = resBalanceMap.get(r.reservationId) ?? Number(r.balanceDue);
+    addToGuest(r, bal, new Date(r.issuedAt));
+  }
+  for (const r of preInvoiceRows) {
+    if (seenReservations.has(r.reservationId)) continue;
+    seenReservations.add(r.reservationId);
+    addToGuest(r, Number(r.balanceDue), new Date(r.createdAt));
+  }
 
   return ok(res, {
     invoices: rows,
@@ -393,18 +430,21 @@ router.post("/outstanding/remind/:guestId", requireAuth, requirePermission("send
   if (!g) return fail(res, 404, "NOT_FOUND", "Guest not found");
   if (!g.phone) return fail(res, 400, "NO_PHONE", "Guest has no phone number");
 
-  // Sum unpaid invoice balances for this guest
-  const invs = await db
-    .select({ balanceDue: invoices.balanceDue })
-    .from(invoices)
+  // Sum the guest's outstanding reservation-level balances. Reservation
+  // balanceDue is the single source of truth (recompute helper keeps
+  // it in sync with payments); summing per-invoice balanceDue on a
+  // multi-invoice booking would over-count if attribution has drifted.
+  const resBalances = await db
+    .select({ balanceDue: reservations.balanceDue })
+    .from(reservations)
     .where(
       and(
-        eq(invoices.guestId, guestId),
-        ne(invoices.status, "paid"),
-        ne(invoices.status, "voided"),
+        eq(reservations.guestId, guestId),
+        sql`${reservations.balanceDue}::numeric > 0.009`,
+        sql`${reservations.bookingSource} <> 'complimentary'`,
       ),
     );
-  const balance = invs.reduce((sum, r) => sum + Number(r.balanceDue), 0);
+  const balance = resBalances.reduce((sum, r) => sum + Number(r.balanceDue), 0);
   if (balance <= 0.009) {
     return fail(res, 400, "NO_BALANCE", "Guest has no outstanding balance");
   }

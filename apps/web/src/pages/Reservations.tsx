@@ -10,6 +10,11 @@ import {
 } from "lucide-react";
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
+import {
+  DatePresetBar,
+  rangeForPreset,
+  type DatePresetKey,
+} from "@/components/DatePresetBar";
 import { Loader } from "@/components/Loader";
 import { StatusBadge } from "@/components/StatusBadge";
 import { api } from "@/lib/api";
@@ -28,6 +33,11 @@ interface Reservation {
   checkOutDate: string;
   checkedInAt: string | null;
   checkedOutAt: string | null;
+  // 0023 — staff-chosen planned arrival / departure clock times.
+  // Preferred over hotel policy when present and the guest hasn't
+  // actually checked in / out yet.
+  plannedCheckInAt?: string | null;
+  plannedCheckOutAt?: string | null;
   numNights: number;
   // Day-use bookings: stayType='short_stay' + durationHours. The card shows
   // "Day use · Nh" instead of the night count.
@@ -74,8 +84,13 @@ export default function Reservations() {
   const navigate = useNavigate();
   const [status, setStatus] = useState("");
   const [q, setQ] = useState("");
-  const [dateFrom, setDateFrom] = useState("");
-  const [dateTo, setDateTo] = useState("");
+  // Default to today. The preset bar updates dateFrom/dateTo when staff
+  // picks Week / Month / Year / Custom; the `preset` key drives which
+  // pill looks active.
+  const initialRange = rangeForPreset("today")!;
+  const [preset, setPreset] = useState<DatePresetKey>("today");
+  const [dateFrom, setDateFrom] = useState(initialRange.from);
+  const [dateTo, setDateTo] = useState(initialRange.to);
   // floor + roomId filters. Empty string = "all". roomId is a UUID we
   // ship to the API; floor is a number coerced server-side from the
   // query string.
@@ -223,39 +238,38 @@ export default function Reservations() {
             ))}
           </select>
         </div>
-        <div className="flex-1 min-w-[140px] sm:flex-none">
-          <label className="label block mb-1">Check-in From</label>
-          <input
-            className="input sm:w-40"
-            type="date"
-            value={dateFrom}
-            onChange={(e) => setDateFrom(e.target.value)}
-          />
-        </div>
-        <div className="flex-1 min-w-[140px] sm:flex-none">
-          <label className="label block mb-1">Check-in To</label>
-          <input
-            className="input sm:w-40"
-            type="date"
-            value={dateTo}
-            onChange={(e) => setDateTo(e.target.value)}
-          />
-        </div>
-        {(status || q || dateFrom || dateTo || floor || roomId) && (
+        {(status || q || floor || roomId || preset !== "today") && (
           <button
             onClick={() => {
               setStatus("");
               setQ("");
-              setDateFrom("");
-              setDateTo("");
               setFloor("");
               setRoomId("");
+              const r = rangeForPreset("today")!;
+              setPreset("today");
+              setDateFrom(r.from);
+              setDateTo(r.to);
             }}
             className="text-xs text-accentBlue hover:underline self-end pb-2"
           >
-            Clear all
+            Reset filters
           </button>
         )}
+      </div>
+
+      {/* Quick range presets — Today / Week / Month / Year / Custom.
+          Filters the list by check-in date inside the picked window. */}
+      <div className="card !py-2.5">
+        <DatePresetBar
+          preset={preset}
+          from={dateFrom}
+          to={dateTo}
+          onChange={(next) => {
+            setPreset(next.preset);
+            setDateFrom(next.from);
+            setDateTo(next.to);
+          }}
+        />
       </div>
 
       {isLoading ? (
@@ -345,11 +359,15 @@ function ReservationRow({
   const hasBalance = bal > 0.009;
   const rooms = r.roomNumbers ? r.roomNumbers.split(",").filter(Boolean) : [];
 
-  // Check-in time: real checkedInAt when guest has arrived; else hotel policy.
+  // Check-in time priority (0023): real checkedInAt > staff-chosen
+  // planned time > hotel policy default.
   const checkInTimeLabel = r.checkedInAt
     ? format(new Date(r.checkedInAt), "h:mm a")
-    : formatHotelTime(hotelCheckInTime);
+    : r.plannedCheckInAt
+      ? format(new Date(r.plannedCheckInAt), "h:mm a")
+      : formatHotelTime(hotelCheckInTime);
   // Check-out time, accounting for short_stay duration + late-checkout grant.
+  // Same priority: actual > planned > policy/late-grant.
   const checkOutTimeLabel = (() => {
     if (r.checkedOutAt) return format(new Date(r.checkedOutAt), "h:mm a");
     if (isShort && r.checkedInAt && dur > 0) {
@@ -357,6 +375,9 @@ function ReservationRow({
         new Date(new Date(r.checkedInAt).getTime() + Math.round(dur * 3600 * 1000)),
         "h:mm a",
       );
+    }
+    if (r.plannedCheckOutAt) {
+      return format(new Date(r.plannedCheckOutAt), "h:mm a");
     }
     const grantHours = Number(r.lateCheckoutHours ?? 0);
     if (grantHours <= 0) return formatHotelTime(hotelCheckOutTime);

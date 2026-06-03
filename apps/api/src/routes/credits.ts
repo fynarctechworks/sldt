@@ -1,4 +1,4 @@
-import { desc, sql } from "drizzle-orm";
+import { sql } from "drizzle-orm";
 import { Router } from "express";
 import { db } from "../db/client.js";
 import { ok } from "../lib/response.js";
@@ -71,7 +71,5 @@ router.get(
     });
   },
 );
-
-void desc; // helper kept for future endpoints (e.g. ledger feed)
 
 export default router;

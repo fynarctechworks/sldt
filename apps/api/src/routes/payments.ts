@@ -8,6 +8,7 @@ import { guests } from "../db/schema/guests.js";
 import { logActivity } from "../lib/activity.js";
 import { loadGuestExtra } from "../lib/guestExtra.js";
 import { logger } from "../lib/logger.js";
+import { recomputeReservationBalance } from "../lib/reservationBalance.js";
 import { renderInvoicePdf, renderReceiptPdf } from "../lib/pdf.js";
 import { generateReceiptNumber } from "../lib/receipt.js";
 import { invalidateDashboard } from "../lib/redis.js";
@@ -68,10 +69,11 @@ router.post(
         })
         .where(eq(invoices.id, input.invoiceId));
 
-      await tx
-        .update(reservations)
-        .set({ balanceDue: String(newBalance), updatedAt: new Date() })
-        .where(eq(reservations.id, inv[0]!.reservationId));
+      // Reservation balanceDue is recomputed from facts, not derived
+      // from this invoice's balance — a booking may have multiple
+      // invoices and we mustn't overwrite the cross-invoice picture
+      // with this one's number.
+      await recomputeReservationBalance(tx, inv[0]!.reservationId);
 
       // If this real payment fully settles the invoice, auto-void any
       // still-pending "collect later" promises that were sitting on the
@@ -275,7 +277,7 @@ router.post(
         .where(eq(payments.id, id));
 
       if (inv.length) {
-        // Post-invoice void: reverse against the invoice + reservation balance.
+        // Post-invoice void: reverse the invoice ledger.
         const newTotalPaid = +(Number(inv[0]!.totalPaid) - Number(existing[0]!.amount)).toFixed(2);
         const newBalance = +(Number(inv[0]!.grandTotal) - newTotalPaid).toFixed(2);
         const newStatus = newBalance <= 0.009 ? "paid" : newTotalPaid > 0 ? "partial" : "issued";
@@ -288,39 +290,11 @@ router.post(
             updatedAt: new Date(),
           })
           .where(eq(invoices.id, inv[0]!.id));
-
-        await tx
-          .update(reservations)
-          .set({ balanceDue: String(newBalance), updatedAt: new Date() })
-          .where(eq(reservations.id, existing[0]!.reservationId));
-      } else {
-        // Pre-invoice void (advance payment): reduce reservation.advancePaid
-        // and recompute balanceDue from grandTotal. Only "received" payments
-        // affect those columns — voiding a "pending" payment has no money
-        // impact since pending wasn't counted as paid in the first place.
-        if (existing[0]!.status === "received") {
-          const [r] = await tx
-            .select()
-            .from(reservations)
-            .where(eq(reservations.id, existing[0]!.reservationId))
-            .limit(1);
-          if (r) {
-            const newAdvance = Math.max(
-              0,
-              +(Number(r.advancePaid) - Number(existing[0]!.amount)).toFixed(2),
-            );
-            const newBalance = +(Number(r.grandTotal) - newAdvance).toFixed(2);
-            await tx
-              .update(reservations)
-              .set({
-                advancePaid: String(newAdvance),
-                balanceDue: String(newBalance),
-                updatedAt: new Date(),
-              })
-              .where(eq(reservations.id, r.id));
-          }
-        }
       }
+      // Reservation balance is the cross-invoice picture; recompute
+      // from the payment facts regardless of whether the voided payment
+      // was attached to an invoice or sitting as a pre-invoice advance.
+      await recomputeReservationBalance(tx, existing[0]!.reservationId);
     });
 
     await logActivity({
@@ -386,13 +360,12 @@ router.post(
               updatedAt: new Date(),
             })
             .where(eq(invoices.id, inv.id));
-
-          await tx
-            .update(reservations)
-            .set({ balanceDue: String(Math.max(0, newBalance)), updatedAt: new Date() })
-            .where(eq(reservations.id, existing.reservationId));
         }
       }
+      // The pending → received flip turns this payment into "real money"
+      // for the first time, so the reservation-level rollup needs to
+      // re-pick it up regardless of whether an invoice is attached.
+      await recomputeReservationBalance(tx, existing.reservationId);
     });
 
     await logActivity({
@@ -457,6 +430,12 @@ async function regenerateInvoicePdfForReservation(reservationId: string): Promis
           numNights: Number(resRow.numNights),
           checkedInAt: resRow.checkedInAt
             ? resRow.checkedInAt.toISOString()
+            : null,
+          plannedCheckInAt: resRow.plannedCheckInAt
+            ? resRow.plannedCheckInAt.toISOString()
+            : null,
+          plannedCheckOutAt: resRow.plannedCheckOutAt
+            ? resRow.plannedCheckOutAt.toISOString()
             : null,
         }
       : undefined,

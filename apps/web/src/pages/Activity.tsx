@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { format, formatDistanceToNow, isToday, isYesterday, startOfMonth, startOfWeek } from "date-fns";
+import { format, formatDistanceToNow, isToday, isYesterday, startOfMonth, startOfWeek, startOfYear } from "date-fns";
 import { Activity as ActivityIcon, Calendar } from "lucide-react";
 import { useMemo, useState } from "react";
 import { Loader } from "@/components/Loader";
@@ -13,7 +13,7 @@ interface ActivityRow {
   createdAt: string;
 }
 
-type RangeKey = "today" | "week" | "month" | "custom";
+type RangeKey = "today" | "week" | "month" | "year" | "custom";
 
 function isoDay(d: Date): string {
   // yyyy-MM-dd in the user's local timezone — matches what the API expects.
@@ -25,6 +25,7 @@ function rangeForKey(key: RangeKey, customFrom: string, customTo: string) {
   if (key === "today") return { from: isoDay(today), to: isoDay(today) };
   if (key === "week") return { from: isoDay(startOfWeek(today, { weekStartsOn: 1 })), to: isoDay(today) };
   if (key === "month") return { from: isoDay(startOfMonth(today)), to: isoDay(today) };
+  if (key === "year") return { from: isoDay(startOfYear(today)), to: isoDay(today) };
   return { from: customFrom, to: customTo };
 }
 
@@ -110,7 +111,7 @@ export default function Activity() {
 
       <div className="card !p-3 flex flex-wrap items-center gap-3">
         <div className="inline-flex items-center bg-bg border border-borderc rounded-md p-1 gap-1">
-          {(["today", "week", "month", "custom"] as RangeKey[]).map((k) => (
+          {(["today", "week", "month", "year", "custom"] as RangeKey[]).map((k) => (
             <button
               key={k}
               onClick={() => setRange(k)}
@@ -123,10 +124,12 @@ export default function Activity() {
               {k === "today"
                 ? "Today"
                 : k === "week"
-                ? "This Week"
-                : k === "month"
-                ? "This Month"
-                : "Custom"}
+                  ? "This Week"
+                  : k === "month"
+                    ? "This Month"
+                    : k === "year"
+                      ? "This Year"
+                      : "Custom"}
             </button>
           ))}
         </div>

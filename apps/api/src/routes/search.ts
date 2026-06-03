@@ -10,7 +10,7 @@
 // last4, room numbers, reservation numbers. We trim and reject queries
 // shorter than 2 chars to avoid table-scan-on-every-keystroke.
 
-import { and, asc, desc, eq, ilike, or, sql } from "drizzle-orm";
+import { asc, desc, eq, ilike, or, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 import { db } from "../db/client.js";

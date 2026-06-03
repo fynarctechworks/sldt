@@ -5,6 +5,7 @@
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
+    "predev": "node scripts/free-port.mjs",
     "dev": "nodemon --watch src --ext ts --exec \"tsx src/index.ts\"",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
@@ -14,7 +15,7 @@
     "db:migrate": "node scripts/migrate.mjs",
     "db:seed": "tsx src/db/seed.ts",
     "test": "vitest run",
-    "lint": "eslint src --ext .ts"
+    "lint": "eslint src"
   },
   "dependencies": {
     "@hoteldesk/shared": "*",

@@ -18,6 +18,13 @@ export const reservationCreateSchema = z
       .min(1),
     checkInDate: z.string().date(),
     checkOutDate: z.string().date(),
+    // Staff-picked arrival / departure clock times (0023). Planned /
+    // display-only — the system still uses the dates for billing and
+    // conflict detection. Stored as ISO timestamps with the property
+    // timezone baked in by the client. Both optional; missing => fall
+    // back to property policy times.
+    plannedCheckInAt: z.string().datetime({ offset: true }).optional(),
+    plannedCheckOutAt: z.string().datetime({ offset: true }).optional(),
     // Day-use vs night-based booking. For short_stay:
     //   - checkInDate == checkOutDate
     //   - durationHours is required (3..23.5, in 0.5 steps)
@@ -75,15 +82,9 @@ export const reservationCreateSchema = z
         message: "check_out_date must be after check_in_date",
       });
     }
-    // Co-guest requirement: 2+ adults need at least 1 co-guest with KYC.
-    // (numAdults beyond 2 doesn't require additional KYC — capped at 1.)
-    if (d.numAdults >= 2 && (!d.coGuestIds || d.coGuestIds.length < 1)) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["coGuestIds"],
-        message: "A second guest with KYC is required when there are 2 or more adults",
-      });
-    }
+    // Co-guest is OPTIONAL for 2+ adults. If staff captures the second
+    // occupant's KYC at booking we store it; if not, the booking still
+    // goes through. Front-desk policy decides when to collect it.
     // Booker can't also be listed as a co-guest.
     if (d.coGuestIds?.some((id) => id === d.guestId)) {
       ctx.addIssue({

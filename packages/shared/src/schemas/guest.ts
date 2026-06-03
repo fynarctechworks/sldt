@@ -89,6 +89,8 @@ export const followUpUpdateSchema = z.object({
 
 export const guestDuplicateQuerySchema = z.object({
   phone: z.string().optional(),
+  email: z.string().optional(),
+  id_type: z.enum(ID_PROOF_TYPES).optional(),
   id_number: z.string().optional(),
 });
 

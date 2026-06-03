@@ -3,7 +3,7 @@ import { Router } from "express";
 import { db } from "../db/client.js";
 import { activityLog } from "../db/schema/activity.js";
 import { guests } from "../db/schema/guests.js";
-import { invoices, payments } from "../db/schema/invoices.js";
+import { payments } from "../db/schema/invoices.js";
 import { profiles } from "../db/schema/profiles.js";
 import { reservationRooms, reservations } from "../db/schema/reservations.js";
 import { rooms } from "../db/schema/rooms.js";
@@ -339,26 +339,18 @@ async function buildDashboard() {
           ),
         ),
       // Outstanding balance — money the property is still owed. Sum
-      // over every non-cancelled reservation: use the latest non-
-      // voided invoice's balance when one exists, otherwise the
-      // reservation's running balance_due. Mirrors how the guest-
-      // profile balance is computed so the two surfaces never disagree.
+      // over every non-cancelled reservation's authoritative
+      // balance_due (recomputed from payments + walletCredit by the
+      // single-source-of-truth helper). The old "latest invoice's
+      // balance" heuristic was wrong for multi-invoice bookings (e.g.
+      // per-room invoices with the same created_at) and could pick a
+      // swap-leg micro-invoice that's unpaid in isolation even when
+      // the reservation as a whole is fully settled.
       db.execute<{ total: string }>(sql`
-        SELECT COALESCE(SUM(
-          CASE
-            WHEN r.status = 'cancelled' THEN 0
-            ELSE COALESCE(
-              (SELECT i.balance_due::numeric
-               FROM ${invoices} i
-               WHERE i.reservation_id = r.id AND i.status != 'voided'
-               ORDER BY i.created_at DESC
-               LIMIT 1),
-              r.balance_due::numeric
-            )
-          END
-        ), 0)::text AS total
+        SELECT COALESCE(SUM(r.balance_due::numeric), 0)::text AS total
         FROM ${reservations} r
         WHERE r.booking_source <> 'complimentary'
+          AND r.status <> 'cancelled'
       `),
       // Pending check-outs today — reservations whose check-out date
       // is today AND status is still 'checked_in' (i.e. the guest is
@@ -722,6 +714,7 @@ async function buildDashboard() {
         id: r.id,
         room_number: r.roomNumber,
         room_type: r.roomType,
+        floor: r.floor,
         status: effectiveStatus,
         guest_name: live?.guestName ?? null,
         reservation_id: live?.reservationId ?? null,

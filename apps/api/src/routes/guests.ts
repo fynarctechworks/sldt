@@ -23,7 +23,12 @@ import { reservationCoGuests, reservations, reservationRooms } from "../db/schem
 import { rooms } from "../db/schema/rooms.js";
 import { invoices, payments } from "../db/schema/invoices.js";
 import { logActivity } from "../lib/activity.js";
+import { logger } from "../lib/logger.js";
 import { encrypt, last4 } from "../lib/crypto.js";
+import {
+  mergeTagsForRead,
+  sanitizeTagsForWrite,
+} from "../lib/guestTags.js";
 import { normalisePhone } from "../lib/phone.js";
 import { resolveCurrentPropertyId } from "../lib/currentProperty.js";
 import { fail, list, ok } from "../lib/response.js";
@@ -119,6 +124,36 @@ router.get(
       db.select({ count: sql<number>`count(*)::int` }).from(guests).where(where),
     ]);
 
+    // Per-guest stay count + lifetime spend, batched in one round-trip
+    // (vs N round-trips for per-row queries). Same scoping logic as
+    // GET /:id stats — only completed, non-comp stays count for the
+    // tag thresholds. Returns 0/0 for guests with no stays.
+    const guestIds = rows.map((r) => r.id);
+    const aggMap = new Map<string, { completed: number; spent: number }>();
+    if (guestIds.length > 0) {
+      const aggRows = await db.execute<{
+        guest_id: string;
+        completed: number;
+        spent: string;
+      }>(sql`
+        SELECT
+          g.id AS guest_id,
+          COUNT(DISTINCT r.id) FILTER (WHERE r.status = 'checked_out' AND r.booking_source <> 'complimentary')::int AS completed,
+          COALESCE(SUM(CASE WHEN p.voided = false AND p.status = 'received' AND r.booking_source <> 'complimentary' THEN p.amount::numeric ELSE 0 END), 0)::text AS spent
+        FROM ${guests} g
+        LEFT JOIN ${reservations} r ON r.guest_id = g.id
+        LEFT JOIN ${payments} p ON p.reservation_id = r.id
+        WHERE g.id = ANY(${sql.raw(`ARRAY[${guestIds.map((id) => `'${id}'::uuid`).join(",")}]`)})
+        GROUP BY g.id
+      `);
+      for (const a of aggRows) {
+        aggMap.set(a.guest_id, {
+          completed: a.completed,
+          spent: Number(a.spent),
+        });
+      }
+    }
+
     // Resolve signed photo URLs in parallel so the guest search dropdown
     // can render thumbnails. Rows without a guestPhoto get null. URLs are
     // short-lived (5 min) — fine for the list view.
@@ -126,10 +161,21 @@ router.get(
       rows.map((r) => (r.guestPhoto ? signedKycUrl(r.guestPhoto) : Promise.resolve(null))),
     );
 
-    const masked = rows.map((r, i) => ({
-      ...maskGuest(r, req.user!.role),
-      photoUrl: photoUrls[i] ?? null,
-    }));
+    const masked = rows.map((r, i) => {
+      const agg = aggMap.get(r.id) ?? { completed: 0, spent: 0 };
+      const computedTags = mergeTagsForRead(r.tags as string[] | null, {
+        createdAt: r.createdAt,
+        isBlacklisted: r.isBlacklisted,
+        gstin: r.gstin,
+        completedStays: agg.completed,
+        totalSpent: agg.spent,
+      });
+      return {
+        ...maskGuest(r, req.user!.role),
+        tags: computedTags,
+        photoUrl: photoUrls[i] ?? null,
+      };
+    });
     return list(res, masked, { total: totalRows[0]?.count ?? 0, page, per_page });
   },
 );
@@ -140,20 +186,84 @@ router.get(
   requirePermission("view_guests"),
   validate(guestDuplicateQuerySchema, "query"),
   async (req, res) => {
-    const { phone, id_number } = req.query as { phone?: string; id_number?: string };
-    if (!phone && !id_number) return ok(res, { duplicate: false });
+    const { phone, email, id_type, id_number } = req.query as {
+      phone?: string;
+      email?: string;
+      id_type?: import("@hoteldesk/shared").IdProofType;
+      id_number?: string;
+    };
+    if (!phone && !email && !id_number) {
+      return ok(res, { duplicate: false, matches: [], reasons: [] });
+    }
 
+    // Build one OR condition per field so we can tell the caller WHICH
+    // identifier matched on each row (phone vs email vs ID). This lets
+    // the form show "Use existing guest" suggestions next to whichever
+    // field the staff is typing into.
     const conditions = [];
-    if (phone) conditions.push(eq(guests.phone, phone));
-    if (id_number) conditions.push(eq(guests.idProofLast4, id_number.slice(-4)));
+    if (phone) conditions.push(eq(guests.phone, normalisePhone(phone)));
+    if (email && email.trim() !== "") {
+      conditions.push(sql`LOWER(${guests.email}) = LOWER(${email.trim()})`);
+    }
+    if (id_number) {
+      const last4 = id_number.slice(-4);
+      // Pair ID number with its type — a 4-digit suffix shared across
+      // an Aadhaar and a Passport isn't the same person.
+      if (id_type) {
+        conditions.push(
+          and(
+            eq(guests.idProofType, id_type),
+            eq(guests.idProofLast4, last4),
+          )!,
+        );
+      } else {
+        conditions.push(eq(guests.idProofLast4, last4));
+      }
+    }
+    if (conditions.length === 0) {
+      return ok(res, { duplicate: false, matches: [], reasons: [] });
+    }
 
-    const matches = await db
-      .select({ id: guests.id, fullName: guests.fullName, phone: guests.phone })
+    const rows = await db
+      .select({
+        id: guests.id,
+        fullName: guests.fullName,
+        phone: guests.phone,
+        email: guests.email,
+        idProofType: guests.idProofType,
+        idProofLast4: guests.idProofLast4,
+      })
       .from(guests)
       .where(or(...conditions))
       .limit(5);
 
-    return ok(res, { duplicate: matches.length > 0, matches });
+    // Annotate each match with WHY it matched so the UI can render
+    // "Phone already used by …" vs "Email already used by …".
+    const matches = rows.map((r) => {
+      const reasons: ("phone" | "email" | "id")[] = [];
+      if (phone && r.phone === normalisePhone(phone)) reasons.push("phone");
+      if (
+        email &&
+        r.email &&
+        r.email.trim().toLowerCase() === email.trim().toLowerCase()
+      ) {
+        reasons.push("email");
+      }
+      if (
+        id_number &&
+        r.idProofLast4 === id_number.slice(-4) &&
+        (!id_type || r.idProofType === id_type)
+      ) {
+        reasons.push("id");
+      }
+      return { ...r, reasons };
+    });
+
+    return ok(res, {
+      duplicate: matches.length > 0,
+      matches,
+      reasons: Array.from(new Set(matches.flatMap((m) => m.reasons))),
+    });
   },
 );
 
@@ -196,6 +306,11 @@ router.get(
             sql`${invoices.status} NOT IN ('voided','paid')`,
             sql`${invoices.balanceDue}::numeric > 0.009`,
             sql`${reservations.bookingSource} <> 'complimentary'`,
+            // Don't list invoice rows whose parent reservation is fully
+            // settled. Happens on multi-invoice bookings where one
+            // invoice looks unpaid in isolation but a sibling invoice
+            // on the same reservation absorbed the payments.
+            sql`${reservations.balanceDue}::numeric > 0.009`,
           ),
         )
         .orderBy(desc(invoices.createdAt)),
@@ -240,9 +355,26 @@ router.get(
         ),
     ]);
 
-    const totalFromInvoices = invoiceRows.reduce((s, r) => s + Number(r.balanceDue), 0);
-    const totalFromPreInvoice = preInvoiceRows.reduce((s, r) => s + Number(r.balanceDue), 0);
-    const total = +(totalFromInvoices + totalFromPreInvoice).toFixed(2);
+    // Total = sum of reservation-level balances (the single source of
+    // truth), one entry per reservation. Summing per-invoice balances
+    // would double-count multi-invoice bookings whenever attribution
+    // is split across siblings.
+    const reservationIds = new Set<string>();
+    for (const r of invoiceRows) reservationIds.add(r.reservationId);
+    for (const r of preInvoiceRows) reservationIds.add(r.reservationId);
+    let total = 0;
+    if (reservationIds.size > 0) {
+      const balRows = await db
+        .select({
+          id: reservations.id,
+          balanceDue: reservations.balanceDue,
+        })
+        .from(reservations)
+        .where(inArray(reservations.id, Array.from(reservationIds)));
+      total = +balRows
+        .reduce((s, r) => s + Number(r.balanceDue), 0)
+        .toFixed(2);
+    }
 
     // Most-recent unpaid item — used by the UI for the "Open previous
     // reservation" deep-link in the banner.
@@ -460,23 +592,22 @@ router.get(
       `),
       // Total paid + balance due across the whole guest history.
       //
-      // Total paid: sum of every non-voided, "received" payment on any of
-      // this guest's reservations. This catches advances taken at booking
-      // (before any invoice exists) AND post-invoice payments.
+      // Both values are pulled from the single source of truth:
+      //   - total_paid: SUM of non-voided, received payments
+      //   - balance_due: SUM of reservations.balance_due (kept honest
+      //     by the recompute helper on every money-event path)
       //
-      // Balance due: for each non-cancelled reservation, take the invoice's
-      // balance if an invoice has been issued (and is not voided); otherwise
-      // take the reservation's running balance_due. This avoids double-
-      // counting when an invoice exists and prevents under-counting when the
-      // guest has paid an advance but hasn't checked out yet (no invoice
-      // yet).
-      // Complimentary reservations are excluded from "Total paid" and
-      // "Balance due" on the guest profile. They count as stays (handled
-      // by resStats above) but their money is tracked in the
-      // Complimentary report, not the guest's lifetime spend.
+      // The old code derived the per-reservation balance from "latest
+      // invoice's balance or the reservation's running number", which
+      // was non-deterministic for per-room invoices with identical
+      // created_at and over-counted multi-invoice bookings. Reservation
+      // balanceDue is authoritative and avoids both bugs.
+      //
+      // Complimentary reservations are excluded — their money is
+      // tracked in the Complimentary report, not lifetime spend.
       db.execute<{ total_paid: string; balance_due: string }>(sql`
         WITH guest_reservations AS (
-          SELECT r.id, r.status, r.balance_due, r.booking_source
+          SELECT r.id, r.status, r.balance_due
           FROM ${reservations} r
           WHERE r.guest_id = ${id}
             AND r.booking_source <> 'complimentary'
@@ -491,14 +622,7 @@ router.get(
           SELECT COALESCE(SUM(
             CASE
               WHEN gr.status = 'cancelled' THEN 0
-              ELSE COALESCE(
-                (SELECT i.balance_due::numeric
-                 FROM ${invoices} i
-                 WHERE i.reservation_id = gr.id AND i.status != 'voided'
-                 ORDER BY i.created_at DESC
-                 LIMIT 1),
-                gr.balance_due::numeric
-              )
+              ELSE gr.balance_due::numeric
             END
           ), 0) AS total
           FROM guest_reservations gr
@@ -513,22 +637,37 @@ router.get(
     const { getGuestBalance } = await import("../lib/ledger.js");
     const walletBalance = await getGuestBalance(id);
 
+    const completedStays = resStats[0]?.completed ?? 0;
+    const totalSpent = Number(
+      (paidStats as unknown as { total_paid: string }[])[0]?.total_paid ?? 0,
+    );
+    // Recompute the lifecycle tags from the freshly-computed numbers
+    // (0026 auto-tagging). Stored tags are merged in for the manual
+    // custom additions; the system slots are overwritten on every
+    // read so they can never drift from the underlying counts.
+    const computedTags = mergeTagsForRead(found[0]!.tags as string[] | null, {
+      createdAt: found[0]!.createdAt,
+      isBlacklisted: found[0]!.isBlacklisted,
+      gstin: found[0]!.gstin,
+      completedStays,
+      totalSpent,
+    });
+
     return ok(res, {
       ...maskGuest(found[0]!, req.user!.role),
+      tags: computedTags,
       photoUrl,
       walletBalance,
       stats: {
         totalStays: resStats[0]?.total ?? 0,
-        completedStays: resStats[0]?.completed ?? 0,
+        completedStays,
         upcomingStays: resStats[0]?.upcoming ?? 0,
         inHouseStays: resStats[0]?.inHouse ?? 0,
         cancelledStays: resStats[0]?.cancelled ?? 0,
         firstStay: resStats[0]?.firstStay ?? null,
         lastStay: resStats[0]?.lastStay ?? null,
         firstBooking: resStats[0]?.firstBooking ?? null,
-        totalSpent: Number(
-          (paidStats as unknown as { total_paid: string }[])[0]?.total_paid ?? 0,
-        ),
+        totalSpent,
         balanceDue: Number(
           (paidStats as unknown as { balance_due: string }[])[0]?.balance_due ?? 0,
         ),
@@ -548,48 +687,146 @@ router.post(
     // register as distinct guests. The duplicate check has to use the
     // same shape we'll store.
     const phone = normalisePhone(input.phone);
-    const dup = await db
-      .select({ id: guests.id })
+    const normalisedEmail =
+      input.email && input.email.trim() !== ""
+        ? input.email.trim().toLowerCase()
+        : null;
+    const idLast4 = last4(input.idProofNumber);
+
+    // Triple uniqueness check. Phone, email, and (id_type + id_last4)
+    // each identify one human; sharing any of them across two guest
+    // rows is almost always a data-quality bug. We check all three in
+    // a single query so staff can see all the collisions in one go,
+    // and pick the existing guest instead of creating a duplicate.
+    const dupConditions = [eq(guests.phone, phone)];
+    if (normalisedEmail) {
+      dupConditions.push(
+        sql`LOWER(${guests.email}) = ${normalisedEmail}`,
+      );
+    }
+    dupConditions.push(
+      and(
+        eq(guests.idProofType, input.idProofType),
+        eq(guests.idProofLast4, idLast4),
+      )!,
+    );
+    const dups = await db
+      .select({
+        id: guests.id,
+        fullName: guests.fullName,
+        phone: guests.phone,
+        email: guests.email,
+        idProofType: guests.idProofType,
+        idProofLast4: guests.idProofLast4,
+      })
       .from(guests)
-      .where(eq(guests.phone, phone))
-      .limit(1);
-    if (dup.length) return fail(res, 409, "DUPLICATE_PHONE", "Phone already registered");
+      .where(or(...dupConditions))
+      .limit(3);
+    if (dups.length) {
+      const reasons: ("phone" | "email" | "id")[] = [];
+      for (const d of dups) {
+        if (d.phone === phone) reasons.push("phone");
+        if (
+          normalisedEmail &&
+          d.email &&
+          d.email.trim().toLowerCase() === normalisedEmail
+        ) {
+          reasons.push("email");
+        }
+        if (
+          d.idProofType === input.idProofType &&
+          d.idProofLast4 === idLast4
+        ) {
+          reasons.push("id");
+        }
+      }
+      const uniqueReasons = Array.from(new Set(reasons));
+      const code =
+        uniqueReasons.length === 1
+          ? uniqueReasons[0] === "phone"
+            ? "DUPLICATE_PHONE"
+            : uniqueReasons[0] === "email"
+              ? "DUPLICATE_EMAIL"
+              : "DUPLICATE_ID"
+          : "DUPLICATE_GUEST";
+      const fieldList = uniqueReasons
+        .map((r) => (r === "id" ? "ID number" : r))
+        .join(" / ");
+      return fail(
+        res,
+        409,
+        code,
+        `A guest with the same ${fieldList} already exists. Use the existing profile instead.`,
+        { matches: dups, reasons: uniqueReasons },
+      );
+    }
 
     const propertyId = await resolveCurrentPropertyId(req);
     // Insert the guest + their first phone-history row atomically so
     // we can never have a guest without an open history row. (The
     // 0022 backfill seeds existing guests; this keeps new ones
     // consistent going forward.)
-    const created = await db.transaction(async (tx) => {
-      const [row] = await tx
-        .insert(guests)
-        .values({
-          propertyId,
-          fullName: input.fullName,
+    //
+    // The pre-flight collision check above runs OUTSIDE the tx, so a
+    // race between two near-simultaneous creates can theoretically
+    // slip a duplicate past it. The DB unique indexes (0030) are the
+    // final guard — we catch 23505 here and turn it into the same
+    // 409 the pre-flight would have returned, with the right code.
+    let created: typeof guests.$inferSelect | null = null;
+    try {
+      created = await db.transaction(async (tx) => {
+        const [row] = await tx
+          .insert(guests)
+          .values({
+            propertyId,
+            fullName: input.fullName,
+            phone,
+            email: input.email || null,
+            gender: input.gender,
+            idProofType: input.idProofType,
+            idProofNumberEncrypted: encrypt(input.idProofNumber),
+            idProofLast4: last4(input.idProofNumber),
+            address: input.address || null,
+            city: input.city || null,
+            state: input.state || null,
+            nationality: input.nationality || "Indian",
+            dateOfBirth: input.dateOfBirth || null,
+            companyName: input.companyName || null,
+            gstin: input.gstin || null,
+            notes: input.notes || null,
+          })
+          .returning();
+        await tx.insert(guestPhoneHistory).values({
+          guestId: row!.id,
           phone,
-          email: input.email || null,
-          gender: input.gender,
-          idProofType: input.idProofType,
-          idProofNumberEncrypted: encrypt(input.idProofNumber),
-          idProofLast4: last4(input.idProofNumber),
-          address: input.address || null,
-          city: input.city || null,
-          state: input.state || null,
-          nationality: input.nationality || "Indian",
-          dateOfBirth: input.dateOfBirth || null,
-          companyName: input.companyName || null,
-          gstin: input.gstin || null,
-          notes: input.notes || null,
-        })
-        .returning();
-      await tx.insert(guestPhoneHistory).values({
-        guestId: row!.id,
-        phone,
-        // valid_from defaults to now() at the DB level; valid_to NULL
-        // marks it as the currently-active phone.
+          // valid_from defaults to now() at the DB level; valid_to NULL
+          // marks it as the currently-active phone.
+        });
+        return row!;
       });
-      return row;
-    });
+    } catch (err) {
+      const code = (err as { code?: string })?.code;
+      const constraint = (err as { constraint?: string })?.constraint ?? "";
+      if (code === "23505") {
+        const isEmail = constraint.includes("email");
+        const isId = constraint.includes("idproof");
+        return fail(
+          res,
+          409,
+          isEmail
+            ? "DUPLICATE_EMAIL"
+            : isId
+              ? "DUPLICATE_ID"
+              : "DUPLICATE_PHONE",
+          isEmail
+            ? "Email already registered to another guest"
+            : isId
+              ? "ID number already registered to another guest"
+              : "Phone already registered to another guest",
+        );
+      }
+      throw err;
+    }
 
     await logActivity({
       action: "guest_created",
@@ -646,11 +883,35 @@ router.put(
     // outside as a belt-and-braces fallback.
     const TX_NOT_FOUND = "__not_found__" as const;
     const TX_COLLISION = "__phone_collision__" as const;
+    // Pre-compute the candidate values we'll check for collisions so
+    // the in-tx probe stays simple. Empty strings are treated as null
+    // (no email).
+    const nextEmail =
+      typeof input.email === "string" && input.email.trim() !== ""
+        ? input.email.trim().toLowerCase()
+        : input.email === null
+          ? null
+          : undefined;
+    const nextIdType =
+      typeof input.idProofType === "string"
+        ? (input.idProofType as import("@hoteldesk/shared").IdProofType)
+        : undefined;
+    const nextIdLast4 =
+      typeof input.idProofNumber === "string"
+        ? last4(input.idProofNumber)
+        : undefined;
+
     let updated: typeof guests.$inferSelect | null = null;
+    let collisionReason: "phone" | "email" | "id" | null = null;
     try {
       const result = await db.transaction(async (tx) => {
         const [before] = await tx
-          .select({ phone: guests.phone })
+          .select({
+            phone: guests.phone,
+            email: guests.email,
+            idProofType: guests.idProofType,
+            idProofLast4: guests.idProofLast4,
+          })
           .from(guests)
           .where(eq(guests.id, id))
           .limit(1);
@@ -663,6 +924,48 @@ router.put(
             .where(eq(guests.phone, nextPhone))
             .limit(1);
           if (collision.length && collision[0]!.id !== id) {
+            collisionReason = "phone";
+            return TX_COLLISION;
+          }
+        }
+
+        // Email collision — only check when the caller actually wrote
+        // a non-empty email AND it differs from what's stored.
+        if (
+          nextEmail &&
+          (before.email ?? "").trim().toLowerCase() !== nextEmail
+        ) {
+          const collision = await tx
+            .select({ id: guests.id })
+            .from(guests)
+            .where(sql`LOWER(${guests.email}) = ${nextEmail}`)
+            .limit(1);
+          if (collision.length && collision[0]!.id !== id) {
+            collisionReason = "email";
+            return TX_COLLISION;
+          }
+        }
+
+        // ID collision — when either ID type or number changed,
+        // re-probe against the (type, last4) pair.
+        const effIdType = nextIdType ?? before.idProofType;
+        const effIdLast4 = nextIdLast4 ?? before.idProofLast4;
+        const idChanged =
+          (nextIdType !== undefined && nextIdType !== before.idProofType) ||
+          (nextIdLast4 !== undefined && nextIdLast4 !== before.idProofLast4);
+        if (idChanged && effIdLast4) {
+          const collision = await tx
+            .select({ id: guests.id })
+            .from(guests)
+            .where(
+              and(
+                eq(guests.idProofType, effIdType),
+                eq(guests.idProofLast4, effIdLast4),
+              ),
+            )
+            .limit(1);
+          if (collision.length && collision[0]!.id !== id) {
+            collisionReason = "id";
             return TX_COLLISION;
           }
         }
@@ -697,26 +1000,51 @@ router.put(
 
       if (result === TX_NOT_FOUND)
         return fail(res, 404, "NOT_FOUND", "Guest not found");
-      if (result === TX_COLLISION)
+      if (result === TX_COLLISION) {
+        const code =
+          collisionReason === "email"
+            ? "DUPLICATE_EMAIL"
+            : collisionReason === "id"
+              ? "DUPLICATE_ID"
+              : "DUPLICATE_PHONE";
+        const fieldWord =
+          collisionReason === "email"
+            ? "Email"
+            : collisionReason === "id"
+              ? "ID number"
+              : "Phone";
         return fail(
           res,
           409,
-          "DUPLICATE_PHONE",
-          "Phone already registered to another guest",
+          code,
+          `${fieldWord} already registered to another guest`,
         );
+      }
       updated = result ?? null;
     } catch (err) {
-      // Belt-and-braces: if the unique index on guests.phone catches
-      // a collision we somehow missed (e.g. an INSERT racing in
-      // between the SELECT and UPDATE inside the transaction), turn
-      // it into a clean 409 instead of bubbling a 500.
+      // Belt-and-braces: if any unique index on guests catches a
+      // collision we somehow missed (e.g. an INSERT racing in between
+      // the SELECT and UPDATE inside the transaction), turn it into a
+      // clean 409. Constraint name disambiguates which identifier
+      // collided so the message stays accurate.
       const code = (err as { code?: string })?.code;
+      const constraint = (err as { constraint?: string })?.constraint ?? "";
       if (code === "23505") {
+        const isEmail = constraint.includes("email");
+        const isId = constraint.includes("idproof");
         return fail(
           res,
           409,
-          "DUPLICATE_PHONE",
-          "Phone already registered to another guest",
+          isEmail
+            ? "DUPLICATE_EMAIL"
+            : isId
+              ? "DUPLICATE_ID"
+              : "DUPLICATE_PHONE",
+          isEmail
+            ? "Email already registered to another guest"
+            : isId
+              ? "ID number already registered to another guest"
+              : "Phone already registered to another guest",
         );
       }
       throw err;
@@ -887,7 +1215,14 @@ router.patch(
   async (req, res) => {
     const id = req.params.id!;
     const { tags } = req.body as { tags: string[] };
-    const normalized = Array.from(new Set(tags.map((t) => t.trim().toLowerCase()).filter(Boolean)));
+    // Strip any system-managed tags ("First Time", "Repeat", "VIP",
+    // "High Value", "Corporate", "Blacklist") — those are computed
+    // from the underlying numbers on every read, so admin can't pin
+    // or remove them. Whatever's left is the manual custom tags.
+    const onlyManual = sanitizeTagsForWrite(tags);
+    const normalized = Array.from(
+      new Set(onlyManual.map((t) => t.trim().toLowerCase()).filter(Boolean)),
+    );
     const [updated] = await db
       .update(guests)
       .set({ tags: normalized, updatedAt: new Date() })
@@ -1221,14 +1556,84 @@ router.get(
 
 router.delete("/:id", requireAuth, requirePermission("delete_guests"), async (req, res) => {
   const id = req.params.id!;
-  const [deleted] = await db.delete(guests).where(eq(guests.id, id)).returning();
-  if (!deleted) return fail(res, 404, "NOT_FOUND", "Guest not found");
+
+  // Refuse the delete if the guest has any stay history. A guest tied
+  // to a reservation (as booker, per-room occupant, or co-guest) is an
+  // accounting record we mustn't lose — staff should void / cancel the
+  // bookings first, or just keep the guest. Returns 409 with the count
+  // so the UI can explain the block.
+  const [bookerCount, occupantCount, coGuestCount] = await Promise.all([
+    db
+      .select({ n: sql<number>`count(*)::int` })
+      .from(reservations)
+      .where(eq(reservations.guestId, id)),
+    db
+      .select({ n: sql<number>`count(*)::int` })
+      .from(reservationRooms)
+      .where(eq(reservationRooms.guestId, id)),
+    db
+      .select({ n: sql<number>`count(*)::int` })
+      .from(reservationCoGuests)
+      .where(eq(reservationCoGuests.guestId, id)),
+  ]);
+  const totalStays =
+    (bookerCount[0]?.n ?? 0) +
+    (occupantCount[0]?.n ?? 0) +
+    (coGuestCount[0]?.n ?? 0);
+  if (totalStays > 0) {
+    return fail(
+      res,
+      409,
+      "HAS_STAYS",
+      `Cannot delete: guest is on ${totalStays} reservation${totalStays === 1 ? "" : "s"}. Cancel or void those first.`,
+      {
+        bookerCount: bookerCount[0]?.n ?? 0,
+        occupantCount: occupantCount[0]?.n ?? 0,
+        coGuestCount: coGuestCount[0]?.n ?? 0,
+      },
+    );
+  }
+
+  // Pull the row up front so we can (a) clean up KYC files from
+  // storage and (b) log the name in activity after the row is gone.
+  const [existing] = await db
+    .select()
+    .from(guests)
+    .where(eq(guests.id, id))
+    .limit(1);
+  if (!existing) return fail(res, 404, "NOT_FOUND", "Guest not found");
+
+  // Delete the row + dependent phone history in one tx. The phone
+  // history FK has ON DELETE CASCADE in the schema, but explicit
+  // delete keeps the intent visible and survives schema drift.
+  await db.transaction(async (tx) => {
+    await tx
+      .delete(guestPhoneHistory)
+      .where(eq(guestPhoneHistory.guestId, id));
+    await tx.delete(guests).where(eq(guests.id, id));
+  });
+
+  // Best-effort KYC cleanup — storage failures shouldn't roll back
+  // the DB delete (the row is the source of truth; an orphaned
+  // file is recoverable, an orphaned row isn't).
+  const kycPaths = [
+    existing.guestPhoto,
+    existing.idProofPhotoFront,
+    existing.idProofPhotoBack,
+  ].filter((p): p is string => !!p);
+  for (const p of kycPaths) {
+    try {
+      await deleteKycFile(p);
+    } catch (err) {
+      logger.warn({ err, path: p }, "kyc cleanup failed during guest delete");
+    }
+  }
 
   await logActivity({
     action: "guest_deleted",
     entityType: "guest",
     entityId: id,
-    description: `Guest ${deleted.fullName} deleted`,
+    description: `Guest ${existing.fullName} deleted`,
     performedBy: req.user!.id,
     ipAddress: req.ip,
   });

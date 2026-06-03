@@ -15,6 +15,7 @@ import {
   Receipt,
   Settings,
   Sparkles,
+  TrendingDown,
   Users,
   Wallet,
 } from "lucide-react";
@@ -43,6 +44,7 @@ const NAV: NavItem[] = [
   { to: "/invoices", label: "Invoices", icon: Receipt, permission: "view_invoices" },
   { to: "/collections", label: "Collections", icon: Wallet, permission: "view_revenue" },
   { to: "/credits", label: "Credits", icon: BadgeIndianRupee, permission: "view_revenue" },
+  { to: "/expenses", label: "Expenses", icon: TrendingDown, permission: "view_expenses" },
   { to: "/notifications", label: "Notifications", icon: Bell, permission: "view_notifications" },
   { to: "/activity", label: "Activity", icon: Activity, permission: "view_activity" },
   { to: "/reports", label: "Reports", icon: BarChart3, permission: "view_reports" },

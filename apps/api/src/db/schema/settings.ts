@@ -85,6 +85,13 @@ export const settings = pgTable("settings", {
     .default(24),
   noShowCutoffHours: integer("no_show_cutoff_hours").notNull().default(6),
 
+  // Migration 0024 — soft access gate for the Complimentary report.
+  // NULL = no gate (the report toggle just reveals the tab). Any
+  // non-empty value enables the prompt before reveal. Validated
+  // server-side via POST /settings/unlock-complimentary so the code
+  // doesn't sit in the JS bundle.
+  complimentaryUnlockCode: text("complimentary_unlock_code"),
+
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });

@@ -52,6 +52,30 @@ export const settingsUpdateSchema = z.object({
   docShowGstin: z.boolean().optional(),
   docShowTerms: z.boolean().optional(),
   docShowSignature: z.boolean().optional(),
+
+  // Soft access gate for the Complimentary report (migration 0024).
+  // Empty string clears the gate; any non-empty value enables it and
+  // becomes the new code. Min 4 chars to avoid trivial codes like
+  // "1" — but no upper-end strength rule because this is staff-shared
+  // and meant to be memorable.
+  complimentaryUnlockCode: z
+    .string()
+    .max(64)
+    .optional()
+    .nullable()
+    .transform((v) => (v === "" ? null : v))
+    .refine(
+      (v) => v === null || v === undefined || v.length >= 4,
+      "Code must be at least 4 characters (or leave blank to clear)",
+    ),
+});
+
+// Body for POST /settings/unlock-complimentary. The endpoint compares
+// `code` against the stored value and returns 200 on match, 401 on
+// miss. The endpoint name is intentionally generic so the network
+// tab doesn't shout "this unlocks Complimentary" — see API route.
+export const unlockSettingsCodeSchema = z.object({
+  code: z.string().min(1).max(64),
 });
 
 // Strong-password rule: 10+ chars, at least one letter, at least one digit,

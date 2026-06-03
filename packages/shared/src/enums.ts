@@ -44,3 +44,25 @@ export const BOOKING_SOURCES = ["walkin", "phone_whatsapp", "complimentary"] as 
 export type BookingSource = (typeof BOOKING_SOURCES)[number];
 
 export const REVENUE_EXCLUDED_SOURCES: readonly BookingSource[] = ["complimentary"];
+
+// Expense ledger (migration 0025).
+export const EXPENSE_CATEGORIES = [
+  "utilities",
+  "repairs_maintenance",
+  "supplies",
+  "salaries_wages",
+  "food_kitchen",
+  "marketing",
+  "government_compliance",
+  "other",
+] as const;
+export type ExpenseCategory = (typeof EXPENSE_CATEGORIES)[number];
+
+export const EXPENSE_PAYMENT_METHODS = [
+  "cash",
+  "upi",
+  "card",
+  "bank_transfer",
+  "pending",
+] as const;
+export type ExpensePaymentMethod = (typeof EXPENSE_PAYMENT_METHODS)[number];

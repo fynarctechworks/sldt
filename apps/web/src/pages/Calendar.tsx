@@ -118,7 +118,11 @@ export default function CalendarPage() {
     enabled: view === "tape",
   });
 
-  const bookings = data?.bookings ?? [];
+  // Wrap in useMemo so the `?? []` fallback returns the SAME array
+  // reference between renders when the API result hasn't changed.
+  // Without this, every render produces a fresh `[]` and the
+  // downstream byDay / totals memos invalidate on every keystroke.
+  const bookings = useMemo(() => data?.bookings ?? [], [data?.bookings]);
 
   // Grid is the displayed month padded out to whole weeks (Mon-start). So
   // April starts with a couple of greyed-out March days on the leading row.
