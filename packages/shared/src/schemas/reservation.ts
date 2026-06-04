@@ -1,5 +1,9 @@
 import { z } from "zod";
 import { BOOKING_SOURCES, PAYMENT_METHODS, RESERVATION_STATUSES } from "../enums.js";
+import {
+  MAINTENANCE_CATEGORIES,
+  MAINTENANCE_SEVERITIES,
+} from "./maintenance.js";
 
 export const STAY_TYPES = ["overnight", "short_stay"] as const;
 export type StayType = (typeof STAY_TYPES)[number];
@@ -146,6 +150,30 @@ export const noShowSchema = z.object({
 
 export const cancelSchema = z.object({
   cancellationReason: z.string().min(1).max(500),
+  // What to do with the advance paid by the guest. Required only when an
+  // advance was actually collected — server enforces. "cash" records a
+  // refund payment row and the desk is expected to hand the money over;
+  // "credit" moves the refundable amount to the guest's wallet as a
+  // credit_issued ledger entry. Backward-compat: omitting both defaults
+  // to "cash" (matches the legacy void-everything behaviour minus the
+  // fee logic).
+  refundMode: z.enum(["cash", "credit"]).optional(),
+  // Optional cancellation fee withheld from the advance — late-cancel
+  // penalty, no-show conversion, admin charge, etc. Recorded as revenue
+  // against the cancelled reservation. The refundable amount is
+  // (advance_paid - cancellationFee), clamped at 0.
+  cancellationFee: z.number().nonnegative().optional().default(0),
+});
+
+// Convert a reservation's invoice layout between per-room and
+// combined. Voids the live invoice(s), reissues with the new shape,
+// and reattaches every non-voided payment to the new invoice(s) so
+// the books reconcile without manual intervention. Used when staff
+// realises mid-stay that the original choice was wrong (e.g. corp
+// guest wants one combined bill after rooms were already issued
+// per-room).
+export const convertInvoicesSchema = z.object({
+  mode: z.enum(["combined", "per_room"]),
 });
 
 // Reclassify an existing reservation as complimentary after the fact.
@@ -192,6 +220,25 @@ export const swapRoomSegmentSchema = z.object({
   // The reservation's subtotal/GST/grand_total/balance recompute when
   // the new rate differs from the old.
   newRate: z.number().nonnegative().optional(),
+  // When the old room is being sent to maintenance, the swap modal
+  // gathers the same inputs as Flag Issue and the server files a
+  // maintenance_issues row in the same transaction. Without this
+  // a swap-to-maintenance only flips room.status — no issue is
+  // logged, so the Maintenance page never sees it.
+  //
+  // Server enforcement: required when markOldRoomStatus = "maintenance",
+  // ignored otherwise. Validation is enforced in the route so we keep
+  // this object optional at the schema level (so dirty/available swaps
+  // don't need to send it).
+  maintenanceIssue: z
+    .object({
+      category: z.enum(MAINTENANCE_CATEGORIES),
+      severity: z.enum(MAINTENANCE_SEVERITIES),
+      title: z.string().min(3).max(200),
+      description: z.string().min(3).max(2000),
+      costEstimate: z.coerce.number().nonnegative(),
+    })
+    .optional(),
 });
 
 export const additionalChargeSchema = z.object({

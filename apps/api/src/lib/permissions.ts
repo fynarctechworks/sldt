@@ -144,6 +144,12 @@ export const SYSTEM_ROLES = {
       "send_reminders",
       "view_invoices",
       "preview_invoice",
+      // Frontdesk needs reissue_invoices for the convert-invoices
+      // (Consolidate / Split) workflow added late June 2026. Without
+      // it the desk hits a 403 the moment they try to fix the bill
+      // shape on a mid-stay booking. Voiding still requires
+      // void_invoices, which stays admin-only.
+      "reissue_invoices",
       "view_maintenance",
       "manage_maintenance",
       "view_activity",

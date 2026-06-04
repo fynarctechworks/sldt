@@ -4,6 +4,7 @@ import { BedDouble, Bell, CalendarPlus, CheckCircle2, ExternalLink, FileImage, P
 import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { Can } from "@/auth/Can";
+import { useAuth } from "@/auth/AuthContext";
 import { useDialog } from "@/components/Dialog";
 import { KycModal } from "@/components/KycModal";
 import { Loader } from "@/components/Loader";
@@ -102,6 +103,7 @@ export default function GuestProfile() {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const dialog = useDialog();
+  const { can } = useAuth();
   const [tab, setTab] = useState<Tab>("profile");
   const [editing, setEditing] = useState(false);
 
@@ -156,6 +158,10 @@ export default function GuestProfile() {
     }
   }, [data, id, navigate]);
 
+  // The /reports/outstanding endpoint is revenue-gated. Frontdesk
+  // without view_revenue would otherwise see a recurring 403 in the
+  // console + a stuck-loading "Outstanding" panel; gate the query
+  // so it just doesn't fire for them. The owing amount degrades to 0.
   const outstandingQ = useQuery({
     queryKey: ["outstanding"],
     queryFn: () =>
@@ -163,6 +169,7 @@ export default function GuestProfile() {
         byGuest: { guestId: string; balance: number }[];
       }>("/reports/outstanding"),
     staleTime: 30_000,
+    enabled: can("view_revenue"),
   });
   const outstanding = outstandingQ.data?.byGuest.find((g) => g.guestId === id)?.balance ?? 0;
 

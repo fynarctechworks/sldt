@@ -22,6 +22,14 @@ import {
   Trash2,
   XCircle,
 } from "lucide-react";
+import {
+  MAINTENANCE_CATEGORIES,
+  MAINTENANCE_CATEGORY_LABELS,
+  MAINTENANCE_SEVERITIES,
+  MAINTENANCE_SEVERITY_LABELS,
+  type MaintenanceCategory,
+  type MaintenanceSeverity,
+} from "@hoteldesk/shared";
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { CheckInReceiptModal, type CheckInReceiptData } from "@/components/CheckInReceiptModal";
@@ -234,7 +242,11 @@ export default function ReservationDetail() {
   const [showLate, setShowLate] = useState(false);
   const [showAddRoom, setShowAddRoom] = useState(false);
   const [showOtp, setShowOtp] = useState(false);
+  const [showCancel, setShowCancel] = useState(false);
   const [showCombinedInvoice, setShowCombinedInvoice] = useState(false);
+  // Open the invoice-conversion confirmation modal. The mode is set at
+  // open time so the same modal handles both directions.
+  const [convertMode, setConvertMode] = useState<"combined" | "per_room" | null>(null);
   // After issuing a combined invoice without collecting payment in the
   // same shot, we surface a "Collect now?" prompt pre-filled with the new
   // invoice's balance. Null = no prompt active.
@@ -345,13 +357,28 @@ export default function ReservationDetail() {
   });
 
   const cancel = useMutation({
-    // The cancel endpoint's zod schema (cancelSchema) expects the field
-    // `cancellationReason`, not `reason` — sending the wrong key made the
-    // server receive undefined and fail validation ("Invalid request
-    // payload").
-    mutationFn: (cancellationReason: string) =>
-      api.post(`/reservations/${id}/cancel`, { cancellationReason }),
+    mutationFn: (input: {
+      cancellationReason: string;
+      refundMode: "cash" | "credit";
+      cancellationFee: number;
+    }) => api.post(`/reservations/${id}/cancel`, input),
     onSuccess: invalidate,
+    onError: (e: Error) => setErr(e.message),
+  });
+
+  // Convert this reservation's invoices between per-room and combined.
+  // Voids the live invoice(s), reissues with the new shape, redistributes
+  // payments. Used when the original choice turns out to be wrong.
+  const convertInvoices = useMutation({
+    mutationFn: (mode: "combined" | "per_room") =>
+      api.post<{ voidedInvoiceNumbers: string[]; newInvoiceNumbers: string[] }>(
+        `/reservations/${id}/convert-invoices`,
+        { mode },
+      ),
+    onSuccess: () => {
+      setConvertMode(null);
+      invalidate();
+    },
     onError: (e: Error) => setErr(e.message),
   });
 
@@ -839,19 +866,7 @@ export default function ReservationDetail() {
         {canCancel && (
           <button
             className="btn-danger inline-flex items-center gap-2"
-            onClick={async () => {
-              const reason = await dialog.prompt({
-                title: "Cancel reservation",
-                message: "This cannot be undone. Please provide a reason for the records.",
-                placeholder: "e.g. Guest requested, duplicate booking",
-                okLabel: "Cancel reservation",
-                cancelLabel: "Keep it",
-                tone: "danger",
-                required: true,
-                multiline: true,
-              });
-              if (reason) cancel.mutate(reason);
-            }}
+            onClick={() => setShowCancel(true)}
           >
             <XCircle className="w-4 h-4" /> Cancel
           </button>
@@ -994,27 +1009,73 @@ export default function ReservationDetail() {
         <div className="card p-0">
           <div className="px-4 py-3 border-b flex items-center justify-between">
             <strong>Invoices ({(data.invoices ?? [invoice]).filter(Boolean).length})</strong>
-            {/* Combined invoice generator — shown whenever 2+ rooms
-                still have no invoice. A reservation can have more than
-                one combined invoice (e.g. two groups paying separately
-                after some rooms were already settled per-room). With
-                only one un-invoiced room left, the per-room "Issue
-                Invoice" button on the room row is the right path
-                instead. */}
-            {(() => {
-              const uninvoicedRoomCount = (data.rooms ?? []).filter(
-                (rm) => !(rm as { roomInvoiceId?: string | null }).roomInvoiceId,
-              ).length;
-              if (uninvoicedRoomCount < 2) return null;
-              return (
-                <button
-                  className="btn-secondary !h-8 text-xs inline-flex items-center gap-1"
-                  onClick={() => setShowCombinedInvoice(true)}
-                >
-                  + Combined Invoice
-                </button>
-              );
-            })()}
+            <div className="flex items-center gap-2">
+              {/* Convert per-room ↔ combined. Visibility depends on
+                  what's currently live. Per-room invoices on 2+ rooms →
+                  offer Consolidate. A single combined invoice covering
+                  2+ rooms → offer Split. Anything else hides both. */}
+              {(() => {
+                const liveInvs = (data.invoices ?? []).filter(
+                  (i) => i && (i as { status: string }).status !== "voided",
+                ) as Array<{
+                  id: string;
+                  status: string;
+                  scope?: "combined" | "room" | "partial";
+                  scopeRoomIds?: string[] | null;
+                }>;
+                const liveRoomScoped = liveInvs.filter((i) => i.scope === "room");
+                const liveCombined = liveInvs.filter((i) => i.scope === "combined");
+                const canConsolidate =
+                  liveRoomScoped.length >= 2 && liveCombined.length === 0;
+                const canSplit =
+                  liveCombined.length === 1 &&
+                  (liveCombined[0]!.scopeRoomIds ?? []).length >= 2;
+                if (canConsolidate) {
+                  return (
+                    <button
+                      className="btn-secondary !h-8 text-xs inline-flex items-center gap-1"
+                      onClick={() => setConvertMode("combined")}
+                      title="Void the per-room invoices and reissue as one combined invoice"
+                    >
+                      Consolidate to Combined
+                    </button>
+                  );
+                }
+                if (canSplit) {
+                  return (
+                    <button
+                      className="btn-secondary !h-8 text-xs inline-flex items-center gap-1"
+                      onClick={() => setConvertMode("per_room")}
+                      title="Void the combined invoice and reissue as per-room invoices"
+                    >
+                      Split into Per-Room
+                    </button>
+                  );
+                }
+                return null;
+              })()}
+              {/* Combined invoice generator — shown whenever 2+ rooms
+                  still have no invoice. A reservation can have more than
+                  one combined invoice (e.g. two groups paying separately
+                  after some rooms were already settled per-room). With
+                  only one un-invoiced room left, the per-room "Issue
+                  Invoice" button on the room row is the right path
+                  instead. */}
+              {(() => {
+                const uninvoicedRoomCount = (data.rooms ?? []).filter(
+                  (rm) => !(rm as { roomInvoiceId?: string | null }).roomInvoiceId,
+                ).length;
+                if (uninvoicedRoomCount < 2) return null;
+                return (
+                  <button
+                    className="btn-secondary !h-8 text-xs inline-flex items-center gap-1"
+                    onClick={() => setShowCombinedInvoice(true)}
+                  >
+                    + Combined Invoice
+                  </button>
+                );
+              })()}
+            </div>
           </div>
           <ul className="divide-y divide-borderc">
             {(data.invoices ?? (invoice ? [invoice] : [])).map((inv) => {
@@ -1455,6 +1516,43 @@ export default function ReservationDetail() {
             setShowLate(false);
             invalidate();
           }}
+        />
+      )}
+      {showCancel && (
+        <CancelReservationModal
+          reservationNumber={r.reservationNumber}
+          advancePaid={Number(r.advancePaid ?? 0)}
+          isSubmitting={cancel.isPending}
+          onClose={() => setShowCancel(false)}
+          onConfirm={(input) => {
+            cancel.mutate(input, {
+              onSuccess: () => setShowCancel(false),
+            });
+          }}
+        />
+      )}
+      {convertMode && (
+        <ConvertInvoicesModal
+          mode={convertMode}
+          reservationNumber={r.reservationNumber}
+          liveInvoices={
+            (r.invoices ?? []).filter(
+              (i) => (i as { status: string }).status !== "voided",
+            ) as Array<{
+              id: string;
+              invoiceNumber: string;
+              grandTotal: string;
+              scope?: "combined" | "room" | "partial";
+              scopeRoomIds?: string[] | null;
+            }>
+          }
+          rooms={(r.rooms ?? []).map((rm) => ({
+            id: rm.id,
+            roomNumber: rm.roomNumber,
+          }))}
+          isSubmitting={convertInvoices.isPending}
+          onClose={() => setConvertMode(null)}
+          onConfirm={() => convertInvoices.mutate(convertMode)}
         />
       )}
       {showAddRoom && (
@@ -2205,7 +2303,12 @@ function SwapRoomModal(props: {
 
   const [effectiveDate, setEffectiveDate] = useState(defaultEffective);
   const [toRoomId, setToRoomId] = useState<string | null>(null);
-  const [reason, setReason] = useState("Maintenance");
+  // Default empty — the Reason field is only visible (and required)
+  // when the chosen status is Needs Cleaning or Available. For
+  // Maintenance the issue Title takes its place, so prefilling the old
+  // "Maintenance" default would leak into the cleaning/available paths
+  // when staff flipped the status pill without re-typing the field.
+  const [reason, setReason] = useState("");
   const [markOldRoomStatus, setMarkOldRoomStatus] = useState<
     "maintenance" | "dirty" | "available"
   >("maintenance");
@@ -2214,6 +2317,16 @@ function SwapRoomModal(props: {
   // rate" or "renegotiate due to category bump"). Empty string means
   // "use the existing rate from the closed segment — send no override".
   const [rateOverride, setRateOverride] = useState<string>("");
+  // Issue inputs — only shown when markOldRoomStatus = "maintenance".
+  // Same fields as the standalone Flag Issue modal so swapping a room
+  // out to maintenance files a proper issue in the same click.
+  const [issueCategory, setIssueCategory] =
+    useState<MaintenanceCategory>("ac_hvac");
+  const [issueSeverity, setIssueSeverity] =
+    useState<MaintenanceSeverity>("normal");
+  const [issueTitle, setIssueTitle] = useState("");
+  const [issueDescription, setIssueDescription] = useState("");
+  const [issueCostEstimate, setIssueCostEstimate] = useState("");
   const [err, setErr] = useState<string | null>(null);
 
   // Availability probe window:
@@ -2256,6 +2369,28 @@ function SwapRoomModal(props: {
         parsedRate !== null &&
         Number.isFinite(parsedRate) &&
         parsedRate >= 0;
+      const parsedCost =
+        issueCostEstimate.trim() === "" ? NaN : Number(issueCostEstimate);
+      const maintenancePayload =
+        markOldRoomStatus === "maintenance"
+          ? {
+              maintenanceIssue: {
+                category: issueCategory,
+                severity: issueSeverity,
+                title: issueTitle.trim(),
+                description: issueDescription.trim(),
+                costEstimate: Number.isFinite(parsedCost) ? parsedCost : 0,
+              },
+            }
+          : {};
+      // Reason field is hidden when the chosen status is Maintenance —
+      // the issue Title takes its place on the swap pill, so staff
+      // doesn't have to type a near-duplicate sentence. For dirty /
+      // available swaps we keep the typed reason as-is.
+      const effectiveReason =
+        markOldRoomStatus === "maintenance"
+          ? issueTitle.trim() || "Maintenance"
+          : reason;
       return api.post(`/reservations/${props.reservationId}/swap-room-segment`, {
         fromReservationRoomId: props.fromReservationRoomId,
         toRoomId,
@@ -2263,11 +2398,12 @@ function SwapRoomModal(props: {
         // segment. In-place swaps (short_stay or 1-night overnight)
         // omit it; the server treats those as full-row replacements.
         ...(props.inPlace ? {} : { effectiveDate }),
-        reason,
+        reason: effectiveReason,
         markOldRoomStatus,
         // Only send newRate when staff filled something in. Empty
         // field = preserve the existing rate (legacy behaviour).
         ...(includeNewRate ? { newRate: parsedRate } : {}),
+        ...maintenancePayload,
       });
     },
     onSuccess: props.onDone,
@@ -2355,17 +2491,25 @@ function SwapRoomModal(props: {
               </div>
             </div>
           )}
-          <div>
-            <label className="label block mb-1">
-              Reason <span className="text-danger">*</span>
-            </label>
-            <input
-              className="input"
-              value={reason}
-              onChange={(e) => setReason(e.target.value)}
-              placeholder="e.g. AC failure, plumbing, guest request"
-            />
-          </div>
+          {/* Reason is the swap-event label that surfaces on the
+              swap pill in reservation history ("Swapped to Room 304 ·
+              <reason>"). When the chosen status is Maintenance we hide
+              this field entirely — the issue Title below replaces it
+              (auto-piped to the swap_reason at submit time). For dirty
+              / available swaps the field stays visible and required. */}
+          {markOldRoomStatus !== "maintenance" && (
+            <div>
+              <label className="label block mb-1">
+                Reason <span className="text-danger">*</span>
+              </label>
+              <input
+                className="input"
+                value={reason}
+                onChange={(e) => setReason(e.target.value)}
+                placeholder="e.g. guest request, deep clean"
+              />
+            </div>
+          )}
         </div>
 
         <div>
@@ -2393,6 +2537,94 @@ function SwapRoomModal(props: {
             ))}
           </div>
         </div>
+
+        {/* When the old room is being sent to maintenance, gather the
+            same details we'd ask in the standalone Flag Issue modal so
+            the issue lands on the Maintenance page immediately. Hidden
+            for dirty / available because those don't open a ticket. */}
+        {markOldRoomStatus === "maintenance" && (
+          <div className="rounded-sm border-2 border-warning/30 bg-warning/5 p-3 space-y-3">
+            <div className="text-xs font-semibold uppercase tracking-wider text-[#B45309]">
+              Issue details for Room {props.fromRoomNumber}
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="label block mb-1">
+                  Category <span className="text-danger">*</span>
+                </label>
+                <select
+                  className="input"
+                  value={issueCategory}
+                  onChange={(e) =>
+                    setIssueCategory(e.target.value as MaintenanceCategory)
+                  }
+                >
+                  {MAINTENANCE_CATEGORIES.map((c) => (
+                    <option key={c} value={c}>
+                      {MAINTENANCE_CATEGORY_LABELS[c]}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="label block mb-1">
+                  Severity <span className="text-danger">*</span>
+                </label>
+                <select
+                  className="input"
+                  value={issueSeverity}
+                  onChange={(e) =>
+                    setIssueSeverity(e.target.value as MaintenanceSeverity)
+                  }
+                >
+                  {MAINTENANCE_SEVERITIES.map((s) => (
+                    <option key={s} value={s}>
+                      {MAINTENANCE_SEVERITY_LABELS[s]}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="col-span-2">
+                <label className="label block mb-1">
+                  Title <span className="text-danger">*</span>
+                </label>
+                <input
+                  className="input"
+                  placeholder="Short summary — e.g. AC not cooling"
+                  value={issueTitle}
+                  onChange={(e) => setIssueTitle(e.target.value)}
+                  maxLength={200}
+                />
+              </div>
+              <div className="col-span-2">
+                <label className="label block mb-1">
+                  Description <span className="text-danger">*</span>
+                </label>
+                <textarea
+                  className="input min-h-[72px]"
+                  placeholder="Details that help the technician — when noticed, what was tried, etc."
+                  value={issueDescription}
+                  onChange={(e) => setIssueDescription(e.target.value)}
+                  maxLength={2000}
+                />
+              </div>
+              <div className="col-span-2">
+                <label className="label block mb-1">
+                  Estimated cost (₹) <span className="text-danger">*</span>
+                </label>
+                <input
+                  className="input"
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  placeholder="Owner needs a budget figure; enter 0 if no spend expected"
+                  value={issueCostEstimate}
+                  onChange={(e) => setIssueCostEstimate(e.target.value)}
+                />
+              </div>
+            </div>
+          </div>
+        )}
 
         <div>
           <div className="label mb-1">
@@ -2523,7 +2755,21 @@ function SwapRoomModal(props: {
           </button>
           <button
             className="btn-primary"
-            disabled={!toRoomId || !reason.trim() || swap.isPending || remainingNights <= 0}
+            disabled={(() => {
+              if (!toRoomId) return true;
+              if (swap.isPending || remainingNights <= 0) return true;
+              if (markOldRoomStatus === "maintenance") {
+                // Reason field hidden — issue Title takes its place.
+                if (issueTitle.trim().length < 3) return true;
+                if (issueDescription.trim().length < 3) return true;
+                const cost = Number(issueCostEstimate);
+                if (issueCostEstimate.trim() === "") return true;
+                if (!Number.isFinite(cost) || cost < 0) return true;
+              } else {
+                if (!reason.trim()) return true;
+              }
+              return false;
+            })()}
             onClick={() => swap.mutate()}
           >
             {swap.isPending ? "Swapping…" : "Confirm Swap"}
@@ -3411,6 +3657,278 @@ function ExtendModal(props: {
   );
 }
 
+// Cancel-reservation modal. Replaces the old single-prompt dialog with
+// a small workflow: reason → optional cancellation fee → refund mode
+// (cash or wallet credit). The server computes refundable as
+// advance_paid − fee, then either records a negative refund row
+// (cash) or issues a credit_issued ledger entry (credit).
+// Convert-invoices confirmation modal. Shows the operator exactly
+// what will be voided and reissued, so they confirm with intent. No
+// editable fields — the conversion is a one-shot operation; if they
+// need to tune amounts they have to use Edit Invoice afterwards on
+// the newly-issued invoice.
+function ConvertInvoicesModal(props: {
+  mode: "combined" | "per_room";
+  reservationNumber: string;
+  liveInvoices: Array<{
+    id: string;
+    invoiceNumber: string;
+    grandTotal: string;
+    scope?: "combined" | "room" | "partial";
+    scopeRoomIds?: string[] | null;
+  }>;
+  rooms: Array<{ id: string; roomNumber: string }>;
+  isSubmitting: boolean;
+  onClose: () => void;
+  onConfirm: () => void;
+}) {
+  const roomMap = new Map(props.rooms.map((r) => [r.id, r.roomNumber]));
+  const liveTotal = props.liveInvoices.reduce(
+    (s, i) => s + Number(i.grandTotal),
+    0,
+  );
+  return (
+    <ModalShell
+      title={
+        props.mode === "combined"
+          ? "Consolidate to Combined Invoice"
+          : "Split into Per-Room Invoices"
+      }
+      onClose={props.onClose}
+      size="md"
+    >
+      <div className="space-y-4">
+        <div className="text-sm text-textSecondary">
+          {props.mode === "combined" ? (
+            <>
+              Reservation{" "}
+              <strong className="text-brand-dark">
+                {props.reservationNumber}
+              </strong>{" "}
+              will have its per-room invoices voided and replaced with{" "}
+              <strong>one combined invoice</strong> for the same total. Every
+              payment recorded so far reattaches to the new invoice. This is
+              the right path when the guest wants a single bill for the whole
+              booking after they've already been issued per-room invoices.
+            </>
+          ) : (
+            <>
+              Reservation{" "}
+              <strong className="text-brand-dark">
+                {props.reservationNumber}
+              </strong>{" "}
+              will have its combined invoice voided and replaced with{" "}
+              <strong>one invoice per room</strong>. Payments split across
+              the new invoices in proportion to each room's bill. This is
+              the right path when occupants want separate receipts after a
+              combined invoice was already issued.
+            </>
+          )}
+        </div>
+
+        <div className="rounded-sm border border-borderc bg-bg/40 p-3 space-y-2 text-sm">
+          <div className="text-xs font-semibold uppercase tracking-wider text-textSecondary">
+            Will be voided
+          </div>
+          <ul className="space-y-1">
+            {props.liveInvoices.map((inv) => {
+              const roomNumbers = (inv.scopeRoomIds ?? [])
+                .map((rid) => roomMap.get(rid))
+                .filter(Boolean)
+                .join(", ");
+              return (
+                <li
+                  key={inv.id}
+                  className="flex items-center justify-between gap-2"
+                >
+                  <span className="font-mono">
+                    {inv.invoiceNumber}
+                    {roomNumbers && (
+                      <span className="text-textSecondary ml-1">
+                        · room{roomNumbers.includes(",") ? "s " : " "}
+                        {roomNumbers}
+                      </span>
+                    )}
+                  </span>
+                  <span className="font-mono">{inr(inv.grandTotal)}</span>
+                </li>
+              );
+            })}
+          </ul>
+          <div className="flex items-center justify-between border-t border-borderc pt-2 mt-2 text-sm">
+            <strong>Total voided</strong>
+            <strong className="font-mono">{inr(liveTotal)}</strong>
+          </div>
+        </div>
+
+        <div className="text-[11px] text-textSecondary">
+          The original invoice numbers stay on file as VOIDED with a
+          "Converted to …" reason for the audit trail. The new invoice
+          numbers will be the next ones in the SLDT-INV-… sequence.
+        </div>
+
+        <div className="flex items-center justify-end gap-2 pt-1">
+          <button
+            className="btn-secondary"
+            onClick={props.onClose}
+            disabled={props.isSubmitting}
+          >
+            Cancel
+          </button>
+          <button
+            className="btn-primary"
+            onClick={props.onConfirm}
+            disabled={props.isSubmitting}
+          >
+            {props.isSubmitting
+              ? "Converting…"
+              : props.mode === "combined"
+                ? "Consolidate"
+                : "Split"}
+          </button>
+        </div>
+      </div>
+    </ModalShell>
+  );
+}
+
+function CancelReservationModal(props: {
+  reservationNumber: string;
+  advancePaid: number;
+  isSubmitting: boolean;
+  onClose: () => void;
+  onConfirm: (input: {
+    cancellationReason: string;
+    refundMode: "cash" | "credit";
+    cancellationFee: number;
+  }) => void;
+}) {
+  const [reason, setReason] = useState("");
+  const [feeStr, setFeeStr] = useState("");
+  const [refundMode, setRefundMode] = useState<"cash" | "credit">("cash");
+
+  const parsedFee = (() => {
+    const n = Number(feeStr);
+    if (!Number.isFinite(n) || n < 0) return 0;
+    return Math.min(n, props.advancePaid);
+  })();
+  const refundable = +(props.advancePaid - parsedFee).toFixed(2);
+  const hasAdvance = props.advancePaid > 0.009;
+  const canSubmit = reason.trim().length > 0 && !props.isSubmitting;
+
+  return (
+    <ModalShell title="Cancel reservation" onClose={props.onClose} size="md">
+      <div className="space-y-4">
+        <div className="text-sm text-textSecondary">
+          <strong className="text-brand-dark">{props.reservationNumber}</strong>{" "}
+          will be cancelled. This can't be undone.
+        </div>
+
+        <div>
+          <label className="label block mb-1">
+            Reason <span className="text-danger">*</span>
+          </label>
+          <textarea
+            className="input min-h-[80px]"
+            placeholder="e.g. Guest requested, duplicate booking"
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            maxLength={500}
+            autoFocus
+          />
+        </div>
+
+        {hasAdvance && (
+          <>
+            <div className="rounded-sm border border-borderc bg-bg/40 p-3 space-y-2">
+              <div className="text-xs font-semibold uppercase tracking-wider text-textSecondary">
+                Advance handling
+              </div>
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-textSecondary">Advance paid</span>
+                <span className="font-mono">₹{props.advancePaid.toFixed(2)}</span>
+              </div>
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-textSecondary">Cancellation fee (withheld)</span>
+                <div className="w-32">
+                  <input
+                    className="input text-right"
+                    type="number"
+                    min={0}
+                    max={props.advancePaid}
+                    step="0.01"
+                    placeholder="0"
+                    value={feeStr}
+                    onChange={(e) => setFeeStr(e.target.value)}
+                  />
+                </div>
+              </div>
+              <div className="flex items-center justify-between border-t border-borderc pt-2 text-sm">
+                <strong>Refundable to guest</strong>
+                <strong className="font-mono">₹{refundable.toFixed(2)}</strong>
+              </div>
+            </div>
+
+            {refundable > 0.009 && (
+              <div>
+                <label className="label block mb-1">Refund method</label>
+                <div className="flex gap-2 flex-wrap">
+                  {(
+                    [
+                      { v: "cash" as const, label: `Refund ₹${refundable.toFixed(2)} cash` },
+                      { v: "credit" as const, label: `Add ₹${refundable.toFixed(2)} to wallet credit` },
+                    ]
+                  ).map((opt) => (
+                    <label
+                      key={opt.v}
+                      className={`px-3 h-9 inline-flex items-center gap-2 rounded-sm border cursor-pointer text-sm ${
+                        refundMode === opt.v
+                          ? "border-brand-dark bg-brand-soft text-brand-dark font-semibold"
+                          : "border-borderc text-textSecondary hover:border-brand-dark/40"
+                      }`}
+                    >
+                      <input
+                        type="radio"
+                        className="sr-only"
+                        checked={refundMode === opt.v}
+                        onChange={() => setRefundMode(opt.v)}
+                      />
+                      {opt.label}
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
+          </>
+        )}
+
+        <div className="flex items-center justify-end gap-2 pt-1">
+          <button
+            className="btn-secondary"
+            onClick={props.onClose}
+            disabled={props.isSubmitting}
+          >
+            Keep it
+          </button>
+          <button
+            className="btn-danger"
+            disabled={!canSubmit}
+            onClick={() =>
+              props.onConfirm({
+                cancellationReason: reason.trim(),
+                refundMode,
+                cancellationFee: parsedFee,
+              })
+            }
+          >
+            {props.isSubmitting ? "Cancelling…" : "Cancel reservation"}
+          </button>
+        </div>
+      </div>
+    </ModalShell>
+  );
+}
+
 function LateCheckoutModal(props: {
   reservationId: string;
   onClose: () => void;
@@ -3819,9 +4337,14 @@ function PerRoomCheckoutModal(props: {
         grandTotal: number;
         // Remaining unpaid amount on the room's invoice (if already
         // bound to one) — what staff actually needs to collect now.
-        // For un-invoiced rooms this matches grandTotal.
+        // For un-invoiced rooms this equals grandTotal - advanceApplied.
         balanceDue: number;
         totalPaid: number;
+        // Share of the reservation's un-allocated advance that lands on
+        // THIS room's bill when the per-room invoice gets issued.
+        // Populated only on the un-invoiced path; 0 for already-invoiced
+        // rooms (their advance attribution is already in totalPaid).
+        advanceApplied?: number;
         invoiceNumber?: string;
         invoiceScope?: "room" | "combined" | "partial";
         alreadyInvoiced: boolean;
@@ -3942,6 +4465,17 @@ function PerRoomCheckoutModal(props: {
                 <span className="font-mono">− {inr(quoteQ.data.totalPaid)}</span>
               </div>
             )}
+            {!quoteQ.data.alreadyInvoiced &&
+              (quoteQ.data.advanceApplied ?? 0) > 0.009 && (
+                <div className="flex justify-between text-sm">
+                  <span className="text-textSecondary">
+                    Advance applied to this room
+                  </span>
+                  <span className="font-mono">
+                    − {inr(quoteQ.data.advanceApplied ?? 0)}
+                  </span>
+                </div>
+              )}
             <div className="flex justify-between border-t border-borderc pt-2 mt-2">
               <strong>{due <= 0.009 ? "Due now" : "Balance due now"}</strong>
               <strong className={`font-mono ${due <= 0.009 ? "text-success" : ""}`}>
