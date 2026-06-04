@@ -917,10 +917,25 @@ function renderReceiptHtml(data: {
   const { payment, reservation, guest, invoice, settings, rooms, allPayments, coGuests } = data;
   const L = layoutFromSettings(settings);
 
-  const isAdvance = !invoice;
-  const pillLabel = isAdvance ? "Advance" : "Check-in";
-  const titleLabel = isAdvance ? "Booking Advance Receipt" : L.receiptTitle;
-  const amountLabel = isAdvance ? "Advance Received" : "Amount Received";
+  // Refund rows have a negative amount (cancel-reservation flow records
+  // the refund as a single signed payment so the per-reservation sum
+  // reconciles). They need their own label set — otherwise the PDF
+  // shows "Booking Advance Receipt — Advance Received ₹-499" which
+  // reads as if the property collected a negative advance instead of
+  // returning the guest's money.
+  const isRefund = Number(payment.amount) < 0;
+  const isAdvance = !invoice && !isRefund;
+  const pillLabel = isRefund ? "Refund" : isAdvance ? "Advance" : "Check-in";
+  const titleLabel = isRefund
+    ? "Refund Receipt"
+    : isAdvance
+      ? "Booking Advance Receipt"
+      : L.receiptTitle;
+  const amountLabel = isRefund
+    ? "Refunded to Guest"
+    : isAdvance
+      ? "Advance Received"
+      : "Amount Received";
 
   const subtotal = Number(reservation.subtotal);
   const gstRate = Number(reservation.gstRate);
@@ -1204,7 +1219,7 @@ ${L.showLogo && L.logoUrl ? `<div class="watermark"><img src="${esc(L.logoUrl)}"
 
   <div class="amount-banner">
     <div class="cap">${esc(amountLabel)}</div>
-    <div class="amt">${inr(payment.amount, L.currency)}</div>
+    <div class="amt">${inr(Math.abs(Number(payment.amount)), L.currency)}</div>
     <div class="method">via ${esc(payment.paymentMethod.replace(/_/g, " "))}${payment.notes ? ` · ${esc(payment.notes)}` : ""}</div>
   </div>
 

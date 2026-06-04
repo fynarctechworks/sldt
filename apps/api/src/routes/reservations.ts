@@ -301,6 +301,18 @@ router.get("/:id", requireAuth, requirePermission("view_reservations"), async (r
     .where(eq(payments.reservationId, id))
     .orderBy(desc(payments.paymentDate));
 
+  // Wallet-credit activity tied to this reservation. The cancel-as-
+  // credit flow inserts a credit_issued row here; without surfacing
+  // it on the reservation page, staff cancelling for "credit" sees
+  // no trace of where the advance went. Filtered to rows that name
+  // THIS reservation, ordered newest-first so it merges cleanly with
+  // the payments list in the UI.
+  const walletLedger = await db
+    .select()
+    .from(guestLedger)
+    .where(eq(guestLedger.reservationId, id))
+    .orderBy(desc(guestLedger.createdAt));
+
   // Per-room occupants. We need each room's guest for the UI, but the
   // guest_id on reservation_rooms doesn't carry the row — fetch them
   // in one batch by distinct id.
@@ -472,6 +484,7 @@ router.get("/:id", requireAuth, requirePermission("view_reservations"), async (r
     invoice: inv,
     invoices: allInvoices,
     payments: pays,
+    walletLedger,
     hotelCheckInTime: s.checkInTime,
     hotelCheckOutTime: s.checkOutTime,
   });
@@ -2535,8 +2548,13 @@ router.post(
     const requestedFee = Math.max(0, Number(input.cancellationFee ?? 0));
     const cancellationFee = Math.min(requestedFee, advancePaid);
     const refundable = +(advancePaid - cancellationFee).toFixed(2);
-    const refundMode: "cash" | "credit" =
-      input.refundMode ?? (refundable > 0.009 ? "cash" : "cash");
+    // Refund destination: defaults to cash when omitted (matches
+    // legacy callers). "credit" goes to the wallet ledger; everything
+    // else records a negative payment row whose paymentMethod matches
+    // the chosen channel (cash/upi/card/bank_transfer) so revenue
+    // reports break refunds down by channel correctly.
+    const refundMode: "cash" | "upi" | "card" | "bank_transfer" | "credit" =
+      input.refundMode ?? "cash";
     const walletCreditRestored = Number(r[0]!.walletCreditApplied ?? 0);
 
     let refundedCash = 0;
@@ -2598,7 +2616,9 @@ router.post(
           creditIssued = refundable;
         }
       } else {
-        // refundMode === "cash" — record a negative refund payment row.
+        // Cash/UPI/card/bank_transfer — record a negative refund
+        // payment row tagged with the chosen channel so reports can
+        // break refund channels down correctly.
         if (refundable > 0.009) {
           const rcpNum = await generateReceiptNumber(tx);
           await tx.insert(payments).values({
@@ -2606,7 +2626,7 @@ router.post(
             propertyId: r[0]!.propertyId,
             reservationId: id,
             amount: String((-refundable).toFixed(2)),
-            paymentMethod: "cash",
+            paymentMethod: refundMode,
             status: "received",
             receivedBy: req.user!.id,
             notes:
@@ -2697,7 +2717,9 @@ router.post(
       descBits.push(`fee ₹${cancellationFee.toFixed(2)} withheld`);
     }
     if (refundedCash > 0.009) {
-      descBits.push(`₹${refundedCash.toFixed(2)} refunded in cash`);
+      descBits.push(
+        `₹${refundedCash.toFixed(2)} refunded via ${refundMode.replace(/_/g, " ")}`,
+      );
     }
     if (creditIssued > 0.009) {
       descBits.push(`₹${creditIssued.toFixed(2)} issued as wallet credit`);

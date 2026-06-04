@@ -215,6 +215,17 @@ interface Detail {
     voided?: boolean;
     createdAt: string;
   }[];
+  // Wallet credit activity tied to this reservation (e.g. the
+  // "Refund as credit" entry produced by cancel-as-credit). Merged
+  // into Payment History on the UI so cancellation-as-credit shows
+  // a clear row instead of vanishing.
+  walletLedger?: {
+    id: string;
+    entryType: "credit_issued" | "credit_used";
+    amount: string;
+    note: string | null;
+    createdAt: string;
+  }[];
 }
 
 export default function ReservationDetail() {
@@ -359,7 +370,7 @@ export default function ReservationDetail() {
   const cancel = useMutation({
     mutationFn: (input: {
       cancellationReason: string;
-      refundMode: "cash" | "credit";
+      refundMode: "cash" | "upi" | "card" | "bank_transfer" | "credit";
       cancellationFee: number;
     }) => api.post(`/reservations/${id}/cancel`, input),
     onSuccess: invalidate,
@@ -1170,7 +1181,7 @@ export default function ReservationDetail() {
         </div>
       )}
 
-      {payments.length > 0 && (
+      {(payments.length > 0 || (r.walletLedger?.length ?? 0) > 0) && (
         <div className="card p-0">
           <div className="px-4 py-3 border-b"><strong>Payment History</strong></div>
           <table className="table-base">
@@ -1184,14 +1195,48 @@ export default function ReservationDetail() {
               </tr>
             </thead>
             <tbody>
-              {collapsePaymentsForDisplay(payments).map((row) => (
-                <PaymentRow
-                  key={row.id}
-                  payment={row}
-                  onSaved={invalidate}
-                  onPrintReceipt={() => previewReceipt(row.id, row.receiptNumber)}
-                />
-              ))}
+              {(() => {
+                // Merge wallet-ledger rows tied to this reservation
+                // into Payment History as virtual rows so the
+                // cancel-as-credit flow leaves a visible trail. They
+                // render through PaymentRow with method="wallet" and
+                // no receipt number (no PDF — the cash receipt path
+                // doesn't apply). credit_issued = money out of the
+                // property to the guest's wallet → negative amount;
+                // credit_used = money in from the wallet → positive.
+                const virtualWalletRows = (r.walletLedger ?? []).map(
+                  (entry) => ({
+                    id: `wallet-${entry.id}`,
+                    amount:
+                      entry.entryType === "credit_issued"
+                        ? `-${entry.amount}`
+                        : entry.amount,
+                    paymentMethod: "wallet",
+                    status: "received",
+                    paymentDate: entry.createdAt,
+                    notes:
+                      entry.note ??
+                      (entry.entryType === "credit_issued"
+                        ? "Issued as wallet credit"
+                        : "Applied wallet credit"),
+                    receiptNumber: null,
+                    voided: false,
+                    createdAt: entry.createdAt,
+                  }),
+                );
+                const merged = [...payments, ...virtualWalletRows].sort(
+                  (a, b) =>
+                    b.paymentDate.localeCompare(a.paymentDate),
+                );
+                return collapsePaymentsForDisplay(merged).map((row) => (
+                  <PaymentRow
+                    key={row.id}
+                    payment={row}
+                    onSaved={invalidate}
+                    onPrintReceipt={() => previewReceipt(row.id, row.receiptNumber)}
+                  />
+                ));
+              })()}
             </tbody>
           </table>
         </div>
@@ -2008,11 +2053,20 @@ function RoomRow(props: {
               {props.room.roomStatus.replace("_", " ")}
             </span>
           )}
-          {statusBadge && !isClosedSwapLeg && (
-            <span className={`text-[9px] uppercase tracking-wide font-semibold px-1.5 py-0.5 rounded border ${statusBadge}`}>
-              {status}
-            </span>
-          )}
+          {/* Physical-room status pill (AVAILABLE / DIRTY / MAINTENANCE…).
+              Skipped when the reservation_room state already tells the
+              full story: a cancelled / checked_out row doesn't benefit
+              from also showing the room's housekeeping status — that
+              info belongs on the Housekeeping board, not the booking
+              page. Keeps the row clean. */}
+          {statusBadge &&
+            !isClosedSwapLeg &&
+            props.room.roomStatus !== "cancelled" &&
+            props.room.roomStatus !== "checked_out" && (
+              <span className={`text-[9px] uppercase tracking-wide font-semibold px-1.5 py-0.5 rounded border ${statusBadge}`}>
+                {status}
+              </span>
+            )}
         </div>
         {/* Per-room (0017) occupant line. Hidden when this room is
             occupied by the booker (the common case for single-guest
@@ -3028,13 +3082,19 @@ function PaymentRow(props: {
                 Mark Received
               </button>
             )}
-            <button
-              className="btn-secondary !h-7 !px-2"
-              onClick={props.onPrintReceipt}
-              title={`Preview receipt ${props.payment.receiptNumber ?? ""}`}
-            >
-              <Eye className="w-3.5 h-3.5" />
-            </button>
+            {/* Receipt eye only for real payment rows. Synthetic
+                wallet-ledger rows (merged from guest_ledger so the
+                cancel-as-credit flow is visible) have no PDF — they're
+                accounting entries, not receipts. */}
+            {props.payment.receiptNumber && (
+              <button
+                className="btn-secondary !h-7 !px-2"
+                onClick={props.onPrintReceipt}
+                title={`Preview receipt ${props.payment.receiptNumber ?? ""}`}
+              >
+                <Eye className="w-3.5 h-3.5" />
+              </button>
+            )}
             {/* Per-payment edit and void removed by product decision —
                 receipts are an immutable financial trail. To correct
                 an error, void the original by cancelling the
@@ -3799,13 +3859,15 @@ function CancelReservationModal(props: {
   onClose: () => void;
   onConfirm: (input: {
     cancellationReason: string;
-    refundMode: "cash" | "credit";
+    refundMode: "cash" | "upi" | "card" | "bank_transfer" | "credit";
     cancellationFee: number;
   }) => void;
 }) {
   const [reason, setReason] = useState("");
   const [feeStr, setFeeStr] = useState("");
-  const [refundMode, setRefundMode] = useState<"cash" | "credit">("cash");
+  const [refundMode, setRefundMode] = useState<
+    "cash" | "upi" | "card" | "bank_transfer" | "credit"
+  >("cash");
 
   const parsedFee = (() => {
     const n = Number(feeStr);
@@ -3875,8 +3937,11 @@ function CancelReservationModal(props: {
                 <div className="flex gap-2 flex-wrap">
                   {(
                     [
-                      { v: "cash" as const, label: `Refund ₹${refundable.toFixed(2)} cash` },
-                      { v: "credit" as const, label: `Add ₹${refundable.toFixed(2)} to wallet credit` },
+                      { v: "cash" as const, label: "Cash" },
+                      { v: "upi" as const, label: "UPI" },
+                      { v: "card" as const, label: "Card" },
+                      { v: "bank_transfer" as const, label: "Bank transfer" },
+                      { v: "credit" as const, label: "Wallet credit" },
                     ]
                   ).map((opt) => (
                     <label
@@ -3896,6 +3961,11 @@ function CancelReservationModal(props: {
                       {opt.label}
                     </label>
                   ))}
+                </div>
+                <div className="text-[11px] text-textSecondary mt-2">
+                  {refundMode === "credit"
+                    ? `₹${refundable.toFixed(2)} will be added to the guest's wallet.`
+                    : `₹${refundable.toFixed(2)} will be handed back via ${refundMode.replace(/_/g, " ")}.`}
                 </div>
               </div>
             )}

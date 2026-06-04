@@ -148,16 +148,28 @@ export const noShowSchema = z.object({
   note: z.string().min(1).max(500),
 });
 
+// Refund destinations supported by the cancel-reservation flow.
+//   - cash / upi / card / bank_transfer: hand the money back to the
+//     guest, recorded as a single negative payment row whose
+//     paymentMethod matches the chosen destination (so reports break
+//     down by channel).
+//   - credit: move the refundable amount into the guest's wallet as
+//     a credit_issued ledger entry. No payment row is created.
+// Backward-compat: omitting the field defaults to "cash".
+export const REFUND_MODES = [
+  "cash",
+  "upi",
+  "card",
+  "bank_transfer",
+  "credit",
+] as const;
+export type RefundMode = (typeof REFUND_MODES)[number];
+
 export const cancelSchema = z.object({
   cancellationReason: z.string().min(1).max(500),
-  // What to do with the advance paid by the guest. Required only when an
-  // advance was actually collected — server enforces. "cash" records a
-  // refund payment row and the desk is expected to hand the money over;
-  // "credit" moves the refundable amount to the guest's wallet as a
-  // credit_issued ledger entry. Backward-compat: omitting both defaults
-  // to "cash" (matches the legacy void-everything behaviour minus the
-  // fee logic).
-  refundMode: z.enum(["cash", "credit"]).optional(),
+  // What to do with the advance paid by the guest. Required only when
+  // an advance was actually collected — server enforces.
+  refundMode: z.enum(REFUND_MODES).optional(),
   // Optional cancellation fee withheld from the advance — late-cancel
   // penalty, no-show conversion, admin charge, etc. Recorded as revenue
   // against the cancelled reservation. The refundable amount is
