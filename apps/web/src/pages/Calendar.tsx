@@ -13,7 +13,7 @@ import {
   startOfWeek,
   subMonths,
 } from "date-fns";
-import { ChevronLeft, ChevronRight, Gift } from "lucide-react";
+import { CalendarDays, ChevronLeft, ChevronRight, Gift, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Loader } from "@/components/Loader";
@@ -65,7 +65,9 @@ function bookingTouchesDay(b: CalendarBooking, day: Date): boolean {
 export default function CalendarPage() {
   const navigate = useNavigate();
   const [cursor, setCursor] = useState(() => startOfMonth(new Date()));
-  const [selectedDay, setSelectedDay] = useState<Date | null>(new Date());
+  // Clicking a day opens its bookings in a modal; null = closed. Starts
+  // closed — the grid alone is the landing view.
+  const [selectedDay, setSelectedDay] = useState<Date | null>(null);
 
   const monthParam = format(cursor, "yyyy-MM");
 
@@ -143,11 +145,7 @@ export default function CalendarPage() {
               <ChevronLeft className="w-4 h-4" />
             </button>
             <button
-              onClick={() => {
-                const today = new Date();
-                setCursor(startOfMonth(today));
-                setSelectedDay(today);
-              }}
+              onClick={() => setCursor(startOfMonth(new Date()))}
               className="px-3 py-2 text-sm font-medium border-l border-r border-borderc bg-surface text-brand-dark hover:bg-bg transition-colors"
             >
               Today
@@ -264,65 +262,106 @@ export default function CalendarPage() {
         </div>
       )}
 
-      {/* Per-day detail panel. Always visible so a day click does something
-          even when there are no bookings on it. */}
+      {/* Per-day detail modal. Opens on day click — right where the staff
+          is looking, instead of a panel below the grid they'd have to
+          scroll to. Backdrop / X closes. */}
       {selectedDay && (
-        <div className="card">
-          <header className="flex items-baseline justify-between gap-3 border-b border-borderc pb-2 mb-3">
-            <h2 className="font-semibold text-brand-dark">
-              {format(selectedDay, "EEEE, d MMMM yyyy")}
-            </h2>
-            <span className="text-xs text-textSecondary">
-              {selectedBookings.length} booking{selectedBookings.length === 1 ? "" : "s"}
-            </span>
-          </header>
-          {selectedBookings.length === 0 ? (
-            <div className="text-sm text-textSecondary py-4 text-center">
-              No bookings on this day.
+        <div
+          className="fixed inset-0 bg-black/50 backdrop-blur-[2px] flex items-center justify-center z-50 p-4"
+          onClick={() => setSelectedDay(null)}
+        >
+          <div
+            className="bg-surface rounded-lg shadow-2xl w-full max-w-3xl max-h-[85vh] flex flex-col overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <header className="flex items-center justify-between gap-3 px-6 py-4 border-b border-borderc bg-brand-soft/30 shrink-0">
+              <div className="flex items-center gap-3">
+                <span className="grid place-items-center w-10 h-10 rounded-md bg-brand-dark text-cream font-bold">
+                  {format(selectedDay, "d")}
+                </span>
+                <div>
+                  <h2 className="text-lg font-semibold text-navy leading-tight">
+                    {format(selectedDay, "EEEE, d MMMM yyyy")}
+                  </h2>
+                  <div className="text-xs text-textSecondary">
+                    {selectedBookings.length === 0
+                      ? "No bookings"
+                      : `${selectedBookings.length} booking${selectedBookings.length === 1 ? "" : "s"}`}
+                  </div>
+                </div>
+              </div>
+              <button
+                onClick={() => setSelectedDay(null)}
+                className="grid place-items-center w-8 h-8 rounded-md text-textSecondary hover:text-brand-dark hover:bg-bg transition-colors"
+                aria-label="Close"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </header>
+            <div className="overflow-y-auto px-6 py-2">
+              {selectedBookings.length === 0 ? (
+                <div className="py-12 text-center text-textSecondary">
+                  <CalendarDays className="w-8 h-8 mx-auto mb-2 opacity-40" />
+                  <div className="text-sm">No bookings on this day.</div>
+                </div>
+              ) : (
+                <ul className="divide-y divide-borderc">
+                  {selectedBookings.map((b) => {
+                    const sameDay = b.checkInDate === b.checkOutDate;
+                    const isDayUse = b.stayType === "short_stay";
+                    const stayLabel = isDayUse
+                      ? `Day use${b.durationHours ? ` · ${Number(b.durationHours)}h` : ""}`
+                      : sameDay
+                        ? format(parseISO(b.checkInDate), "dd MMM")
+                        : `${format(parseISO(b.checkInDate), "dd MMM")} → ${format(parseISO(b.checkOutDate), "dd MMM")}`;
+                    const roomChips = b.roomNumbers
+                      ? b.roomNumbers.split(",").map((r) => r.trim()).filter(Boolean)
+                      : [];
+                    return (
+                      <li
+                        key={b.id}
+                        onClick={() => navigate(`/reservations/${b.reservationNumber}`)}
+                        className="group py-3.5 flex items-center gap-4 cursor-pointer hover:bg-bg -mx-3 px-3 rounded-sm transition-colors"
+                      >
+                        <span
+                          className={`w-24 text-center text-[10px] font-semibold px-2 py-1 rounded border shrink-0 ${STATUS_STYLES[b.status]}`}
+                        >
+                          {STATUS_LABELS[b.status]}
+                        </span>
+                        <div className="flex-1 min-w-0">
+                          <div className="text-sm font-semibold text-navy flex items-center gap-1.5 truncate">
+                            {b.guestName}
+                            {b.bookingSource === "complimentary" && (
+                              <span className="inline-flex items-center gap-0.5 text-[10px] font-medium text-brass shrink-0">
+                                <Gift className="w-3 h-3" /> Comp
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-1.5 mt-1 flex-wrap">
+                            <span className="text-[11px] text-textSecondary font-mono">
+                              {b.reservationNumber}
+                            </span>
+                            {roomChips.map((r) => (
+                              <span
+                                key={r}
+                                className="text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded-sm bg-brand-soft text-brand-dark"
+                              >
+                                {r}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                        <div className="text-xs text-textSecondary font-medium text-right shrink-0">
+                          {stayLabel}
+                        </div>
+                        <ChevronRight className="w-4 h-4 text-textSecondary/40 group-hover:text-brand-dark transition-colors shrink-0" />
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
             </div>
-          ) : (
-            <ul className="divide-y divide-borderc">
-              {selectedBookings.map((b) => {
-                const sameDay = b.checkInDate === b.checkOutDate;
-                const isDayUse = b.stayType === "short_stay";
-                const stayLabel = isDayUse
-                  ? `Day use${b.durationHours ? ` · ${Number(b.durationHours)}h` : ""}`
-                  : sameDay
-                  ? "1 day"
-                  : `${b.checkInDate} → ${b.checkOutDate}`;
-                return (
-                  <li
-                    key={b.id}
-                    onClick={() => navigate(`/reservations/${b.reservationNumber}`)}
-                    className="py-2.5 flex items-center gap-3 cursor-pointer hover:bg-bg -mx-2 px-2 rounded-sm"
-                  >
-                    <span
-                      className={`text-[10px] font-semibold px-2 py-0.5 rounded border ${STATUS_STYLES[b.status]}`}
-                    >
-                      {STATUS_LABELS[b.status]}
-                    </span>
-                    <div className="flex-1 min-w-0">
-                      <div className="text-sm font-medium text-navy flex items-center gap-1.5">
-                        {b.guestName}
-                        {b.bookingSource === "complimentary" && (
-                          <span className="inline-flex items-center gap-0.5 text-[10px] text-brass">
-                            <Gift className="w-3 h-3" /> Comp
-                          </span>
-                        )}
-                      </div>
-                      <div className="text-xs text-textSecondary font-mono">
-                        {b.reservationNumber}
-                        {b.roomNumbers ? ` · Room ${b.roomNumbers}` : ""}
-                      </div>
-                    </div>
-                    <div className="text-xs text-textSecondary text-right shrink-0">
-                      {stayLabel}
-                    </div>
-                  </li>
-                );
-              })}
-            </ul>
-          )}
+          </div>
         </div>
       )}
     </div>

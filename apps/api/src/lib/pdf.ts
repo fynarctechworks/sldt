@@ -559,16 +559,13 @@ function renderInvoiceHtml(data: {
             // After the (Room X) is gone, "Per-room share of check-out
             // collection" is redundant — collapse to plain wording.
             .replace(/^Per-room share of check-out collection/, "Collected at check-out");
-          const looksLikeRichNote =
-            cleanedNotes.length > 0 &&
-            (cleanedNotes.startsWith("Collected at check-out") ||
-              cleanedNotes.startsWith("Advance at booking") ||
-              cleanedNotes.startsWith("Advance at check-in") ||
-              cleanedNotes.startsWith("Booking — no advance collected"));
           const isLater =
             checkedInAtMs !== null &&
             new Date(p.paymentDate).getTime() > checkedInAtMs;
-          const tag = looksLikeRichNote
+          // Any actual note wins over the generic chronological tag —
+          // staff-entered reasons ("part payment", refs) belong on the
+          // invoice just like the system's rich notes do.
+          const tag = cleanedNotes.length > 0
             ? cleanedNotes
             : isLater
               ? "Later payment"

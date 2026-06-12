@@ -1,7 +1,9 @@
 import { endOfMonth, format, parseISO, startOfMonth } from "date-fns";
+import { propertyDayEnd, propertyDayStart } from "../lib/propertyTime.js";
 import { and, desc, eq, gte, inArray, lte, ne, sql } from "drizzle-orm";
 import { Router } from "express";
 import { db } from "../db/client.js";
+import { expenses } from "../db/schema/expenses.js";
 import { guests } from "../db/schema/guests.js";
 import { invoices, payments } from "../db/schema/invoices.js";
 import { reservationRooms, reservations } from "../db/schema/reservations.js";
@@ -16,14 +18,24 @@ import { requireAuth, requirePermission } from "../middleware/auth.js";
 
 const router = Router();
 
+// Date params are property-local calendar dates. `to` is inclusive of
+// its WHOLE day — the old parseISO gave midnight for both ends, so a
+// single-day window ("Today") excluded everything after 00:00.
+// fromStr/toStr are the raw yyyy-MM-dd strings for ::date casts in SQL
+// (formatting the Date back would shift a day on a non-IST server).
 function rangeDefaults(req: { query: Record<string, string | undefined> }) {
-  const from = req.query.date_from ? parseISO(req.query.date_from) : startOfMonth(new Date());
-  const to = req.query.date_to ? parseISO(req.query.date_to) : endOfMonth(new Date());
-  return { from, to };
+  const fromStr = req.query.date_from ?? format(startOfMonth(new Date()), "yyyy-MM-dd");
+  const toStr = req.query.date_to ?? format(endOfMonth(new Date()), "yyyy-MM-dd");
+  return {
+    from: propertyDayStart(fromStr),
+    to: propertyDayEnd(toStr),
+    fromStr,
+    toStr,
+  };
 }
 
 router.get("/occupancy", requireAuth, requirePermission("view_reports"), async (req, res) => {
-  const { from, to } = rangeDefaults(req as never);
+  const { from, to, fromStr, toStr } = rangeDefaults(req as never);
   const totalRooms = (await db.select({ c: sql<number>`count(*)::int` }).from(rooms))[0]!.c;
 
   const rows = await db.execute<{ day: string; occupied: number }>(sql`
@@ -33,7 +45,7 @@ router.get("/occupancy", requireAuth, requirePermission("view_reports"), async (
        WHERE r.check_in_date <= gs AND r.check_out_date > gs
        AND r.status IN ('checked_in','checked_out','confirmed')
        AND r.booking_source <> 'complimentary') as occupied
-    FROM generate_series(${format(from, "yyyy-MM-dd")}::date, ${format(to, "yyyy-MM-dd")}::date, '1 day') gs
+    FROM generate_series(${fromStr}::date, ${toStr}::date, '1 day') gs
   `);
 
   const daily = rows.map((r) => ({
@@ -50,6 +62,124 @@ router.get("/occupancy", requireAuth, requirePermission("view_reports"), async (
   return ok(res, { from, to, totalRooms, avgOccupancy: avg, daily });
 });
 
+// Day book: one row per calendar day with everything the owner asks
+// for at close-of-day — which rooms were occupied (and by whom, at
+// what nightly price), how much money came in, how much went out as
+// expenses, and the net. Also returns the per-room-night detail rows
+// so the UI can offer a detailed CSV export.
+router.get("/daily-ledger", requireAuth, requirePermission("view_reports"), async (req, res) => {
+  const { from, to, fromStr, toStr } = rangeDefaults(req as never);
+
+  // One row per occupied room-night. Half-open [check_in, check_out)
+  // matches the billing convention (checkout day isn't a sold night);
+  // day-use stays collapse to their single day. Swap segments narrow a
+  // row to effective_from/effective_to like everywhere else.
+  const nights = await db.execute<{
+    day: string;
+    room_number: string;
+    rate: string;
+    guest_name: string;
+    reservation_number: string;
+    booking_source: string | null;
+  }>(sql`
+    SELECT gs::date::text AS day,
+           ro.room_number,
+           rr.rate_per_night::text AS rate,
+           g.full_name AS guest_name,
+           r.reservation_number,
+           r.booking_source
+    FROM generate_series(${fromStr}::date, ${toStr}::date, '1 day') gs
+    JOIN ${reservations} r
+      ON r.status IN ('checked_in','checked_out','confirmed')
+     AND (
+       (r.stay_type = 'overnight' AND r.check_in_date <= gs AND r.check_out_date > gs)
+       OR (r.stay_type = 'short_stay' AND r.check_in_date = gs)
+     )
+    JOIN ${reservationRooms} rr
+      ON rr.reservation_id = r.id
+     AND rr.status <> 'cancelled'
+     AND (rr.effective_from IS NULL OR rr.effective_from <= gs)
+     AND (rr.effective_to IS NULL OR rr.effective_to > gs)
+    JOIN ${rooms} ro ON ro.id = rr.room_id
+    JOIN ${guests} g ON g.id = r.guest_id
+    ORDER BY gs, ro.room_number
+  `);
+
+  // Bucket payments by the property-local (IST) calendar day — plain
+  // DATE() groups in the DB's timezone (UTC), which shoves anything
+  // paid between 00:00 and 05:30 IST onto the previous day's row.
+  const collectedRows = await db.execute<{ day: string; total: string }>(sql`
+    SELECT DATE(p.payment_date AT TIME ZONE 'Asia/Kolkata')::text AS day,
+           COALESCE(SUM(p.amount),0)::text AS total
+    FROM ${payments} p
+    WHERE p.payment_date >= ${from.toISOString()} AND p.payment_date <= ${to.toISOString()}
+      AND p.voided = false AND p.status = 'received'
+    GROUP BY DATE(p.payment_date AT TIME ZONE 'Asia/Kolkata')
+  `);
+
+  const expenseRows = await db
+    .select({
+      day: sql<string>`${expenses.expenseDate}::text`,
+      total: sql<string>`COALESCE(SUM(${expenses.amount}),0)::text`,
+    })
+    .from(expenses)
+    .where(and(gte(expenses.expenseDate, fromStr), lte(expenses.expenseDate, toStr)))
+    .groupBy(expenses.expenseDate);
+
+  const collectedByDay = new Map(collectedRows.map((r) => [r.day, Number(r.total)]));
+  const expensesByDay = new Map(expenseRows.map((r) => [r.day, Number(r.total)]));
+
+  // Assemble every day in the range (including empty ones — a day
+  // with zero rooms but an expense entry still belongs in the book).
+  const detailByDay = new Map<string, (typeof nights)[number][]>();
+  for (const n of nights) {
+    if (!detailByDay.has(n.day)) detailByDay.set(n.day, []);
+    detailByDay.get(n.day)!.push(n);
+  }
+  // Pure string/local-date iteration — `new Date("yyyy-MM-dd")` parses
+  // as UTC midnight, and re-formatting that in a server timezone west
+  // of UTC yields the PREVIOUS day, so every key would miss the
+  // Postgres ::date keys. parseISO gives local midnight, which
+  // round-trips through format() losslessly in any timezone.
+  const days: string[] = [];
+  for (let d = parseISO(fromStr); format(d, "yyyy-MM-dd") <= toStr; d.setDate(d.getDate() + 1)) {
+    days.push(format(d, "yyyy-MM-dd"));
+  }
+
+  const daily = days.map((day) => {
+    const detail = detailByDay.get(day) ?? [];
+    const roomCharges = +detail.reduce((s, n) => s + Number(n.rate), 0).toFixed(2);
+    const collected = collectedByDay.get(day) ?? 0;
+    const spent = expensesByDay.get(day) ?? 0;
+    return {
+      day,
+      roomsOccupied: detail.length,
+      roomNumbers: detail.map((n) => n.room_number).join(", "),
+      roomCharges,
+      collected,
+      expenses: spent,
+      net: +(collected - spent).toFixed(2),
+      rooms: detail.map((n) => ({
+        roomNumber: n.room_number,
+        guestName: n.guest_name,
+        reservationNumber: n.reservation_number,
+        rate: Number(n.rate),
+        complimentary: n.booking_source === "complimentary",
+      })),
+    };
+  });
+
+  const totals = {
+    roomNights: daily.reduce((s, d) => s + d.roomsOccupied, 0),
+    roomCharges: +daily.reduce((s, d) => s + d.roomCharges, 0).toFixed(2),
+    collected: +daily.reduce((s, d) => s + d.collected, 0).toFixed(2),
+    expenses: +daily.reduce((s, d) => s + d.expenses, 0).toFixed(2),
+    net: +daily.reduce((s, d) => s + d.net, 0).toFixed(2),
+  };
+
+  return ok(res, { from: fromStr, to: toStr, daily, totals });
+});
+
 router.get("/revenue", requireAuth, requirePermission("view_reports"), async (req, res) => {
   const { from, to } = rangeDefaults(req as never);
 
@@ -60,7 +190,7 @@ router.get("/revenue", requireAuth, requirePermission("view_reports"), async (re
   // The daily aggregate joins to reservations so it can apply the same
   // booking-source filter the per-type breakdowns use.
   const daily = await db.execute<{ day: string; total: string; count: number }>(sql`
-    SELECT DATE(p.payment_date)::text as day,
+    SELECT DATE(p.payment_date AT TIME ZONE 'Asia/Kolkata')::text as day,
       COALESCE(SUM(p.amount),0)::text as total,
       COUNT(*)::int as count
     FROM ${payments} p
@@ -69,7 +199,7 @@ router.get("/revenue", requireAuth, requirePermission("view_reports"), async (re
       AND p.voided = false
       AND p.status = 'received'
       AND r.booking_source <> 'complimentary'
-    GROUP BY DATE(p.payment_date)
+    GROUP BY DATE(p.payment_date AT TIME ZONE 'Asia/Kolkata')
     ORDER BY day
   `);
 
@@ -183,11 +313,10 @@ router.get("/gst-summary", requireAuth, requirePermission("view_reports"), async
   let to: Date;
   let label: string;
   if (date_from && date_to) {
-    from = parseISO(date_from);
-    // Inclusive end-of-day so a single-day window includes invoices issued
-    // anytime on date_to.
-    to = new Date(parseISO(date_to).getTime() + 86_399_999);
-    label = `${format(from, "dd MMM yyyy")} → ${format(parseISO(date_to), "dd MMM yyyy")}`;
+    // Property-local (IST) day bounds, date_to inclusive of its whole day.
+    from = propertyDayStart(date_from);
+    to = propertyDayEnd(date_to);
+    label = `${format(parseISO(date_from), "dd MMM yyyy")} → ${format(parseISO(date_to), "dd MMM yyyy")}`;
   } else {
     const anchor = month ? parseISO(`${month}-01`) : new Date();
     from = startOfMonth(anchor);
@@ -581,12 +710,12 @@ router.get("/guests", requireAuth, requirePermission("view_reports"), async (req
 //   { stay_dates: ["2026-06-01", ...],
 //     curves: { "0": [12,13,...], "7": [...], "14": [...], "30": [...] } }
 router.get("/pace", requireAuth, requirePermission("view_reports"), async (req, res) => {
-  const { from, to } = rangeDefaults(req as never);
+  const { fromStr, toStr } = rangeDefaults(req as never);
   const leads = [0, 7, 14, 30];
 
   const rows = await db.execute<{ stay_date: string; lead: number; nights: number }>(sql`
     WITH stay_days AS (
-      SELECT generate_series(${format(from, "yyyy-MM-dd")}::date, ${format(to, "yyyy-MM-dd")}::date, interval '1 day')::date AS d
+      SELECT generate_series(${fromStr}::date, ${toStr}::date, interval '1 day')::date AS d
     ),
     leads(l) AS (VALUES (0), (7), (14), (30))
     SELECT
@@ -633,11 +762,11 @@ router.get("/pace", requireAuth, requirePermission("view_reports"), async (req, 
 //   { window_days: 7,
 //     rows: [{ stay_date, picked_up_last_7d, picked_up_last_30d }, ...] }
 router.get("/pickup", requireAuth, requirePermission("view_reports"), async (req, res) => {
-  const { from, to } = rangeDefaults(req as never);
+  const { fromStr, toStr } = rangeDefaults(req as never);
 
   const rows = await db.execute<{ stay_date: string; pu7: number; pu30: number }>(sql`
     WITH stay_days AS (
-      SELECT generate_series(${format(from, "yyyy-MM-dd")}::date, ${format(to, "yyyy-MM-dd")}::date, interval '1 day')::date AS d
+      SELECT generate_series(${fromStr}::date, ${toStr}::date, interval '1 day')::date AS d
     )
     SELECT
       to_char(sd.d, 'YYYY-MM-DD') AS stay_date,

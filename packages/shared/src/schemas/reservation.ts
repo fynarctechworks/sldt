@@ -280,6 +280,11 @@ export const availabilityQuerySchema = z
   .object({
     check_in: z.string().date(),
     check_out: z.string().date(),
+    // "1" → date-conflicted rooms are returned too, flagged with their
+    // conflicting reservation, so pickers can render them disabled
+    // instead of hiding them. Off by default — legacy callers treat
+    // every returned room as selectable.
+    include_conflicts: z.enum(["1"]).optional(),
   })
   // Postgres collapses daterange(X, X, '[)') to an empty range that
   // overlaps nothing — silently returning "all rooms available". For
@@ -305,6 +310,32 @@ export const extendSplitSchema = z.object({
   newCheckOutDate: z.string().date(),
   roomIds: z.array(z.string().uuid()).min(1),
   ratePerNight: z.coerce.number().positive().optional(),
+});
+
+// Extension query: which of the reservation's rooms are free for the
+// extension window, and which alternative rooms could take a blocked
+// room's guest for the new night(s).
+export const extendOptionsQuerySchema = z.object({
+  newCheckOutDate: z.string().date(),
+});
+
+// Continuation booking: the guest stays past the current check-out but
+// in a DIFFERENT room (their room is booked by someone else for the new
+// night(s)). Creates a fresh reservation [oldCheckOut, newCheckOut) for
+// the same guest — no detail re-entry. OTP-gated: the guest confirms
+// via a code sent to their phone/email (see /otp/send).
+export const extendContinueSchema = z.object({
+  newCheckOutDate: z.string().date(),
+  moves: z
+    .array(
+      z.object({
+        fromRoomId: z.string().uuid(),
+        toRoomId: z.string().uuid(),
+        ratePerNight: z.coerce.number().positive().optional(),
+      }),
+    )
+    .min(1),
+  otpCode: z.string().min(4).max(8),
 });
 
 export const lateCheckoutSchema = z.object({

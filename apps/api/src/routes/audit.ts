@@ -6,7 +6,7 @@
 // access as a sensitive capability so we don't expose it to ordinary
 // staff roles.
 
-import { format, parseISO, startOfMonth } from "date-fns";
+import { format, startOfMonth } from "date-fns";
 import { and, asc, desc, eq, gte, lte } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
@@ -14,6 +14,7 @@ import { db } from "../db/client.js";
 import { activityLog } from "../db/schema/activity.js";
 import { profiles } from "../db/schema/profiles.js";
 import { logActivity } from "../lib/activity.js";
+import { propertyDayEnd, propertyDayStart } from "../lib/propertyTime.js";
 import { fail } from "../lib/response.js";
 import { requireAuth, requirePermission } from "../middleware/auth.js";
 
@@ -50,11 +51,10 @@ router.get(
     }
     const { date_from, date_to, limit } = parsed.data;
 
-    const from = date_from ? parseISO(date_from) : startOfMonth(new Date());
-    // Inclusive end of day for date_to.
-    const to = date_to
-      ? new Date(`${date_to}T23:59:59.999Z`)
-      : new Date();
+    // Property-local (IST) day bounds — the old version mixed a
+    // server-local start with a UTC end-of-day.
+    const from = date_from ? propertyDayStart(date_from) : startOfMonth(new Date());
+    const to = date_to ? propertyDayEnd(date_to) : new Date();
 
     const conditions = [gte(activityLog.createdAt, from), lte(activityLog.createdAt, to)];
 

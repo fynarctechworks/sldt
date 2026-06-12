@@ -24,7 +24,7 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { invoices, payments } from "../db/schema/invoices.js";
-import { reservations } from "../db/schema/reservations.js";
+import { reservationRooms, reservations } from "../db/schema/reservations.js";
 import { rooms } from "../db/schema/rooms.js";
 import { generateReceiptNumber } from "./receipt.js";
 
@@ -209,6 +209,24 @@ export async function attachOrphanPaymentsAndRecompute(
     return;
   }
 
+  // Money beyond what the existing invoices need is only an
+  // "overpayment" once every room has its invoice. While non-cancelled
+  // rooms are still awaiting theirs, the surplus is the advance for
+  // those future per-room invoices and must STAY orphaned — parking it
+  // on the fallback invoice would make the next room's checkout quote
+  // find no advance and ask staff to collect the whole bill again.
+  const [pendingRooms] = await tx
+    .select({ n: sql<number>`count(*)::int` })
+    .from(reservationRooms)
+    .where(
+      and(
+        eq(reservationRooms.reservationId, reservationId),
+        sql`${reservationRooms.invoiceId} IS NULL`,
+        sql`${reservationRooms.status} <> 'cancelled'`,
+      ),
+    );
+  const keepSurplusOrphaned = (pendingRooms?.n ?? 0) > 0;
+
   // 2. Snapshot each invoice's owed amount (grand total minus what's
   //    already attached). Voided invoices are excluded. We work on a
   //    local copy so we can drain it as we allocate.
@@ -291,7 +309,9 @@ export async function attachOrphanPaymentsAndRecompute(
 
     // Build the allocation plan first (no writes), so we know how many
     // parts the payment will end up as before we touch any row.
-    const plan: { invoiceId: string; amount: number }[] = [];
+    // invoiceId: null means "keep this slice orphaned" (advance held
+    // back for rooms that don't have their invoice yet).
+    const plan: { invoiceId: string | null; amount: number }[] = [];
     let toPlace = remaining;
 
     // Preferred first hop: the invoice whose room number appears in
@@ -317,12 +337,20 @@ export async function attachOrphanPaymentsAndRecompute(
       owedByInv.set(invId, +(owed - consumed).toFixed(2));
       toPlace = +(toPlace - consumed).toFixed(2);
     }
-    // Anything left over after every invoice is satisfied is an
-    // over-payment. Park it on the fallback so the row keeps a home —
-    // recomputeInvoiceTotals will clamp the invoice balance at 0 and
-    // expose the surplus via the reservation's advance_paid > grand_total.
+    // Anything left over after every invoice is satisfied: if rooms are
+    // still awaiting their invoices, it's their advance — keep it
+    // orphaned (the whole row, when nothing was allocated from it).
+    // Otherwise it's a genuine over-payment; park it on the fallback so
+    // the row keeps a home — recomputeInvoiceTotals will clamp the
+    // invoice balance at 0 and expose the surplus via the reservation's
+    // advance_paid > grand_total.
     if (toPlace > 0.009) {
-      plan.push({ invoiceId: fallbackInvoiceId, amount: toPlace });
+      if (keepSurplusOrphaned) {
+        if (plan.length === 0) continue;
+        plan.push({ invoiceId: null, amount: toPlace });
+      } else {
+        plan.push({ invoiceId: fallbackInvoiceId, amount: toPlace });
+      }
       toPlace = 0;
     }
 

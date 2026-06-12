@@ -3,6 +3,7 @@ import { format, formatDistanceToNow, isToday, isYesterday, startOfMonth, startO
 import { Activity as ActivityIcon, Calendar } from "lucide-react";
 import { useMemo, useState } from "react";
 import { Loader } from "@/components/Loader";
+import { StickyBar } from "@/components/StickyBar";
 import { api } from "@/lib/api";
 
 interface ActivityRow {
@@ -109,6 +110,7 @@ export default function Activity() {
         </div>
       </div>
 
+      <StickyBar>
       <div className="card !p-3 flex flex-wrap items-center gap-3">
         <div className="inline-flex items-center bg-bg border border-borderc rounded-md p-1 gap-1">
           {(["today", "week", "month", "year", "custom"] as RangeKey[]).map((k) => (
@@ -211,6 +213,7 @@ export default function Activity() {
           )}
         </div>
       </div>
+      </StickyBar>
 
       {isLoading ? (
         <Loader label="Loading activity…" />

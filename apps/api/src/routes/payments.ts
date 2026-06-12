@@ -8,6 +8,7 @@ import { guests } from "../db/schema/guests.js";
 import { logActivity } from "../lib/activity.js";
 import { loadGuestExtra } from "../lib/guestExtra.js";
 import { logger } from "../lib/logger.js";
+import { propertyDayEnd, propertyDayStart } from "../lib/propertyTime.js";
 import { recomputeReservationBalance } from "../lib/reservationBalance.js";
 import { renderInvoicePdf, renderReceiptPdf } from "../lib/pdf.js";
 import { generateReceiptNumber } from "../lib/receipt.js";
@@ -158,8 +159,8 @@ router.post(
 router.get("/", requireAuth, requirePermission("view_revenue"), async (req, res) => {
   const { date_from, date_to, method } = req.query as Record<string, string | undefined>;
   const conditions = [];
-  if (date_from) conditions.push(gte(payments.paymentDate, new Date(date_from)));
-  if (date_to) conditions.push(lte(payments.paymentDate, new Date(date_to)));
+  if (date_from) conditions.push(gte(payments.paymentDate, propertyDayStart(date_from)));
+  if (date_to) conditions.push(lte(payments.paymentDate, propertyDayEnd(date_to)));
   if (method) conditions.push(eq(payments.paymentMethod, method as never));
 
   const rows = await db

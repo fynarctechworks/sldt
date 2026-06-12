@@ -18,6 +18,7 @@ import {
   type DatePresetKey,
 } from "@/components/DatePresetBar";
 import { Loader } from "@/components/Loader";
+import { StickyBar } from "@/components/StickyBar";
 import { Money } from "@/components/Money";
 import { PdfPreviewModal } from "@/components/PdfPreviewModal";
 import { api, getList } from "@/lib/api";
@@ -221,6 +222,7 @@ export default function Invoices() {
 
       {/* Date range presets. Sits on its own row so the buttons stay
           readable; the filter card below holds search / status / scope. */}
+      <StickyBar>
       <div className="card !py-2.5">
         <DatePresetBar
           preset={preset}
@@ -309,6 +311,7 @@ export default function Invoices() {
           </button>
         )}
       </div>
+      </StickyBar>
 
       {isLoading ? (
         <Loader />

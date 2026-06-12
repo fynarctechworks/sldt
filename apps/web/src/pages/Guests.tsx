@@ -22,6 +22,7 @@ import type { LucideIcon } from "lucide-react";
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Loader } from "@/components/Loader";
+import { StickyBar } from "@/components/StickyBar";
 import { Combobox } from "@/components/Combobox";
 import { EmailInput } from "@/components/EmailInput";
 import { getList, api } from "@/lib/api";
@@ -172,6 +173,7 @@ export default function Guests() {
         </button>
       </div>
 
+      <StickyBar>
       <div className="card space-y-3">
         <div className="flex items-center gap-3">
           <Search className="w-4 h-4 text-textSecondary" />
@@ -238,6 +240,7 @@ export default function Guests() {
           </label>
         </div>
       </div>
+      </StickyBar>
 
       {isLoading ? (
         <Loader />

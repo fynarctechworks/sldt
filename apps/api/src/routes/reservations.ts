@@ -10,6 +10,8 @@ import {
   editChargeSchema,
   editDatesSchema,
   editRoomRateSchema,
+  extendContinueSchema,
+  extendOptionsQuerySchema,
   extendReservationSchema,
   extendSplitSchema,
   lateCheckoutSchema,
@@ -33,11 +35,14 @@ import { combinedRoomTypeLabel, type RoomTypeLabelMap } from "../lib/roomTypeLab
 import { logActivity } from "../lib/activity.js";
 import { logger } from "../lib/logger.js";
 import {
+  findAvailableRooms,
+  findRoomConflicts,
   isRoomAvailable,
   lockKey,
   lockRoom,
   nextDailySequence,
   nextInvoiceSequence,
+  type RoomConflict,
 } from "../lib/availability.js";
 import { getGuestBalance } from "../lib/ledger.js";
 import {
@@ -1612,7 +1617,24 @@ async function handlePerRoomCheckout(args: {
   });
 
   const totalGrand = +builts.reduce((s, b) => s + b.built.grandTotal, 0).toFixed(2);
-  const previouslyPaid = Number(r.advancePaid);
+  // advance_paid is reservation-wide and includes money already consumed
+  // by invoices issued earlier in the stay (per-room early check-outs).
+  // Only orphan payment rows (invoice_id IS NULL) can still pay for the
+  // rooms billed here — counting the rest manufactures a phantom
+  // "overpayment" and offers to refund money that's already settled on a
+  // sibling invoice.
+  const [orphanPaid] = await db
+    .select({ total: sql<string>`COALESCE(SUM(${payments.amount}), 0)::text` })
+    .from(payments)
+    .where(
+      and(
+        eq(payments.reservationId, id),
+        sql`${payments.invoiceId} IS NULL`,
+        eq(payments.voided, false),
+        eq(payments.status, "received"),
+      ),
+    );
+  const previouslyPaid = Number(orphanPaid?.total ?? 0);
   const walletCreditApplied = Number(r.walletCreditApplied ?? 0);
   const finalPayment = input.finalPayment ?? 0;
   const isUnpaid = input.paymentMethod === "unpaid";
@@ -2094,7 +2116,22 @@ router.post(
     const grandTotal = +(subtotal + totalGst).toFixed(2);
 
     const finalPayment = input.finalPayment ?? 0;
-    const previouslyPaid = Number(r[0]!.advancePaid);
+    // Same rule as the per-room branch: only orphan payments are still
+    // available to pay for the rooms billed here. Money attached to
+    // earlier per-room invoices is already spent — counting it again
+    // fabricates an overpayment/refund.
+    const [orphanPaid] = await db
+      .select({ total: sql<string>`COALESCE(SUM(${payments.amount}), 0)::text` })
+      .from(payments)
+      .where(
+        and(
+          eq(payments.reservationId, id),
+          sql`${payments.invoiceId} IS NULL`,
+          eq(payments.voided, false),
+          eq(payments.status, "received"),
+        ),
+      );
+    const previouslyPaid = Number(orphanPaid?.total ?? 0);
     // Wallet credit already applied to this reservation reduces what's owed
     // at checkout — count it just like cash already paid in.
     const walletCreditApplied = Number(r[0]!.walletCreditApplied ?? 0);
@@ -2748,6 +2785,25 @@ router.post(
         refundMode,
       },
     });
+    try {
+      const cancelledRooms = await getReservationRoomNumbers(id);
+      const [cancelGuest] = await db
+        .select({ fullName: guests.fullName })
+        .from(guests)
+        .where(eq(guests.id, r[0]!.guestId))
+        .limit(1);
+      const moneyBits = descBits.slice(1);
+      await dispatchNotification({
+        type: "reservation_cancelled",
+        title: "Reservation cancelled",
+        body: `${r[0]!.reservationNumber} · ${cancelGuest?.fullName ?? "Guest"}${cancelledRooms ? ` · Room ${cancelledRooms}` : ""} — ${cancellationReason}${moneyBits.length ? ` · ${moneyBits.join(" · ")}` : ""}`,
+        href: `/reservations/${id}`,
+        payload: { reservationId: id },
+        recipientRoles: ["admin", "frontdesk", "housekeeping"],
+      });
+    } catch (err) {
+      logger.warn({ err, reservationId: id }, "cancel notification failed");
+    }
     await invalidateDashboard();
     return ok(res, {
       success: true,
@@ -2844,6 +2900,26 @@ router.post(
       ipAddress: req.ip,
       metadata: { forfeitedAdvance, note },
     });
+    // No-show releases rooms exactly like a cancellation — reuse the
+    // cancelled notification type (red badge); the title disambiguates.
+    try {
+      const nsRooms = await getReservationRoomNumbers(id);
+      const [nsGuest] = await db
+        .select({ fullName: guests.fullName })
+        .from(guests)
+        .where(eq(guests.id, r[0]!.guestId))
+        .limit(1);
+      await dispatchNotification({
+        type: "reservation_cancelled",
+        title: "No-show",
+        body: `${r[0]!.reservationNumber} · ${nsGuest?.fullName ?? "Guest"}${nsRooms ? ` · Room ${nsRooms}` : ""} — ${note}${forfeitedAdvance > 0 ? ` · ₹${forfeitedAdvance.toFixed(2)} advance forfeited` : ""}`,
+        href: `/reservations/${id}`,
+        payload: { reservationId: id },
+        recipientRoles: ["admin", "frontdesk", "housekeeping"],
+      });
+    } catch (err) {
+      logger.warn({ err, reservationId: id }, "no-show notification failed");
+    }
     await invalidateDashboard();
     return ok(res, { success: true, forfeitedAdvance });
   },
@@ -3797,6 +3873,323 @@ router.post(
       source: refreshedSource,
       created: refreshedNew,
     });
+  },
+);
+
+// Pre-flight for the Extend Stay modal: which of this reservation's
+// rooms are free for the extension window [currentCheckOut, newCheckOut),
+// which are blocked by another booking (and by whom), and which OTHER
+// rooms are free and could take a blocked room's guest instead.
+router.get(
+  "/:id/extend-options",
+  requireAuth,
+  requirePermission("view_reservations"),
+  validate(extendOptionsQuerySchema, "query"),
+  async (req, res) => {
+    const id = req.params.id!;
+    const { newCheckOutDate } = req.query as unknown as { newCheckOutDate: string };
+
+    const [current] = await db
+      .select()
+      .from(reservations)
+      .where(eq(reservations.id, id))
+      .limit(1);
+    if (!current) return fail(res, 404, "NOT_FOUND", "Reservation not found");
+    if (current.stayType === "short_stay") {
+      return fail(
+        res,
+        400,
+        "SHORT_STAY_NOT_EXTENDABLE",
+        "Short-stay (day-use) bookings can't be extended.",
+      );
+    }
+    if (new Date(newCheckOutDate) <= new Date(current.checkOutDate)) {
+      return fail(res, 400, "INVALID_DATES", "New check-out must be after current check-out");
+    }
+
+    const assigned = await db
+      .select({ rr: reservationRooms, room: rooms })
+      .from(reservationRooms)
+      .innerJoin(rooms, eq(rooms.id, reservationRooms.roomId))
+      .where(eq(reservationRooms.reservationId, id));
+
+    // Conflicts over the extension window only — the current stay is
+    // unchanged. Exclude this reservation so its own rows don't count.
+    const conflictByRoom = await findRoomConflicts(current.checkOutDate, newCheckOutDate, {
+      excludeReservationId: id,
+    });
+
+    // One state per distinct room (swap segments can produce multiple
+    // rows for the same room id — the active one wins).
+    const stateByRoom = new Map<
+      string,
+      {
+        roomId: string;
+        roomNumber: string;
+        invoiced: boolean;
+        available: boolean;
+        conflict: RoomConflict | null;
+      }
+    >();
+    for (const x of assigned) {
+      if (x.rr.status === "cancelled" || x.rr.status === "checked_out") continue;
+      stateByRoom.set(x.room.id, {
+        roomId: x.room.id,
+        roomNumber: x.room.roomNumber,
+        invoiced: !!x.rr.invoiceId,
+        available: !conflictByRoom.has(x.room.id),
+        conflict: conflictByRoom.get(x.room.id) ?? null,
+      });
+    }
+
+    // Rooms free for the extension window that could take a blocked
+    // room's guest. Excludes rooms already on this reservation.
+    const assignedIds = new Set(assigned.map((x) => x.room.id));
+    const free = await findAvailableRooms(current.checkOutDate, newCheckOutDate);
+    const alternatives = free
+      .filter((r) => !assignedIds.has(r.id) && !r.conflict)
+      .map((r) => ({
+        id: r.id,
+        roomNumber: r.roomNumber,
+        roomType: r.roomType,
+        baseRate: r.baseRate,
+        status: r.status,
+      }));
+
+    return ok(res, { rooms: Array.from(stateByRoom.values()), alternatives });
+  },
+);
+
+// Continuation booking: the guest stays past the current check-out but
+// in a DIFFERENT room (their room is taken by another booking for the
+// new night(s)). Creates a fresh reservation [oldCheckOut, newCheckOut)
+// for the same guest — no detail re-entry. The source reservation's
+// dates and billing are untouched; the guest physically moves rooms on
+// the changeover day.
+//
+// OTP-GATED: the guest confirms via a code sent to their phone/email
+// (POST /otp/send { reservationId }). The code is verified and consumed
+// inside the creation transaction so one code can't confirm two
+// bookings.
+router.post(
+  "/:id/extend-continue",
+  requireAuth,
+  requirePermission("view_reservations"),
+  idempotent("reservations.extendContinue"),
+  validate(extendContinueSchema),
+  async (req, res) => {
+    const id = req.params.id!;
+    const input = req.body as {
+      newCheckOutDate: string;
+      moves: { fromRoomId: string; toRoomId: string; ratePerNight?: number }[];
+      otpCode: string;
+    };
+
+    const [current] = await db
+      .select()
+      .from(reservations)
+      .where(eq(reservations.id, id))
+      .limit(1);
+    if (!current) return fail(res, 404, "NOT_FOUND", "Reservation not found");
+    if (current.status !== "confirmed" && current.status !== "checked_in") {
+      return fail(
+        res,
+        400,
+        "INVALID_STATE",
+        "Only confirmed or checked-in reservations can be continued",
+      );
+    }
+    if (current.stayType === "short_stay") {
+      return fail(
+        res,
+        400,
+        "SHORT_STAY_NOT_EXTENDABLE",
+        "Short-stay (day-use) bookings can't be extended. Create a new reservation instead.",
+      );
+    }
+    if (new Date(input.newCheckOutDate) <= new Date(current.checkOutDate)) {
+      return fail(res, 400, "INVALID_DATES", "New check-out must be after current check-out");
+    }
+
+    const assigned = await db
+      .select({ rr: reservationRooms, room: rooms })
+      .from(reservationRooms)
+      .innerJoin(rooms, eq(rooms.id, reservationRooms.roomId))
+      .where(eq(reservationRooms.reservationId, id));
+    const activeByRoomId = new Map(
+      assigned
+        .filter((x) => x.rr.status !== "cancelled" && x.rr.status !== "checked_out")
+        .map((x) => [x.room.id, x]),
+    );
+
+    const toIds = input.moves.map((m) => m.toRoomId);
+    if (new Set(toIds).size !== toIds.length) {
+      return fail(res, 400, "DUPLICATE_TARGET", "Each move must target a different room");
+    }
+    for (const mv of input.moves) {
+      if (!activeByRoomId.has(mv.fromRoomId)) {
+        return fail(res, 404, "ROOM_NOT_ON_RESERVATION", "Source room isn't on this reservation", {
+          roomId: mv.fromRoomId,
+        });
+      }
+      if (activeByRoomId.has(mv.toRoomId)) {
+        return fail(
+          res,
+          409,
+          "TARGET_ON_RESERVATION",
+          "Target room is already part of this reservation — extend it instead",
+          { roomId: mv.toRoomId },
+        );
+      }
+    }
+    const targetRooms = await db.select().from(rooms).where(inArray(rooms.id, toIds));
+    const targetById = new Map(targetRooms.map((r) => [r.id, r]));
+    for (const mv of input.moves) {
+      const target = targetById.get(mv.toRoomId);
+      if (!target) {
+        return fail(res, 404, "TARGET_ROOM_NOT_FOUND", "Target room not found", {
+          roomId: mv.toRoomId,
+        });
+      }
+      const okAvail = await isRoomAvailable(
+        mv.toRoomId,
+        current.checkOutDate,
+        input.newCheckOutDate,
+        id,
+      );
+      if (!okAvail) {
+        return fail(
+          res,
+          409,
+          "TARGET_UNAVAILABLE",
+          `Room ${target.roomNumber} is not available for the extension period`,
+          { roomId: mv.toRoomId },
+        );
+      }
+    }
+
+    // ---- OTP gate. Mirrors POST /otp/verify but defers consumption to
+    // the creation transaction (same pattern as the OTP-verified
+    // reservation-create flow).
+    const [otpRow] = await db
+      .select()
+      .from(otps)
+      .where(and(eq(otps.reservationId, id), isNull(otps.consumedAt)))
+      .orderBy(desc(otps.createdAt))
+      .limit(1);
+    if (!otpRow) {
+      return fail(res, 400, "OTP_REQUIRED", "Send a verification code to the guest first");
+    }
+    if (otpRow.expiresAt < new Date()) {
+      return fail(res, 400, "OTP_EXPIRED", "The code has expired — send a new one");
+    }
+    if (otpRow.attempts >= env.OTP_MAX_ATTEMPTS) {
+      return fail(res, 429, "TOO_MANY_ATTEMPTS", "Too many wrong attempts — send a new code");
+    }
+    if (otpRow.codeHash !== hashOtp(input.otpCode)) {
+      await db
+        .update(otps)
+        .set({ attempts: otpRow.attempts + 1 })
+        .where(eq(otps.id, otpRow.id));
+      return fail(res, 400, "INVALID_CODE", "Incorrect code");
+    }
+
+    const moveDesc = input.moves
+      .map(
+        (mv) =>
+          `${activeByRoomId.get(mv.fromRoomId)!.room.roomNumber} → ${targetById.get(mv.toRoomId)!.roomNumber}`,
+      )
+      .join(", ");
+
+    let newReservationId = "";
+    let newReservationNumber = "";
+    await db.transaction(async (tx) => {
+      // Consume the OTP first; the conditional WHERE makes a concurrent
+      // replay of the same code lose the race.
+      const consumed = await tx
+        .update(otps)
+        .set({ consumedAt: new Date() })
+        .where(and(eq(otps.id, otpRow.id), isNull(otps.consumedAt)))
+        .returning({ id: otps.id });
+      if (consumed.length === 0) {
+        throw new Error("OTP was already used — request a new code");
+      }
+
+      const seq = await nextDailySequence(`SLDT-RES-%`, tx);
+      newReservationNumber = reservationNumber(seq);
+      const [created] = await tx
+        .insert(reservations)
+        .values({
+          reservationNumber: newReservationNumber,
+          propertyId: current.propertyId,
+          guestId: current.guestId,
+          checkInDate: current.checkOutDate,
+          checkOutDate: input.newCheckOutDate,
+          stayType: "overnight",
+          numAdults: current.numAdults,
+          numChildren: current.numChildren,
+          ratePerNight: current.ratePerNight,
+          subtotal: "0",
+          // Same guest continuing the same stay — keep the snapshotted
+          // tax treatment (see /extend for the rationale).
+          gstRate: current.gstRate,
+          gstAmount: "0",
+          grandTotal: "0",
+          gstMode: current.gstMode ?? "exclusive",
+          // Money stays with the source reservation; the continuation
+          // bills and collects on its own.
+          advancePaid: "0",
+          walletCreditApplied: "0",
+          balanceDue: "0",
+          status: "confirmed",
+          bookingSource: current.bookingSource,
+          specialRequests: `Continuation of ${current.reservationNumber} — room change ${moveDesc}. Confirmed by guest via OTP.`,
+          createdBy: req.user!.id,
+        })
+        .returning();
+      newReservationId = created!.id;
+
+      for (const mv of input.moves) {
+        const src = activeByRoomId.get(mv.fromRoomId)!;
+        const rate = mv.ratePerNight ?? Number(src.rr.ratePerNight);
+        await tx.insert(reservationRooms).values({
+          reservationId: newReservationId,
+          roomId: mv.toRoomId,
+          ratePerNight: rate.toFixed(2),
+          guestId: src.rr.guestId,
+          status: "confirmed",
+        });
+      }
+    });
+
+    await recalcReservation(newReservationId);
+
+    const [refreshedNew] = await db
+      .select()
+      .from(reservations)
+      .where(eq(reservations.id, newReservationId))
+      .limit(1);
+
+    await logActivity({
+      action: "reservation_continued_room_change",
+      entityType: "reservation",
+      entityId: id,
+      description: `${current.reservationNumber} continued to ${input.newCheckOutDate} as ${newReservationNumber} with room change (${moveDesc}) — guest confirmed via OTP`,
+      performedBy: req.user!.id,
+      ipAddress: req.ip,
+      metadata: {
+        sourceReservationId: id,
+        sourceReservationNumber: current.reservationNumber,
+        newReservationId,
+        newReservationNumber,
+        moves: input.moves,
+        oldCheckOut: current.checkOutDate,
+        newCheckOut: input.newCheckOutDate,
+      },
+    });
+
+    await invalidateDashboard();
+    return ok(res, { created: refreshedNew });
   },
 );
 
@@ -4963,10 +5356,15 @@ router.get(
     // per-room invoices were issued. As each room checks out we owe it a
     // share of that advance — otherwise the modal asks staff to collect
     // the room's full grand_total even though the guest already paid an
-    // advance. Share is proportional to each un-invoiced room's bill so
-    // mixed-rate bookings split fairly (₹2,500 advance on rooms of
-    // ₹1,500/₹1,500/₹1,500 → ₹833.33 each; on ₹2,000/₹1,500/₹1,000 →
-    // ₹1,111.11/₹833.33/₹555.56).
+    // advance. Split EQUALLY per remaining room (owner's preference —
+    // easy to explain at the desk): ₹5,000 advance on 2 rooms → ₹2,500
+    // each; on 4 rooms → ₹1,250 each. Capped at this room's own bill —
+    // a cheap room can't absorb more than it owes; the unused portion
+    // stays unallocated, and the next room's quote recomputes from
+    // whatever advance is actually still orphaned, so amounts stay
+    // consistent however the rooms check out. (The displayed share
+    // never moves real money by itself — payment attachment at invoice
+    // time is need-based.)
     //
     // We only count payments NOT already attached to a different invoice
     // as "available advance" — anything that's been redirected to a
@@ -4989,42 +5387,13 @@ router.get(
       if (p.invoiceId === null) return sum + Number(p.amount);
       return sum;
     }, 0);
-    // Build the denominator: sum of un-invoiced rooms' grand totals.
-    // We re-run buildInvoice per sibling room only when there's an
-    // advance to split, since the per-room quote work is cheap.
     let advanceShare = 0;
-    if (availableAdvance > 0.009 && remainingUnInvoicedRoomIds.length > 0) {
-      let denom = 0;
-      for (const x of allResRooms) {
-        if (x.rr.invoiceId) continue;
-        const sibCharges = selectChargesForScope({
-          allCharges,
-          scopeRoomIds: [x.room.id],
-          remainingUnInvoicedRoomIds,
-        });
-        const sibBuilt = buildInvoice({
-          reservation: {
-            stayType: resv.stayType,
-            durationHours: resv.durationHours,
-            checkInDate: resv.checkInDate,
-            checkOutDate: resv.checkOutDate,
-            numNights: resv.numNights,
-            gstRate: resv.gstRate,
-            gstMode: resv.gstMode,
-          },
-          rooms: [{ ...x.rr, room: x.room }] as never,
-          charges: sibCharges,
-          labelMap,
-        });
-        denom += sibBuilt.grandTotal;
-      }
-      if (denom > 0.009) {
-        advanceShare = +(
-          (availableAdvance * built.grandTotal) / denom
-        ).toFixed(2);
-        // Clamp at this room's grand total (can't overpay one room).
-        advanceShare = Math.min(advanceShare, built.grandTotal);
-      }
+    // Distinct rooms — a swapped room can have multiple segment rows
+    // with the same room id, which would silently shrink every share.
+    const remainingRoomCount = new Set(remainingUnInvoicedRoomIds).size;
+    if (availableAdvance > 0.009 && remainingRoomCount > 0) {
+      const equalShare = availableAdvance / remainingRoomCount;
+      advanceShare = +Math.min(equalShare, built.grandTotal).toFixed(2);
     }
 
     return ok(res, {

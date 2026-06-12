@@ -31,11 +31,14 @@ router.get(
   requireAuth,
   validate(availabilityQuerySchema, "query"),
   async (req, res) => {
-    const { check_in, check_out } = req.query as unknown as {
+    const { check_in, check_out, include_conflicts } = req.query as unknown as {
       check_in: string;
       check_out: string;
+      include_conflicts?: "1";
     };
-    const available = await findAvailableRooms(check_in, check_out);
+    const available = await findAvailableRooms(check_in, check_out, {
+      includeConflicts: include_conflicts === "1",
+    });
     return ok(res, available);
   },
 );

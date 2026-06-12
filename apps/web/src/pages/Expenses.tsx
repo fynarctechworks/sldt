@@ -20,14 +20,10 @@ import { format } from "date-fns";
 import {
   ChevronLeft,
   ChevronRight,
-  Eye,
   FileText,
-  Paperclip,
-  Pencil,
   Plus,
   Receipt,
   Search,
-  Trash2,
   Wallet,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
@@ -38,8 +34,8 @@ import {
   rangeForPreset,
   type DatePresetKey,
 } from "@/components/DatePresetBar";
-import { useDialog } from "@/components/Dialog";
 import { Loader } from "@/components/Loader";
+import { StickyBar } from "@/components/StickyBar";
 import { Money } from "@/components/Money";
 import { useToast } from "@/components/Toast";
 import { api, getList } from "@/lib/api";
@@ -122,14 +118,6 @@ export default function Expenses() {
   // blank.
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<ExpenseRow | null>(null);
-
-  // Bill preview modal — when staff clicks the paperclip in the row.
-  // We fetch a fresh signed URL on demand (the list endpoint returns
-  // the storage path, not the URL, to keep the response small).
-  const [previewOpen, setPreviewOpen] = useState<{
-    expenseId: string;
-    description: string;
-  } | null>(null);
 
   const queryParams = useMemo(
     () => ({
@@ -260,6 +248,7 @@ export default function Expenses() {
       )}
 
       {/* Date preset bar. Same component used by Reservations + Invoices. */}
+      <StickyBar>
       <div className="card !py-2.5">
         <DatePresetBar
           preset={preset}
@@ -342,6 +331,7 @@ export default function Expenses() {
           </button>
         )}
       </div>
+      </StickyBar>
 
       {isLoading ? (
         <Loader />
@@ -352,29 +342,19 @@ export default function Expenses() {
         </div>
       ) : (
         <div className="card !p-0 overflow-hidden">
-          <div className="hidden md:grid grid-cols-[110px_140px_minmax(180px,1fr)_140px_120px_120px_110px] gap-3 px-3 py-2 text-[10px] font-semibold uppercase tracking-wider text-textSecondary bg-bg/60 border-b border-borderc">
+          <div className="hidden md:grid grid-cols-[110px_140px_minmax(180px,1fr)_140px_120px_120px] gap-3 px-3 py-2 text-[10px] font-semibold uppercase tracking-wider text-textSecondary bg-bg/60 border-b border-borderc">
             <div>Date</div>
             <div>Category</div>
             <div>Description</div>
             <div>Vendor</div>
             <div className="text-right">Amount</div>
             <div>Payment</div>
-            <div className="text-right">Actions</div>
           </div>
+          {/* Edit / delete / bill preview live on the detail page the
+              row opens — no inline action buttons. */}
           <ul className="divide-y divide-borderc">
             {rows.map((r) => (
-              <ExpenseRowItem
-                key={r.id}
-                r={r}
-                canManage={canManage}
-                onEdit={() => {
-                  setEditing(r);
-                  setModalOpen(true);
-                }}
-                onPreviewBill={() =>
-                  setPreviewOpen({ expenseId: r.id, description: r.description })
-                }
-              />
+              <ExpenseRowItem key={r.id} r={r} />
             ))}
           </ul>
         </div>
@@ -414,13 +394,6 @@ export default function Expenses() {
         />
       )}
 
-      {previewOpen && (
-        <BillPreview
-          expenseId={previewOpen.expenseId}
-          description={previewOpen.description}
-          onClose={() => setPreviewOpen(null)}
-        />
-      )}
     </div>
   );
 }
@@ -429,43 +402,27 @@ export default function Expenses() {
 // Row + actions
 // ============================================================
 
-function ExpenseRowItem({
-  r,
-  canManage,
-  onEdit,
-  onPreviewBill,
-}: {
-  r: ExpenseRow;
-  canManage: boolean;
-  onEdit: () => void;
-  onPreviewBill: () => void;
-}) {
-  const qc = useQueryClient();
-  const dialog = useDialog();
-  const { toast } = useToast();
+// An expense counts as "edited" when updated meaningfully after
+// creation. The 60s grace skips the updated_at bump caused by the
+// attachment upload that immediately follows a create.
+function wasEdited(r: ExpenseRow): boolean {
+  return new Date(r.updatedAt).getTime() - new Date(r.createdAt).getTime() > 60_000;
+}
+
+function EditedChip({ updatedAt }: { updatedAt: string }) {
+  return (
+    <span
+      title={`Last edited ${format(new Date(updatedAt), "dd MMM yyyy, h:mm a")}`}
+      className="inline-block px-1 py-px rounded-sm text-[9px] font-bold uppercase tracking-wider bg-warning/15 text-warning border border-warning/30"
+    >
+      edited
+    </span>
+  );
+}
+
+function ExpenseRowItem({ r }: { r: ExpenseRow }) {
   const navigate = useNavigate();
   const isPending = r.paymentMethod === "pending";
-
-  const del = useMutation({
-    mutationFn: () => api.del(`/expenses/${r.id}`),
-    onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: ["expenses"] });
-      void qc.invalidateQueries({ queryKey: ["expenses-summary"] });
-      toast("Expense deleted", "success");
-    },
-    onError: (e: Error) => toast(e.message, "error"),
-  });
-
-  async function confirmDelete() {
-    const ok = await dialog.confirm({
-      title: "Delete this expense?",
-      message: `"${r.description}" — ${inr(r.amount)}. This can't be undone.`,
-      okLabel: "Delete",
-      cancelLabel: "Keep",
-      tone: "danger",
-    });
-    if (ok) del.mutate();
-  }
 
   // Open the full detail page. Bound to the whole row + keyboard so
   // staff can tab through and Enter on any row.
@@ -487,7 +444,7 @@ function ExpenseRowItem({
       className="group hover:bg-brand-soft/30 focus:bg-brand-soft/40 focus:outline-none cursor-pointer transition-colors"
     >
       {/* DESKTOP */}
-      <div className="hidden md:grid grid-cols-[110px_140px_minmax(180px,1fr)_140px_120px_120px_110px] gap-3 items-center px-3 py-2.5">
+      <div className="hidden md:grid grid-cols-[110px_140px_minmax(180px,1fr)_140px_120px_120px] gap-3 items-center px-3 py-2.5">
         <div className="text-xs">
           <div className="text-brand-dark font-medium">
             {format(new Date(r.expenseDate), "dd MMM yyyy")}
@@ -510,9 +467,14 @@ function ExpenseRowItem({
         </div>
         <div className="min-w-0">
           <div className="text-sm text-brand-dark truncate">{r.description}</div>
-          {r.billNumber && (
-            <div className="text-[10px] text-textSecondary font-mono truncate">
-              Bill #{r.billNumber}
+          {(r.billNumber || wasEdited(r)) && (
+            <div className="flex items-center gap-1.5 min-w-0">
+              {r.billNumber && (
+                <span className="text-[10px] text-textSecondary font-mono truncate">
+                  Bill #{r.billNumber}
+                </span>
+              )}
+              {wasEdited(r) && <EditedChip updatedAt={r.updatedAt} />}
             </div>
           )}
         </div>
@@ -545,50 +507,16 @@ function ExpenseRowItem({
             {PAYMENT_METHOD_LABELS[r.paymentMethod]}
           </span>
         </div>
-        {/* Action buttons need stopPropagation so clicking them
-            doesn't also trigger the row's openDetail navigation. */}
-        <div
-          className="flex justify-end gap-1"
-          onClick={(e) => e.stopPropagation()}
-        >
-          {r.attachmentUrl && (
-            <button
-              onClick={onPreviewBill}
-              className="h-7 px-2 rounded-sm border-2 border-borderc text-textSecondary hover:border-brand-dark hover:text-brand-dark text-[11px] font-semibold inline-flex items-center gap-1"
-              title="View bill"
-            >
-              <Paperclip className="w-3 h-3" />
-            </button>
-          )}
-          {canManage && (
-            <>
-              <button
-                onClick={onEdit}
-                className="h-7 px-2 rounded-sm border-2 border-borderc text-textSecondary hover:border-brand-dark hover:text-brand-dark text-[11px] font-semibold inline-flex items-center gap-1"
-                title="Edit"
-              >
-                <Pencil className="w-3 h-3" />
-              </button>
-              <button
-                onClick={confirmDelete}
-                disabled={del.isPending}
-                className="h-7 px-2 rounded-sm border-2 border-borderc text-danger hover:border-danger text-[11px] font-semibold inline-flex items-center gap-1 disabled:opacity-40"
-                title="Delete"
-              >
-                <Trash2 className="w-3 h-3" />
-              </button>
-            </>
-          )}
-        </div>
       </div>
 
       {/* MOBILE */}
       <div className="md:hidden px-3 py-3">
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0 flex-1">
-            <div className="text-[11px] text-textSecondary">
+            <div className="text-[11px] text-textSecondary flex items-center gap-1.5">
               {format(new Date(r.expenseDate), "dd MMM yyyy")} ·{" "}
               {CATEGORY_LABELS[r.category]}
+              {wasEdited(r) && <EditedChip updatedAt={r.updatedAt} />}
             </div>
             <div className="text-sm text-brand-dark mt-0.5 truncate">
               {r.description}
@@ -614,38 +542,6 @@ function ExpenseRowItem({
             </span>
           </div>
         </div>
-        {(r.attachmentUrl || canManage) && (
-          <div
-            className="flex gap-2 mt-2"
-            onClick={(e) => e.stopPropagation()}
-          >
-            {r.attachmentUrl && (
-              <button
-                onClick={onPreviewBill}
-                className="flex-1 h-8 rounded-sm border-2 border-borderc text-textSecondary text-xs font-semibold inline-flex items-center justify-center gap-1"
-              >
-                <Paperclip className="w-3.5 h-3.5" /> Bill
-              </button>
-            )}
-            {canManage && (
-              <>
-                <button
-                  onClick={onEdit}
-                  className="flex-1 h-8 rounded-sm border-2 border-borderc text-textSecondary text-xs font-semibold inline-flex items-center justify-center gap-1"
-                >
-                  <Pencil className="w-3.5 h-3.5" /> Edit
-                </button>
-                <button
-                  onClick={confirmDelete}
-                  disabled={del.isPending}
-                  className="flex-1 h-8 rounded-sm border-2 border-borderc text-danger text-xs font-semibold inline-flex items-center justify-center gap-1 disabled:opacity-40"
-                >
-                  <Trash2 className="w-3.5 h-3.5" /> Delete
-                </button>
-              </>
-            )}
-          </div>
-        )}
       </div>
     </li>
   );
@@ -942,70 +838,3 @@ export function ExpenseModal({
   );
 }
 
-// ============================================================
-// Bill preview — fetches single row to get a fresh signed URL
-// ============================================================
-
-function BillPreview({
-  expenseId,
-  description,
-  onClose,
-}: {
-  expenseId: string;
-  description: string;
-  onClose: () => void;
-}) {
-  const { data } = useQuery({
-    queryKey: ["expense", expenseId],
-    queryFn: () =>
-      api.get<{
-        attachmentSignedUrl: string | null;
-        attachmentUrl: string | null;
-      }>(`/expenses/${expenseId}`),
-  });
-
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") onClose();
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
-  const url = data?.attachmentSignedUrl ?? null;
-  const isPdf = url?.includes(".pdf") ?? false;
-
-  return (
-    <div
-      className="fixed inset-0 z-[100] grid place-items-center bg-brand-dark/50 p-4"
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-    >
-      <div className="w-full max-w-3xl h-[85vh] bg-surface rounded-md shadow-2xl border border-borderc overflow-hidden flex flex-col">
-        <div className="px-5 py-3 border-b border-borderc bg-bg/50 flex items-center justify-between gap-3">
-          <div className="font-semibold text-brand-dark truncate">
-            <Eye className="inline w-4 h-4 mr-1" />
-            {description}
-          </div>
-          <button onClick={onClose} className="text-textSecondary hover:text-textPrimary">
-            ✕
-          </button>
-        </div>
-        <div className="flex-1 bg-bg grid place-items-center">
-          {!url ? (
-            <div className="text-textSecondary text-sm">Loading…</div>
-          ) : isPdf ? (
-            <iframe src={url} title="bill" className="w-full h-full bg-white" />
-          ) : (
-            <img
-              src={url}
-              alt={description}
-              className="max-w-full max-h-full object-contain bg-white"
-            />
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}

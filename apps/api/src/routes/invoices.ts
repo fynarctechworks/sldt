@@ -10,6 +10,7 @@ import { reservationRooms, reservations } from "../db/schema/reservations.js";
 import { rooms } from "../db/schema/rooms.js";
 import { logActivity } from "../lib/activity.js";
 import { loadGuestExtra } from "../lib/guestExtra.js";
+import { propertyDayEnd, propertyDayStart } from "../lib/propertyTime.js";
 import { renderInvoicePdf } from "../lib/pdf.js";
 import { recomputeReservationBalance } from "../lib/reservationBalance.js";
 import { invalidateDashboard } from "../lib/redis.js";
@@ -36,8 +37,8 @@ router.get("/", requireAuth, requirePermission("view_invoices"), async (req, res
 
   const conditions = [];
   if (status) conditions.push(eq(invoices.status, status as never));
-  if (date_from) conditions.push(gte(invoices.createdAt, new Date(date_from)));
-  if (date_to) conditions.push(lte(invoices.createdAt, new Date(date_to)));
+  if (date_from) conditions.push(gte(invoices.createdAt, propertyDayStart(date_from)));
+  if (date_to) conditions.push(lte(invoices.createdAt, propertyDayEnd(date_to)));
   if (scope) conditions.push(eq(invoices.scope, scope as never));
   if (q && q.trim()) {
     // Match invoice number, billed-to guest name, or guest GSTIN. The
@@ -107,8 +108,8 @@ router.get("/summary", requireAuth, requirePermission("view_invoices"), async (r
 
   const conditions = [];
   if (status) conditions.push(eq(invoices.status, status as never));
-  if (date_from) conditions.push(gte(invoices.createdAt, new Date(date_from)));
-  if (date_to) conditions.push(lte(invoices.createdAt, new Date(date_to)));
+  if (date_from) conditions.push(gte(invoices.createdAt, propertyDayStart(date_from)));
+  if (date_to) conditions.push(lte(invoices.createdAt, propertyDayEnd(date_to)));
   if (scope) conditions.push(eq(invoices.scope, scope as never));
   if (q && q.trim()) {
     const needle = `%${q.trim()}%`;
@@ -171,8 +172,8 @@ router.get("/export", requireAuth, requirePermission("view_invoices"), async (re
 
   const conditions = [];
   if (status) conditions.push(eq(invoices.status, status as never));
-  if (date_from) conditions.push(gte(invoices.createdAt, new Date(date_from)));
-  if (date_to) conditions.push(lte(invoices.createdAt, new Date(date_to)));
+  if (date_from) conditions.push(gte(invoices.createdAt, propertyDayStart(date_from)));
+  if (date_to) conditions.push(lte(invoices.createdAt, propertyDayEnd(date_to)));
   if (scope) conditions.push(eq(invoices.scope, scope as never));
   if (q && q.trim()) {
     const needle = `%${q.trim()}%`;

@@ -61,6 +61,17 @@ interface AvailableRoom {
     checkOutDate: string;
     guestName: string;
   } | null;
+  // Present only when the picker asks for conflicts (include_conflicts=1):
+  // this room's dates clash with an existing booking. Rendered as a
+  // disabled "Booked" card so staff see WHY it can't be picked instead
+  // of the room silently missing from the list.
+  conflict?: {
+    reservationId: string;
+    reservationNumber: string;
+    guestName: string;
+    bookedFrom: string;
+    bookedTill: string;
+  } | null;
 }
 
 const todayStr = format(new Date(), "yyyy-MM-dd");
@@ -376,6 +387,7 @@ export default function NewReservation() {
         check_out: isShortStay
           ? format(addDays(new Date(checkInDate), 1), "yyyy-MM-dd")
           : checkOutDate,
+        include_conflicts: "1",
       }),
     enabled: canPriceStay,
   });
@@ -404,7 +416,7 @@ export default function NewReservation() {
   useEffect(() => {
     if (!preselectRoomId || !availRooms.data) return;
     const room = availRooms.data.find((r) => r.id === preselectRoomId);
-    if (!room) return;
+    if (!room || room.conflict) return;
     setSelectedRooms((prev) =>
       prev.some((r) => r.roomId === room.id)
         ? prev
@@ -1592,21 +1604,28 @@ export default function NewReservation() {
                     <div className="grid grid-cols-2 md:grid-cols-3 gap-3 auto-rows-min items-start">
                       {byFloor.get(floor)!.map((r) => {
               const selected = selectedRooms.find((s) => s.roomId === r.id);
+              const conflicted = !!r.conflict;
               const isDirty = r.status === "dirty";
+              // Cleanliness only gates same-day check-ins — housekeeping
+              // turns the room over long before a future arrival.
+              const needsClean = isDirty && checkInDate <= todayStr;
               const cleanInFlight =
                 markRoomClean.isPending && markRoomClean.variables === r.id;
               return (
                 <div
                   key={r.id}
                   className={`border rounded-sm p-3 transition ${
-                    isDirty && !selected
-                      ? "border-warning/50 bg-warning/5"
-                      : selected
-                        ? "border-accentBlue bg-accentBlue/5 cursor-pointer"
-                        : "border-borderc hover:border-navy cursor-pointer"
+                    conflicted
+                      ? "border-borderc bg-bg/60 opacity-60 cursor-not-allowed"
+                      : needsClean && !selected
+                        ? "border-warning/50 bg-warning/5"
+                        : selected
+                          ? "border-accentBlue bg-accentBlue/5 cursor-pointer"
+                          : "border-borderc hover:border-navy cursor-pointer"
                   }`}
                   onClick={() => {
-                    if (isDirty && !selected) return;
+                    if (conflicted) return;
+                    if (needsClean && !selected) return;
                     toggleRoom(r);
                   }}
                 >
@@ -1614,7 +1633,12 @@ export default function NewReservation() {
                     <div className="min-w-0">
                       <div className="flex items-center gap-2 flex-wrap">
                         <div className="font-mono font-bold">{r.roomNumber}</div>
-                        {isDirty && (
+                        {conflicted && (
+                          <span className="inline-flex items-center px-1.5 py-0.5 rounded-sm text-[10px] font-semibold bg-danger/15 text-danger">
+                            BOOKED
+                          </span>
+                        )}
+                        {needsClean && (
                           <span
                             className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-sm text-[10px] font-semibold bg-warning/15 text-warning"
                             title="Room hasn't been cleaned since the last checkout. Mark clean before assigning to a guest."
@@ -1655,6 +1679,15 @@ export default function NewReservation() {
                       {selected ? inr(selected.ratePerNight) : inr(r.baseRate)}
                     </div>
                   </div>
+                  {/* Date conflict: card stays visible but disabled so
+                      staff see exactly which booking holds the room. */}
+                  {r.conflict && (
+                    <div className="mt-2 rounded-sm border border-danger/30 bg-danger/5 p-2 text-[11px] text-textSecondary leading-snug">
+                      Booked for <strong>{r.conflict.guestName}</strong> till{" "}
+                      <strong>{format(new Date(r.conflict.bookedTill), "dd MMM yyyy")}</strong>{" "}
+                      · {r.conflict.reservationNumber}
+                    </div>
+                  )}
                   {/* Same-day re-let warning. Shown for reserved rooms
                       whose existing booking arrives AFTER the walk-in's
                       check-out. Staff must confirm via the checkbox
@@ -1687,7 +1720,7 @@ export default function NewReservation() {
                     </div>
                   )}
 
-                  {isDirty && !selected && (
+                  {needsClean && !selected && (
                     <div className="mt-2" onClick={(e) => e.stopPropagation()}>
                       <button
                         type="button"

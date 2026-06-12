@@ -30,7 +30,7 @@ import {
   type MaintenanceCategory,
   type MaintenanceSeverity,
 } from "@hoteldesk/shared";
-import { Fragment, useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { CheckInReceiptModal, type CheckInReceiptData } from "@/components/CheckInReceiptModal";
 import { EarlyCheckInModal } from "@/components/EarlyCheckInModal";
@@ -3507,6 +3507,74 @@ function ExtendModal(props: {
   const [ratePerNight, setRatePerNight] = useState(Number(props.currentRate));
   const [err, setErr] = useState<string | null>(null);
 
+  // Per-room availability for the extension window, checked as soon as
+  // a date is picked — staff see "booked till …" immediately instead of
+  // a 409 after pressing Extend. Also lists free alternative rooms a
+  // blocked room's guest can continue in.
+  type ExtendOptions = {
+    rooms: {
+      roomId: string;
+      roomNumber: string;
+      invoiced: boolean;
+      available: boolean;
+      conflict: {
+        reservationId: string;
+        reservationNumber: string;
+        guestName: string;
+        bookedFrom: string;
+        bookedTill: string;
+      } | null;
+    }[];
+    alternatives: {
+      id: string;
+      roomNumber: string;
+      roomType: string;
+      baseRate: string;
+      status?: string;
+    }[];
+  };
+  const optionsQ = useQuery({
+    queryKey: ["extend-options", props.reservationId, newCheckOutDate],
+    queryFn: () =>
+      api.get<ExtendOptions>(`/reservations/${props.reservationId}/extend-options`, {
+        newCheckOutDate,
+      }),
+    enabled: !!newCheckOutDate && newCheckOutDate > props.currentCheckOut,
+  });
+  const optByRoom = new Map((optionsQ.data?.rooms ?? []).map((r) => [r.roomId, r]));
+  const blockedRooms = (optionsQ.data?.rooms ?? []).filter(
+    (r) => !r.available && !r.invoiced,
+  );
+
+  // Blocked room → chosen alternative room ("" = staff leaves it; the
+  // room simply checks out on the original date).
+  const [moves, setMoves] = useState<Record<string, string>>({});
+  const moveEntries = Object.entries(moves).filter(([, to]) => to);
+
+  // OTP confirmation for the continuation booking.
+  const [otpSent, setOtpSent] = useState<{ target: string; devCode?: string } | null>(null);
+  const [otpCode, setOtpCode] = useState("");
+  const sendOtp = useMutation({
+    mutationFn: () =>
+      api.post<{ target: string; devCode?: string }>(`/otp/send`, {
+        reservationId: props.reservationId,
+        channel: "sms",
+      }),
+    onSuccess: (d) => {
+      setOtpSent(d);
+      setErr(null);
+    },
+    onError: (e: Error) => setErr(e.message),
+  });
+  const continueKey = useMemo(() => newIdempotencyKey(), []);
+
+  // A different date changes what's blocked — chosen moves and any
+  // in-flight OTP no longer apply to it.
+  useEffect(() => {
+    setMoves({});
+    setOtpCode("");
+  }, [newCheckOutDate]);
+
   // Default to all billable rooms picked = behaves like the original
   // "extend all" flow. Untick any to split that subset off into a new
   // reservation with the extended dates.
@@ -3516,10 +3584,44 @@ function ExtendModal(props: {
   const [pickedRooms, setPickedRooms] = useState<Set<string>>(
     () => new Set(billable.map((r) => r.id)),
   );
+  // Blocked rooms can't extend in place — drop them from the picked set
+  // as soon as the availability check identifies them. Track WHICH ids
+  // we auto-dropped so that when staff picks a different date where the
+  // room is free again, we re-pick it. Without the restore, the silent
+  // unpick survives the date change and "Extend" would quietly split
+  // off a subset instead of extending the whole reservation. Manual
+  // unticks are never overridden (they're not in the auto set).
+  const autoUnpicked = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!optionsQ.data) return;
+    const opts = optionsQ.data.rooms;
+    setPickedRooms((prev) => {
+      const next = new Set(prev);
+      let changed = false;
+      for (const r of opts) {
+        if (!r.available && next.has(r.roomId)) {
+          next.delete(r.roomId);
+          autoUnpicked.current.add(r.roomId);
+          changed = true;
+        } else if (r.available && autoUnpicked.current.has(r.roomId)) {
+          next.add(r.roomId);
+          autoUnpicked.current.delete(r.roomId);
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [optionsQ.data]);
   const isMultiRoom = props.rooms.length > 1;
   const allBillablePicked =
     billable.length > 0 && billable.every((r) => pickedRooms.has(r.id));
-  const willSplit = isMultiRoom && pickedRooms.size > 0 && !allBillablePicked;
+  // The in-place /extend endpoint re-checks EVERY assigned room, so it
+  // can only be used when nothing on the reservation is blocked and all
+  // billable rooms extend together. Any move forces the split path for
+  // the in-place rooms.
+  const willSplit =
+    (isMultiRoom && pickedRooms.size > 0 && !allBillablePicked) ||
+    (pickedRooms.size > 0 && moveEntries.length > 0);
 
   function toggleRoom(roomId: string) {
     setPickedRooms((prev) => {
@@ -3532,30 +3634,59 @@ function ExtendModal(props: {
 
   const save = useMutation({
     mutationFn: async () => {
-      if (willSplit) {
-        // Subset: split the reservation. The API creates a new
-        // reservation with the picked rooms + extended dates, leaves
-        // the source intact with its original dates.
-        return await api.post<{
-          source: { id: string; reservationNumber: string };
+      let created: { id: string; reservationNumber: string } | null = null;
+
+      // 1. Continuation booking for blocked rooms moved to alternative
+      //    rooms — same guest, new reservation for the extension nights,
+      //    confirmed by the guest's OTP.
+      if (moveEntries.length > 0) {
+        const resp = await api.post<{
           created: { id: string; reservationNumber: string };
-        }>(`/reservations/${props.reservationId}/extend-split`, {
-          newCheckOutDate,
-          roomIds: Array.from(pickedRooms),
-          ratePerNight: overrideRate ? ratePerNight : undefined,
-        });
+        }>(
+          `/reservations/${props.reservationId}/extend-continue`,
+          {
+            newCheckOutDate,
+            moves: moveEntries.map(([fromRoomId, toRoomId]) => ({
+              fromRoomId,
+              toRoomId,
+              ratePerNight: overrideRate ? ratePerNight : undefined,
+            })),
+            otpCode,
+          },
+          { idempotencyKey: continueKey },
+        );
+        created = resp.created;
       }
-      // All rooms (or single-room reservation): use the original
-      // /extend endpoint that bumps the source's check-out in place.
-      await api.post(`/reservations/${props.reservationId}/extend`, {
-        newCheckOutDate,
-        ratePerNight: overrideRate ? ratePerNight : undefined,
-      });
-      return null;
+
+      // 2. In-place extension for the rooms that ARE free.
+      if (pickedRooms.size > 0) {
+        if (willSplit) {
+          // Subset: split the reservation. The API creates a new
+          // reservation with the picked rooms + extended dates, leaves
+          // the source intact with its original dates.
+          const resp = await api.post<{
+            source: { id: string; reservationNumber: string };
+            created: { id: string; reservationNumber: string };
+          }>(`/reservations/${props.reservationId}/extend-split`, {
+            newCheckOutDate,
+            roomIds: Array.from(pickedRooms),
+            ratePerNight: overrideRate ? ratePerNight : undefined,
+          });
+          created = created ?? resp.created;
+        } else {
+          // All rooms (or single-room reservation): use the original
+          // /extend endpoint that bumps the source's check-out in place.
+          await api.post(`/reservations/${props.reservationId}/extend`, {
+            newCheckOutDate,
+            ratePerNight: overrideRate ? ratePerNight : undefined,
+          });
+        }
+      }
+      return created;
     },
-    onSuccess: (data) => {
-      if (data?.created && props.onSplit) {
-        props.onSplit(data.created);
+    onSuccess: (created) => {
+      if (created && props.onSplit) {
+        props.onSplit(created);
       } else {
         props.onSaved();
       }
@@ -3592,17 +3723,24 @@ function ExtendModal(props: {
             <div className="border border-borderc rounded-sm divide-y divide-borderc">
               {props.rooms.map((rm) => {
                 const isOn = pickedRooms.has(rm.id);
+                const opt = optByRoom.get(rm.id);
+                const blocked = !!opt && !opt.available;
                 const disabled =
                   rm.invoiced ||
                   rm.status === "cancelled" ||
-                  rm.status === "checked_out";
+                  rm.status === "checked_out" ||
+                  blocked;
                 const reason = rm.invoiced
                   ? "already invoiced"
                   : rm.status === "cancelled"
                     ? "cancelled"
                     : rm.status === "checked_out"
                       ? "checked out"
-                      : null;
+                      : blocked
+                        ? `booked till ${format(new Date(opt!.conflict?.bookedTill ?? newCheckOutDate), "dd MMM")}`
+                        : optionsQ.data
+                          ? "free for the new night(s)"
+                          : null;
                 return (
                   <label
                     key={rm.id}
@@ -3625,7 +3763,15 @@ function ExtendModal(props: {
                       Room {rm.roomNumber}
                     </span>
                     {reason && (
-                      <span className="text-[11px] text-textSecondary ml-auto">
+                      <span
+                        className={`text-[11px] ml-auto ${
+                          blocked
+                            ? "text-danger font-semibold"
+                            : reason.startsWith("free")
+                              ? "text-success"
+                              : "text-textSecondary"
+                        }`}
+                      >
                         {reason}
                       </span>
                     )}
@@ -3644,6 +3790,116 @@ function ExtendModal(props: {
                 <>All rooms extend together — same reservation, new check-out date.</>
               )}
             </div>
+          </div>
+        )}
+
+        {blockedRooms.length > 0 && (
+          <div className="rounded-sm border border-danger/30 bg-danger/5 p-3 space-y-2">
+            <div className="text-xs font-semibold uppercase tracking-wider text-danger">
+              {blockedRooms.length === 1
+                ? "Room isn't free for the new night(s)"
+                : `${blockedRooms.length} rooms aren't free for the new night(s)`}
+            </div>
+            {blockedRooms.map((b) => (
+              <div key={b.roomId} className="space-y-1">
+                <div className="text-sm">
+                  <span className="font-mono font-semibold text-brand-dark">
+                    Room {b.roomNumber}
+                  </span>{" "}
+                  <span className="text-xs text-textSecondary">
+                    booked
+                    {b.conflict ? (
+                      <>
+                        {" "}for <strong>{b.conflict.guestName}</strong> till{" "}
+                        <strong>{format(new Date(b.conflict.bookedTill), "dd MMM yyyy")}</strong>{" "}
+                        · {b.conflict.reservationNumber}
+                      </>
+                    ) : null}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-textSecondary shrink-0">Continue in:</span>
+                  <select
+                    className="input !h-8 text-sm"
+                    value={moves[b.roomId] ?? ""}
+                    onChange={(e) =>
+                      setMoves((m) => ({ ...m, [b.roomId]: e.target.value }))
+                    }
+                  >
+                    <option value="">— don't extend this room —</option>
+                    {(optionsQ.data?.alternatives ?? [])
+                      // An alternative can only take one guest.
+                      .filter(
+                        (a) =>
+                          moves[b.roomId] === a.id ||
+                          !Object.values(moves).includes(a.id),
+                      )
+                      .map((a) => (
+                        <option key={a.id} value={a.id}>
+                          Room {a.roomNumber} · {a.roomType.replace(/_/g, " ")} · ₹
+                          {Number(a.baseRate).toFixed(0)}/night
+                        </option>
+                      ))}
+                  </select>
+                </div>
+              </div>
+            ))}
+            {(optionsQ.data?.alternatives.length ?? 0) === 0 && (
+              <div className="text-xs text-danger">
+                No alternative rooms are free for those nights.
+              </div>
+            )}
+            <div className="text-[11px] text-textSecondary leading-tight">
+              Picking a room books a continuation reservation for the same guest —
+              details and KYC carry over, nothing to re-enter. The guest confirms
+              with a one-time code.
+            </div>
+          </div>
+        )}
+
+        {moveEntries.length > 0 && (
+          <div className="rounded-sm border border-borderc bg-bg/40 p-3 space-y-2">
+            <div className="text-xs font-semibold uppercase tracking-wider text-textSecondary">
+              Guest confirmation (OTP)
+            </div>
+            {otpSent ? (
+              <>
+                <div className="text-xs text-textSecondary">
+                  Code sent to <span className="font-mono">{otpSent.target}</span>.
+                  {otpSent.devCode && (
+                    <>
+                      {" "}Dev code: <span className="font-mono font-semibold">{otpSent.devCode}</span>
+                    </>
+                  )}
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    className="input !h-9 font-mono tracking-widest"
+                    placeholder="Enter code"
+                    value={otpCode}
+                    maxLength={8}
+                    onChange={(e) => setOtpCode(e.target.value.replace(/\D/g, ""))}
+                  />
+                  <button
+                    type="button"
+                    className="btn-secondary !h-9 shrink-0"
+                    onClick={() => sendOtp.mutate()}
+                    disabled={sendOtp.isPending}
+                  >
+                    {sendOtp.isPending ? "Sending…" : "Resend"}
+                  </button>
+                </div>
+              </>
+            ) : (
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={() => sendOtp.mutate()}
+                disabled={sendOtp.isPending}
+              >
+                {sendOtp.isPending ? "Sending…" : "Send OTP to guest"}
+              </button>
+            )}
           </div>
         )}
 
@@ -3700,16 +3956,29 @@ function ExtendModal(props: {
           <button className="btn-secondary" onClick={props.onClose}>Cancel</button>
           <button
             className="btn-primary"
-            disabled={!newCheckOutDate || save.isPending || pickedRooms.size === 0}
+            disabled={
+              !newCheckOutDate ||
+              save.isPending ||
+              // Nothing to do: no room extends in place, no room moves.
+              (pickedRooms.size === 0 && moveEntries.length === 0) ||
+              // A move needs the guest's OTP before it can be booked.
+              (moveEntries.length > 0 && otpCode.trim().length < 4)
+            }
             onClick={() => save.mutate()}
           >
             {save.isPending
-              ? willSplit
-                ? "Splitting…"
-                : "Extending…"
-              : willSplit
-                ? `Split ${pickedRooms.size} room${pickedRooms.size === 1 ? "" : "s"} into new reservation`
-                : "Extend"}
+              ? moveEntries.length > 0
+                ? "Booking…"
+                : willSplit
+                  ? "Splitting…"
+                  : "Extending…"
+              : moveEntries.length > 0
+                ? pickedRooms.size > 0
+                  ? "Extend & book new room"
+                  : "Verify code & book new room"
+                : willSplit
+                  ? `Split ${pickedRooms.size} room${pickedRooms.size === 1 ? "" : "s"} into new reservation`
+                  : "Extend"}
           </button>
         </div>
       </div>
@@ -4302,11 +4571,22 @@ function PaymentModal(props: {
 }) {
   const [amount, setAmount] = useState(props.balance);
   const [method, setMethod] = useState<"cash" | "card" | "upi" | "bank_transfer">("cash");
+  const [reason, setReason] = useState("");
   const [reference, setReference] = useState("");
   const [err, setErr] = useState<string | null>(null);
   // One key per modal mount: double-click → server replays the first
   // response. Closing and reopening the modal generates a fresh key.
   const idempotencyKey = useMemo(() => newIdempotencyKey(), []);
+
+  // Reason + reference both travel in payments.notes — that's the field
+  // every surface already renders (payment history, Collections, receipt
+  // and invoice PDFs).
+  const composedNotes = [
+    reason.trim(),
+    reference.trim() ? `Ref: ${reference.trim()}` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
 
   const save = useMutation({
     mutationFn: () =>
@@ -4315,7 +4595,7 @@ function PaymentModal(props: {
         {
           amount,
           paymentMethod: method,
-          notes: reference || undefined,
+          notes: composedNotes || undefined,
           ...(props.invoiceId ? { invoiceId: props.invoiceId } : {}),
         },
         { idempotencyKey },
@@ -4357,6 +4637,18 @@ function PaymentModal(props: {
             <option value="card">Card</option>
             <option value="bank_transfer">Bank Transfer</option>
           </select>
+        </div>
+        <div>
+          <label className="label block mb-1">Reason (optional)</label>
+          <input
+            className="input"
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            placeholder="e.g. part payment, advance for extra night"
+          />
+          <div className="text-xs text-textSecondary mt-1">
+            Shows in payment history, collections and on the receipt / invoice.
+          </div>
         </div>
         <div>
           <label className="label block mb-1">Reference (optional)</label>
@@ -4439,17 +4731,23 @@ function PerRoomCheckoutModal(props: {
   });
   const walletBalance = walletQ.data?.walletBalance ?? 0;
   const [amount, setAmount] = useState<number>(0);
+  const [userEdited, setUserEdited] = useState(false);
   const [method, setMethod] = useState<
     "cash" | "upi" | "card" | "bank_transfer" | "unpaid" | "wallet"
   >("cash");
   const [notes, setNotes] = useState("");
   const [err, setErr] = useState<string | null>(null);
 
-  // Default the amount to whatever's still owed on the bound invoice
-  // (or the full bill when there's no invoice yet).
+  // Prefill the amount with what's still owed and keep tracking the
+  // quote until staff edits the field manually. The first render can
+  // serve a cached quote from before the latest payment was recorded —
+  // locking that in showed a stale (higher) amount and tripped the
+  // "over by" warning.
   useEffect(() => {
-    if (quoteQ.data && amount === 0) setAmount(quoteQ.data.balanceDue);
-  }, [quoteQ.data, amount]);
+    if (quoteQ.data && !userEdited && method !== "wallet") {
+      setAmount(quoteQ.data.balanceDue);
+    }
+  }, [quoteQ.data, userEdited, method]);
 
   // When the user switches to "wallet", cap the amount at the wallet balance
   // (and at the bill total). Switching away leaves the amount alone.
@@ -4566,6 +4864,7 @@ function PerRoomCheckoutModal(props: {
                     value={amount === 0 ? "" : amount}
                     onChange={(e) => {
                       const v = e.target.value;
+                      setUserEdited(true);
                       setAmount(v === "" ? 0 : Number(v));
                     }}
                   />
@@ -5251,7 +5550,11 @@ function CheckoutModal(props: {
     "cash" | "card" | "upi" | "bank_transfer" | "unpaid" | "wallet"
   >("cash");
   const [paymentNotes, setPaymentNotes] = useState("");
-  const [refundMode, setRefundMode] = useState<"cash" | "credit">("credit");
+  // Deliberately no preselection — refunding as wallet credit vs cash is
+  // the staff's call, never a silent default. If a refund turns out to be
+  // due and nothing is picked, the API rejects with REFUND_MODE_REQUIRED
+  // and the error surfaces in this modal.
+  const [refundMode, setRefundMode] = useState<"cash" | "credit" | "">("");
   const [refundNote, setRefundNote] = useState("");
   const [err, setErr] = useState<string | null>(null);
 
@@ -5318,10 +5621,8 @@ function CheckoutModal(props: {
             { idempotencyKey: newIdempotencyKey() },
           );
         }
-        const body: Record<string, unknown> = {
-          refundMode,
-          invoiceMode,
-        };
+        const body: Record<string, unknown> = { invoiceMode };
+        if (refundMode) body.refundMode = refundMode;
         if (refundNote.trim()) body.refundNote = refundNote.trim();
         await api.post(`/reservations/${props.reservationId}/check-out`, body);
         return;
@@ -5335,7 +5636,7 @@ function CheckoutModal(props: {
         body.paymentMethod = method;
         if (isUnpaid) body.paymentNotes = paymentNotes;
       }
-      body.refundMode = refundMode;
+      if (refundMode) body.refundMode = refundMode;
       if (refundNote.trim()) body.refundNote = refundNote.trim();
       await api.post(`/reservations/${props.reservationId}/check-out`, body);
 

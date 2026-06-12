@@ -6,6 +6,7 @@ import { useNavigate } from "react-router-dom";
 import { useAuth } from "@/auth/AuthContext";
 import { useDialog } from "@/components/Dialog";
 import { Loader } from "@/components/Loader";
+import { StickyBar } from "@/components/StickyBar";
 import { useToast } from "@/components/Toast";
 import { ApiError, api, getList, newIdempotencyKey } from "@/lib/api";
 import { invalidateReservationData } from "@/lib/invalidate";
@@ -104,6 +105,7 @@ export default function Credits() {
         )}
       </div>
 
+      <StickyBar>
       <div className="card">
         <div className="flex items-center gap-3">
           <Search className="w-4 h-4 text-textSecondary shrink-0" />
@@ -124,6 +126,7 @@ export default function Credits() {
           )}
         </div>
       </div>
+      </StickyBar>
 
       <div className="card p-0 overflow-hidden">
         {isLoading ? (

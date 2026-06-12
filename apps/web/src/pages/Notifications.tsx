@@ -15,6 +15,7 @@ import {
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Loader } from "@/components/Loader";
+import { StickyBar } from "@/components/StickyBar";
 import { api } from "@/lib/api";
 
 interface Notification {
@@ -106,6 +107,7 @@ export default function Notifications() {
 
   return (
     <div className="space-y-4">
+      <StickyBar>
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold text-brand-dark">Notifications</h1>
@@ -154,6 +156,7 @@ export default function Notifications() {
           </button>
         ))}
       </div>
+      </StickyBar>
 
       {items.length === 0 && (
         <div className="card flex flex-col items-center justify-center py-16 text-center text-textSecondary">

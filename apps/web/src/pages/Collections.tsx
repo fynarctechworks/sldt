@@ -26,6 +26,7 @@ import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useDialog } from "@/components/Dialog";
 import { Loader } from "@/components/Loader";
+import { StickyBar } from "@/components/StickyBar";
 import { Money, useMaskedInr } from "@/components/Money";
 import { useToast } from "@/components/Toast";
 import { api } from "@/lib/api";
@@ -201,6 +202,7 @@ export default function Collections() {
 
   return (
     <div className="space-y-5">
+      <StickyBar>
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <div>
           <h1 className="text-2xl font-bold text-brand-dark">Collections</h1>
@@ -216,6 +218,7 @@ export default function Collections() {
           onChange={(e) => setSearch(e.target.value)}
         />
       </div>
+      </StickyBar>
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <div className="card">

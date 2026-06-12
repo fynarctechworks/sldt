@@ -16,6 +16,7 @@ import {
   type DatePresetKey,
 } from "@/components/DatePresetBar";
 import { Loader } from "@/components/Loader";
+import { StickyBar } from "@/components/StickyBar";
 import { StatusBadge } from "@/components/StatusBadge";
 import { api } from "@/lib/api";
 import { inr } from "@/lib/utils";
@@ -168,6 +169,7 @@ export default function Reservations() {
         </div>
       </div>
 
+      <StickyBar>
       <div className="card flex flex-wrap gap-3 items-end">
         {/* Search input takes a full row on phones for clarity, then
             flexes back into the wrap-row on sm+. */}
@@ -271,6 +273,7 @@ export default function Reservations() {
           }}
         />
       </div>
+      </StickyBar>
 
       {isLoading ? (
         <Loader />

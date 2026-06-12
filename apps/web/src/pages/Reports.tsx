@@ -27,7 +27,7 @@ import {
   Wallet,
 } from "lucide-react";
 import Papa from "papaparse";
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useMemo, useState, type ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Bar,
@@ -48,6 +48,7 @@ import { inr } from "@/lib/utils";
 
 type Tab =
   | "occupancy"
+  | "daily"
   | "revenue"
   | "invoices"
   | "collections"
@@ -71,6 +72,7 @@ interface TabDef {
 // reachable via the URL (?tab=credit) and via the dropdown.
 const PRIMARY_TABS: TabDef[] = [
   { id: "occupancy", label: "Occupancy", caption: "Daily room fill rate", Icon: Percent },
+  { id: "daily", label: "Daily Report", caption: "Day book — rooms, money in & out", Icon: CalendarDays },
   { id: "revenue", label: "Revenue", caption: "Earnings + room-type mix", Icon: TrendingUp },
   { id: "invoices", label: "Invoices", caption: "Every tax invoice on the property", Icon: Receipt },
   { id: "collections", label: "Collections", caption: "Money received by method", Icon: Coins },
@@ -342,6 +344,7 @@ export default function Reports() {
       )}
 
       {tab === "occupancy" && <OccupancyTab from={from} to={to} />}
+      {tab === "daily" && <DailyLedgerTab from={from} to={to} />}
       {tab === "revenue" && <RevenueTab from={from} to={to} />}
       {tab === "invoices" && <InvoicesTab from={from} to={to} />}
       {tab === "collections" && <CollectionsTab from={from} to={to} />}
@@ -1677,6 +1680,242 @@ function OutstandingTab() {
           )}
         </div>
       </section>
+    </div>
+  );
+}
+
+// Day book — one row per calendar day: rooms occupied that night (who
+// and at what price), money collected, expenses paid out, and the net.
+// The "everything in one place" report for close-of-day and accountant
+// handovers. Two exports: per-day summary and per-room-night detail.
+function DailyLedgerTab({ from, to }: { from: string; to: string }) {
+  interface LedgerRoom {
+    roomNumber: string;
+    guestName: string;
+    reservationNumber: string;
+    rate: number;
+    complimentary: boolean;
+  }
+  interface LedgerDay {
+    day: string;
+    roomsOccupied: number;
+    roomNumbers: string;
+    roomCharges: number;
+    collected: number;
+    expenses: number;
+    net: number;
+    rooms: LedgerRoom[];
+  }
+  const { data, isLoading } = useQuery({
+    queryKey: ["rpt-daily-ledger", from, to],
+    queryFn: () =>
+      api.get<{
+        daily: LedgerDay[];
+        totals: {
+          roomNights: number;
+          roomCharges: number;
+          collected: number;
+          expenses: number;
+          net: number;
+        };
+      }>("/reports/daily-ledger", { date_from: from, date_to: to }),
+  });
+  const [expanded, setExpanded] = useState<string | null>(null);
+
+  const daily = data?.daily ?? [];
+  const totals = data?.totals;
+  // Hide leading/trailing dead days only when the range is long; a
+  // week view keeps every day so gaps are visible.
+  const hasAnything = (d: LedgerDay) =>
+    d.roomsOccupied > 0 || d.collected > 0.009 || d.expenses > 0.009;
+
+  if (isLoading) return <Loader label="Building the day book…" />;
+
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+        <Kpi label="Room nights sold" value={totals?.roomNights ?? 0} Icon={BedDouble} />
+        <Kpi
+          label="Collected"
+          value={inr(totals?.collected ?? 0)}
+          Icon={Coins}
+          tone="success"
+        />
+        <Kpi
+          label="Expenses"
+          value={inr(totals?.expenses ?? 0)}
+          Icon={Wallet}
+          tone="danger"
+        />
+        <Kpi
+          label="Net"
+          value={inr(totals?.net ?? 0)}
+          Icon={TrendingUp}
+          tone={(totals?.net ?? 0) >= 0 ? "success" : "danger"}
+        />
+      </div>
+
+      <div>
+        <SectionHeader
+          title="Day book"
+          subtitle="Click a day to see each room, guest and nightly price"
+          right={
+            <div className="flex items-center gap-2">
+              <ExportBtn
+                label="Export days CSV"
+                disabled={!daily.length}
+                onClick={() =>
+                  exportCsv(
+                    `daily-report-${from}-${to}.csv`,
+                    daily.map((d) => ({
+                      date: d.day,
+                      rooms_occupied: d.roomsOccupied,
+                      room_numbers: d.roomNumbers,
+                      room_charges: d.roomCharges,
+                      collected: d.collected,
+                      expenses: d.expenses,
+                      net: d.net,
+                    })),
+                  )
+                }
+              />
+              <ExportBtn
+                label="Export detail CSV"
+                disabled={!daily.length}
+                onClick={() =>
+                  exportCsv(
+                    `daily-report-detail-${from}-${to}.csv`,
+                    daily.flatMap((d) =>
+                      d.rooms.map((r) => ({
+                        date: d.day,
+                        room: r.roomNumber,
+                        guest: r.guestName,
+                        reservation: r.reservationNumber,
+                        price_per_night: r.rate,
+                        complimentary: r.complimentary ? "yes" : "no",
+                        collected_that_day: d.collected,
+                        expenses_that_day: d.expenses,
+                      })),
+                    ),
+                  )
+                }
+              />
+            </div>
+          }
+        />
+        <div className="card !p-0 overflow-x-auto">
+          {daily.filter(hasAnything).length === 0 ? (
+            <EmptyState Icon={Inbox} title="Nothing recorded in this range" />
+          ) : (
+            <table className="table-base">
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th className="!text-right">Rooms</th>
+                  <th>Room numbers</th>
+                  <th className="!text-right">Room charges</th>
+                  <th className="!text-right">Collected</th>
+                  <th className="!text-right">Expenses</th>
+                  <th className="!text-right">Net</th>
+                </tr>
+              </thead>
+              <tbody>
+                {daily.filter(hasAnything).map((d) => {
+                  const open = expanded === d.day;
+                  return (
+                    <Fragment key={d.day}>
+                      <tr
+                        className={`cursor-pointer hover:bg-bg ${open ? "bg-brand-soft/30" : ""}`}
+                        onClick={() => setExpanded(open ? null : d.day)}
+                      >
+                        <td className="font-mono font-semibold text-brand-dark whitespace-nowrap">
+                          {format(new Date(d.day), "dd MMM yyyy")}
+                          <span className="ml-1.5 text-[10px] font-sans font-normal text-textSecondary">
+                            {format(new Date(d.day), "EEE")}
+                          </span>
+                        </td>
+                        <td className="text-right tabular-nums">{d.roomsOccupied}</td>
+                        <td className="max-w-[220px] truncate text-textSecondary text-xs font-mono">
+                          {d.roomNumbers || "—"}
+                        </td>
+                        <td className="text-right font-mono tabular-nums">{inr(d.roomCharges)}</td>
+                        <td className="text-right font-mono tabular-nums text-success">
+                          {inr(d.collected)}
+                        </td>
+                        <td className="text-right font-mono tabular-nums text-danger">
+                          {d.expenses > 0.009 ? `− ${inr(d.expenses)}` : inr(0)}
+                        </td>
+                        <td
+                          className={`text-right font-mono font-semibold tabular-nums ${
+                            d.net >= 0 ? "text-brand-dark" : "text-danger"
+                          }`}
+                        >
+                          {inr(d.net)}
+                        </td>
+                      </tr>
+                      {open && d.rooms.length > 0 && (
+                        <tr>
+                          <td colSpan={7} className="!p-0 bg-bg/50">
+                            <table className="w-full text-xs">
+                              <tbody>
+                                {d.rooms.map((r, i) => (
+                                  <tr key={`${d.day}-${r.roomNumber}-${i}`} className="border-b border-borderc/40 last:border-0">
+                                    <td className="pl-10 py-1.5 font-mono font-semibold text-brand-dark w-24">
+                                      {r.roomNumber}
+                                    </td>
+                                    <td className="py-1.5">
+                                      {r.guestName}
+                                      {r.complimentary && (
+                                        <span className="ml-1.5 text-[10px] text-brass">Comp</span>
+                                      )}
+                                    </td>
+                                    <td className="py-1.5 font-mono text-textSecondary">
+                                      {r.reservationNumber}
+                                    </td>
+                                    <td className="py-1.5 pr-4 text-right font-mono tabular-nums">
+                                      {inr(r.rate)}/night
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  );
+                })}
+              </tbody>
+              <tfoot>
+                <tr className="bg-brand-soft/40">
+                  <td className="font-semibold text-brand-dark">Total</td>
+                  <td className="text-right font-semibold tabular-nums">
+                    {totals?.roomNights ?? 0}
+                  </td>
+                  <td></td>
+                  <td className="text-right font-mono font-bold tabular-nums">
+                    {inr(totals?.roomCharges ?? 0)}
+                  </td>
+                  <td className="text-right font-mono font-bold tabular-nums text-success">
+                    {inr(totals?.collected ?? 0)}
+                  </td>
+                  <td className="text-right font-mono font-bold tabular-nums text-danger">
+                    − {inr(totals?.expenses ?? 0)}
+                  </td>
+                  <td className="text-right font-mono font-bold tabular-nums">
+                    {inr(totals?.net ?? 0)}
+                  </td>
+                </tr>
+              </tfoot>
+            </table>
+          )}
+        </div>
+        <p className="text-[11px] text-textSecondary mt-2 leading-snug">
+          Room charges = sum of nightly rates of occupied rooms (the night belongs to the
+          check-in day; checkout day isn't billed). Collected = payments received that day
+          across all bookings. Net = collected − expenses.
+        </p>
+      </div>
     </div>
   );
 }

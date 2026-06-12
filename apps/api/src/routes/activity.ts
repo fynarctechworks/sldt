@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, lt, sql } from "drizzle-orm";
+import { and, desc, eq, gte, lte, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 import { db } from "../db/client.js";
@@ -6,6 +6,7 @@ import { activityLog } from "../db/schema/activity.js";
 import { profiles } from "../db/schema/profiles.js";
 import { reservationRooms } from "../db/schema/reservations.js";
 import { rooms } from "../db/schema/rooms.js";
+import { propertyDayEnd, propertyDayStart } from "../lib/propertyTime.js";
 import { ok } from "../lib/response.js";
 import { requireAuth } from "../middleware/auth.js";
 import { validate } from "../middleware/validate.js";
@@ -29,11 +30,13 @@ router.get(
   async (req, res) => {
     const { date_from, date_to, limit } = req.query as unknown as z.infer<typeof listSchema>;
 
-    // Inclusive day-range. We compare against the column directly, but expand
-    // date_to to "< next day" so the entire end-day is included.
+    // Inclusive day-range in the property's timezone. The previous
+    // ::date casts compared against DB-timezone (UTC) midnights, so
+    // entries logged between 00:00 and 05:30 IST landed in the wrong
+    // day's bucket.
     const conds = [];
-    if (date_from) conds.push(gte(activityLog.createdAt, sql`${date_from}::date`));
-    if (date_to) conds.push(lt(activityLog.createdAt, sql`(${date_to}::date + interval '1 day')`));
+    if (date_from) conds.push(gte(activityLog.createdAt, propertyDayStart(date_from)));
+    if (date_to) conds.push(lte(activityLog.createdAt, propertyDayEnd(date_to)));
 
     const rows = await db
       .select({
