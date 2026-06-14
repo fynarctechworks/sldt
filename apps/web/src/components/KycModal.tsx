@@ -50,11 +50,11 @@ export function KycModal({
 
   return (
     <div
-      className="fixed inset-0 bg-black/50 flex items-center justify-center z-50"
+      className="fixed inset-0 bg-black/50 flex items-end justify-center sm:items-center z-50 sm:p-4"
       onClick={onClose}
     >
       <div
-        className="bg-surface rounded-md w-full max-w-lg p-5"
+        className="bg-surface rounded-t-2xl sm:rounded-md w-full sm:max-w-lg p-5 pb-safe sm:pb-5 max-h-[92vh] overflow-y-auto"
         onClick={(e) => e.stopPropagation()}
       >
         <h2 className="text-lg font-semibold text-navy mb-1 flex items-center gap-2">

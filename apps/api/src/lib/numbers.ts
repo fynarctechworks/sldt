@@ -12,3 +12,7 @@ export function invoiceNumber(_prefix: string, seq: number) {
 export function receiptNumber(seq: number) {
   return `SLDT-RCP-${fmt4(seq)}`;
 }
+
+export function creditNoteNumber(seq: number) {
+  return `SLDT-CN-${fmt4(seq)}`;
+}

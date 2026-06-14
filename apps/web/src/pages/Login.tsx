@@ -248,20 +248,37 @@ export default function Login() {
         </div>
       </aside>
 
-      <main className="flex items-center justify-center p-6 sm:p-10 bg-ivory">
+      {/* On phone/tablet (no brand aside) the form pane gets the brand
+          backdrop itself — a jade gradient + soft logo watermark — so the
+          card floats on something rich instead of empty cream. On lg+ it
+          reverts to plain ivory next to the brand aside. */}
+      <main className="relative flex items-center justify-center p-6 sm:p-10 bg-brand-dark lg:bg-ivory overflow-hidden">
+        {/* Decorative layers — phone/tablet only. */}
+        <div className="lg:hidden absolute inset-0 opacity-[0.18] [background:radial-gradient(circle_at_18%_12%,#E8E2D3_0,transparent_45%),radial-gradient(circle_at_82%_88%,#B08A4A_0,transparent_55%)]" aria-hidden />
+        <img
+          src="/logo.jpg"
+          alt=""
+          aria-hidden
+          className="lg:hidden absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[80vw] max-w-sm object-contain opacity-[0.05] mix-blend-screen select-none pointer-events-none"
+        />
+        <div className="relative w-full max-w-md flex flex-col items-center">
+          {/* Brand mark ABOVE the card — phone/tablet only (lg+ has the
+              brand aside). Logo on the green backdrop, then the card. */}
+          <div className="lg:hidden flex flex-col items-center text-center mb-5">
+            <img
+              src="/logo.jpg"
+              alt="SLDT Stay Inn"
+              className="w-16 h-16 rounded-2xl object-contain bg-cream shadow-lg ring-1 ring-brass/30"
+            />
+            <div className="mt-3 text-cream font-semibold text-lg leading-tight">SLDT Stay Inn</div>
+            <div className="text-[11px] tracking-[0.18em] uppercase text-brass">Sabbavaram</div>
+          </div>
         <form
           onSubmit={onSubmit}
           noValidate
-          className="w-full max-w-md p-9 space-y-5 bg-surface rounded-md border border-borderc shadow-[0_20px_50px_-20px_rgba(15,61,46,0.25)]"
+          className="relative w-full p-9 space-y-5 bg-surface rounded-2xl lg:rounded-md border border-borderc shadow-[0_20px_50px_-20px_rgba(15,61,46,0.45)]"
           aria-describedby={error ? errId : undefined}
         >
-          <div className="lg:hidden flex items-center gap-3 font-semibold text-navy">
-            <img src="/logo.jpg" alt="SLDT Stay Inn" className="w-11 h-11 rounded-md object-contain bg-brand-soft p-0.5" />
-            <div className="leading-tight">
-              <div>SLDT Stay Inn</div>
-              <div className="text-[11px] font-normal text-textSecondary">Sabbavaram</div>
-            </div>
-          </div>
 
           {!mfaStep && (
             <div>
@@ -490,6 +507,7 @@ export default function Login() {
             </div>
           )}
         </form>
+        </div>
       </main>
     </div>
   );

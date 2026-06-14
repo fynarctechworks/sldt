@@ -128,7 +128,7 @@ export default function Credits() {
       </div>
       </StickyBar>
 
-      <div className="card p-0 overflow-hidden">
+      <div className="card p-0 overflow-x-auto">
         {isLoading ? (
           <Loader />
         ) : filtered.length === 0 ? (

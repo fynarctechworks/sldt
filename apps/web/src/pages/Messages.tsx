@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { format, isToday, isYesterday } from "date-fns";
-import { Check, CheckCheck, Loader2, MessageSquare, Search, Send, Users } from "lucide-react";
+import { ArrowLeft, Check, CheckCheck, Loader2, MessageSquare, Search, Send, Users } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useAuth } from "@/auth/AuthContext";
@@ -163,9 +163,15 @@ export default function Messages() {
   }
 
   return (
-    <div className="grid grid-cols-[21rem_1fr] h-[calc(100vh-6.5rem)] rounded-md overflow-hidden border border-borderc shadow-[0_2px_8px_-2px_rgba(15,61,46,0.06)]">
+    // Phone: ONE pane at a time — list, or the open chat (driven by the
+    // ?with= param). md+: the classic two-column split.
+    <div className="grid grid-cols-1 md:grid-cols-[21rem_1fr] h-[calc(100vh-9.5rem)] md:h-[calc(100vh-6.5rem)] rounded-md overflow-hidden border border-borderc shadow-[0_2px_8px_-2px_rgba(15,61,46,0.06)]">
       {/* ============ LEFT: conversation list ============ */}
-      <aside className="bg-white border-r border-borderc flex flex-col min-w-0">
+      <aside
+        className={`bg-white border-r border-borderc flex-col min-w-0 ${
+          activeId ? "hidden md:flex" : "flex"
+        }`}
+      >
         <div className={`px-4 py-3 ${WA.bar} flex items-center gap-2 shrink-0`}>
           <span className="font-semibold text-[#111b21]">Chats</span>
           {totalUnread > 0 && (
@@ -264,7 +270,11 @@ export default function Messages() {
       </aside>
 
       {/* ============ RIGHT: chat ============ */}
-      <section className="flex flex-col min-w-0 overflow-hidden">
+      <section
+        className={`flex-col min-w-0 overflow-hidden ${
+          activeId ? "flex" : "hidden md:flex"
+        }`}
+      >
         {!activeId && (
           <div className="flex-1 grid place-items-center bg-[#f8fafa] border-b-[6px] border-[#00a884]">
             <div className="text-center text-[#667781] px-8">
@@ -281,6 +291,14 @@ export default function Messages() {
         {activeId && (
           <>
             <div className={`px-4 py-2.5 ${WA.bar} flex items-center gap-3 shrink-0 border-b border-borderc/60`}>
+              {/* Back to the conversation list (phone only). */}
+              <button
+                onClick={() => setParams({})}
+                className="md:hidden -ml-1 p-1 rounded text-[#54656f] hover:bg-black/5"
+                aria-label="Back to chats"
+              >
+                <ArrowLeft className="w-5 h-5" />
+              </button>
               <Avatar name={activeName} />
               <div className="min-w-0">
                 <div className="font-medium text-[#111b21] leading-tight truncate">{activeName}</div>

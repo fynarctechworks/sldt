@@ -4,7 +4,7 @@ import { z } from "zod";
 import { db } from "../db/client.js";
 import { activityLog } from "../db/schema/activity.js";
 import { profiles } from "../db/schema/profiles.js";
-import { reservationRooms } from "../db/schema/reservations.js";
+import { reservationRooms, reservations } from "../db/schema/reservations.js";
 import { rooms } from "../db/schema/rooms.js";
 import { propertyDayEnd, propertyDayStart } from "../lib/propertyTime.js";
 import { ok } from "../lib/response.js";
@@ -37,6 +37,15 @@ router.get(
     const conds = [];
     if (date_from) conds.push(gte(activityLog.createdAt, propertyDayStart(date_from)));
     if (date_to) conds.push(lte(activityLog.createdAt, propertyDayEnd(date_to)));
+    // Hide entries tied to complimentary reservations — they're silent
+    // everywhere outside the Complimentary report. (entity_id is a uuid
+    // column, so the join below is always type-safe.)
+    conds.push(
+      sql`NOT (${activityLog.entityType} = 'reservation' AND EXISTS (
+        SELECT 1 FROM ${reservations} r
+        WHERE r.id = ${activityLog.entityId}
+          AND r.booking_source = 'complimentary'))`,
+    );
 
     const rows = await db
       .select({

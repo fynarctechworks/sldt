@@ -327,8 +327,14 @@ router.get("/gst-summary", requireAuth, requirePermission("view_reports"), async
   // GST summary excludes invoices tied to complimentary reservations.
   // A comped booking is not a taxable sale from a management standpoint,
   // so its CGST/SGST shouldn't appear in the GST filing rollup.
+  //
+  // Group by document_type AND status so credit notes (negative tax
+  // reversals) are a visible line, not silently netted into the
+  // "issued" bucket. The period's net output tax = invoices − credit
+  // notes, which is what gets filed.
   const rows = await db
     .select({
+      documentType: invoices.documentType,
       status: invoices.status,
       subtotal: sql<string>`COALESCE(SUM(${invoices.subtotal}),0)::text`,
       cgst: sql<string>`COALESCE(SUM(${invoices.cgstAmount}),0)::text`,
@@ -346,9 +352,33 @@ router.get("/gst-summary", requireAuth, requirePermission("view_reports"), async
         sql`${reservations.bookingSource} <> 'complimentary'`,
       ),
     )
-    .groupBy(invoices.status);
+    .groupBy(invoices.documentType, invoices.status);
 
-  return ok(res, { month: label, from, to, byStatus: rows });
+  // Split the rows into ordinary invoices (by status, as before) and a
+  // single credit-note rollup so the UI can render both without
+  // re-deriving the document type.
+  const byStatus = rows
+    .filter((r) => r.documentType !== "credit_note")
+    .map(({ status, subtotal, cgst, sgst, total, count }) => ({
+      status,
+      subtotal,
+      cgst,
+      sgst,
+      total,
+      count,
+    }));
+  const cnRows = rows.filter((r) => r.documentType === "credit_note");
+  const creditNotes = {
+    count: cnRows.reduce((s, r) => s + r.count, 0),
+    // Amounts are already negative in the DB; surface their magnitude so
+    // the UI can show "− ₹X" cleanly.
+    subtotal: cnRows.reduce((s, r) => s + Number(r.subtotal), 0).toFixed(2),
+    cgst: cnRows.reduce((s, r) => s + Number(r.cgst), 0).toFixed(2),
+    sgst: cnRows.reduce((s, r) => s + Number(r.sgst), 0).toFixed(2),
+    total: cnRows.reduce((s, r) => s + Number(r.total), 0).toFixed(2),
+  };
+
+  return ok(res, { month: label, from, to, byStatus, creditNotes });
 });
 
 router.get("/outstanding", requireAuth, requirePermission("view_revenue"), async (_req, res) => {

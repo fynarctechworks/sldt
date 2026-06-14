@@ -257,6 +257,15 @@ async function buildDashboard() {
         })
         .from(activityLog)
         .innerJoin(profiles, eq(profiles.id, activityLog.performedBy))
+        // Hide activity tied to complimentary reservations — they're
+        // silent everywhere outside the Complimentary report. (entity_id
+        // is a uuid column, so the join is always type-safe.)
+        .where(
+          sql`NOT (${activityLog.entityType} = 'reservation' AND EXISTS (
+            SELECT 1 FROM ${reservations} r
+            WHERE r.id = ${activityLog.entityId}
+              AND r.booking_source = 'complimentary'))`,
+        )
         .orderBy(desc(activityLog.createdAt))
         .limit(10),
       // Upcoming check-outs — every reservation that is checked_in and is
@@ -425,6 +434,9 @@ async function buildDashboard() {
             eq(reservations.status, "confirmed"),
             gte(reservations.checkInDate, today),
             lte(reservations.checkInDate, reminderWindowEnd),
+            // Complimentary bookings get no arrival reminder (banner or
+            // WhatsApp) — they're silent everywhere outside the comp report.
+            sql`${reservations.bookingSource} <> 'complimentary'`,
           ),
         )
         .orderBy(reservations.checkInDate),
@@ -446,6 +458,8 @@ async function buildDashboard() {
           and(
             eq(reservations.status, "confirmed"),
             lte(reservations.checkInDate, today),
+            // No no-show alert for complimentary bookings.
+            sql`${reservations.bookingSource} <> 'complimentary'`,
           ),
         )
         .orderBy(reservations.checkInDate),

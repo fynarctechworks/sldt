@@ -40,6 +40,7 @@ import {
   isRoomAvailable,
   lockKey,
   lockRoom,
+  nextCreditNoteSequence,
   nextDailySequence,
   nextInvoiceSequence,
   type RoomConflict,
@@ -47,6 +48,7 @@ import {
 import { getGuestBalance } from "../lib/ledger.js";
 import {
   attachOrphanPaymentsAndRecompute,
+  recomputeInvoiceTotals,
   recomputeReservationBalance,
 } from "../lib/reservationBalance.js";
 import { resolveCurrentPropertyId } from "../lib/currentProperty.js";
@@ -54,7 +56,7 @@ import { calcGstBreakdown, getGstRate } from "../lib/gst.js";
 import { loadGuestExtra } from "../lib/guestExtra.js";
 import { buildInvoice, selectChargesForScope } from "../lib/invoiceBuilder.js";
 import { PAYMENT_METHODS } from "../db/schema/enums.js";
-import { invoiceNumber, reservationNumber } from "../lib/numbers.js";
+import { creditNoteNumber, invoiceNumber, reservationNumber } from "../lib/numbers.js";
 import { hashOtp } from "../lib/otp.js";
 import { renderInvoicePdf, renderReceiptPdf } from "../lib/pdf.js";
 import { generateReceiptNumber } from "../lib/receipt.js";
@@ -72,6 +74,7 @@ import { validate } from "../middleware/validate.js";
 import { guests } from "../db/schema/guests.js";
 import { otps } from "../db/schema/otps.js";
 import { guestLedger } from "../db/schema/guestLedger.js";
+import { notifications } from "../db/schema/notifications.js";
 
 const router = Router();
 
@@ -876,6 +879,11 @@ router.post(
 
     void (async () => {
       try {
+        // Complimentary bookings stay silent — no staff notification, no
+        // guest/owner WhatsApp. They live only in the Complimentary
+        // report. (A booking created directly as complimentary is rare
+        // but the guard covers it.)
+        if (createdReservation.bookingSource === "complimentary") return;
         const [g] = await db
           .select()
           .from(guests)
@@ -1379,6 +1387,9 @@ router.post(
 
     void (async () => {
       try {
+        // Complimentary bookings are silent everywhere — skip check-in
+        // notification + guest/owner WhatsApp.
+        if (r[0]!.bookingSource === "complimentary") return;
         const [g] = await db.select().from(guests).where(eq(guests.id, r[0]!.guestId)).limit(1);
         const roomNumbers = (
           await db
@@ -1845,6 +1856,8 @@ async function handlePerRoomCheckout(args: {
   // loops over every invoice we just issued.
   void (async () => {
     try {
+      // Complimentary bookings: no checkout notification / WhatsApp.
+      if (r.bookingSource === "complimentary") return;
       const settingsCo = await getSettings();
       const invoiceLinks: string[] = [];
       for (const issued of issuedInvoices) {
@@ -2314,6 +2327,8 @@ router.post(
 
     void (async () => {
       try {
+        // Complimentary bookings: no checkout notification / WhatsApp.
+        if (r[0]!.bookingSource === "complimentary") return;
         const [g] = await db.select().from(guests).where(eq(guests.id, r[0]!.guestId)).limit(1);
 
         // Generate invoice PDF and upload for public link
@@ -2516,6 +2531,14 @@ router.post(
         updatedAt: new Date(),
       })
       .where(eq(reservations.id, id));
+
+    // Wipe any in-app notifications this booking already generated
+    // BEFORE it was comped (new booking / check-in / check-out alerts).
+    // The reservation id lives in the notification's JSONB payload.
+    // Going comp means going silent retroactively too.
+    await db
+      .delete(notifications)
+      .where(sql`${notifications.payload}->>'reservationId' = ${id}`);
 
     await logActivity({
       action: "reservation_made_complimentary",
@@ -2785,24 +2808,27 @@ router.post(
         refundMode,
       },
     });
-    try {
-      const cancelledRooms = await getReservationRoomNumbers(id);
-      const [cancelGuest] = await db
-        .select({ fullName: guests.fullName })
-        .from(guests)
-        .where(eq(guests.id, r[0]!.guestId))
-        .limit(1);
-      const moneyBits = descBits.slice(1);
-      await dispatchNotification({
-        type: "reservation_cancelled",
-        title: "Reservation cancelled",
-        body: `${r[0]!.reservationNumber} · ${cancelGuest?.fullName ?? "Guest"}${cancelledRooms ? ` · Room ${cancelledRooms}` : ""} — ${cancellationReason}${moneyBits.length ? ` · ${moneyBits.join(" · ")}` : ""}`,
-        href: `/reservations/${id}`,
-        payload: { reservationId: id },
-        recipientRoles: ["admin", "frontdesk", "housekeeping"],
-      });
-    } catch (err) {
-      logger.warn({ err, reservationId: id }, "cancel notification failed");
+    // Complimentary bookings stay silent — no cancellation notification.
+    if (r[0]!.bookingSource !== "complimentary") {
+      try {
+        const cancelledRooms = await getReservationRoomNumbers(id);
+        const [cancelGuest] = await db
+          .select({ fullName: guests.fullName })
+          .from(guests)
+          .where(eq(guests.id, r[0]!.guestId))
+          .limit(1);
+        const moneyBits = descBits.slice(1);
+        await dispatchNotification({
+          type: "reservation_cancelled",
+          title: "Reservation cancelled",
+          body: `${r[0]!.reservationNumber} · ${cancelGuest?.fullName ?? "Guest"}${cancelledRooms ? ` · Room ${cancelledRooms}` : ""} — ${cancellationReason}${moneyBits.length ? ` · ${moneyBits.join(" · ")}` : ""}`,
+          href: `/reservations/${id}`,
+          payload: { reservationId: id },
+          recipientRoles: ["admin", "frontdesk", "housekeeping"],
+        });
+      } catch (err) {
+        logger.warn({ err, reservationId: id }, "cancel notification failed");
+      }
     }
     await invalidateDashboard();
     return ok(res, {
@@ -2902,23 +2928,26 @@ router.post(
     });
     // No-show releases rooms exactly like a cancellation — reuse the
     // cancelled notification type (red badge); the title disambiguates.
-    try {
-      const nsRooms = await getReservationRoomNumbers(id);
-      const [nsGuest] = await db
-        .select({ fullName: guests.fullName })
-        .from(guests)
-        .where(eq(guests.id, r[0]!.guestId))
-        .limit(1);
-      await dispatchNotification({
-        type: "reservation_cancelled",
-        title: "No-show",
-        body: `${r[0]!.reservationNumber} · ${nsGuest?.fullName ?? "Guest"}${nsRooms ? ` · Room ${nsRooms}` : ""} — ${note}${forfeitedAdvance > 0 ? ` · ₹${forfeitedAdvance.toFixed(2)} advance forfeited` : ""}`,
-        href: `/reservations/${id}`,
-        payload: { reservationId: id },
-        recipientRoles: ["admin", "frontdesk", "housekeeping"],
-      });
-    } catch (err) {
-      logger.warn({ err, reservationId: id }, "no-show notification failed");
+    // Complimentary bookings stay silent.
+    if (r[0]!.bookingSource !== "complimentary") {
+      try {
+        const nsRooms = await getReservationRoomNumbers(id);
+        const [nsGuest] = await db
+          .select({ fullName: guests.fullName })
+          .from(guests)
+          .where(eq(guests.id, r[0]!.guestId))
+          .limit(1);
+        await dispatchNotification({
+          type: "reservation_cancelled",
+          title: "No-show",
+          body: `${r[0]!.reservationNumber} · ${nsGuest?.fullName ?? "Guest"}${nsRooms ? ` · Room ${nsRooms}` : ""} — ${note}${forfeitedAdvance > 0 ? ` · ₹${forfeitedAdvance.toFixed(2)} advance forfeited` : ""}`,
+          href: `/reservations/${id}`,
+          payload: { reservationId: id },
+          recipientRoles: ["admin", "frontdesk", "housekeeping"],
+        });
+      } catch (err) {
+        logger.warn({ err, reservationId: id }, "no-show notification failed");
+      }
     }
     await invalidateDashboard();
     return ok(res, { success: true, forfeitedAdvance });
@@ -5437,6 +5466,167 @@ const perRoomCheckoutSchema = z.object({
   paymentNotes: z.string().max(500).optional(),
 });
 
+// Auto-consolidate per-room invoices into ONE combined invoice when a
+// multi-room stay finishes via per-room checkout. Called at roll-up
+// (the last room just checked out). Goal: every completed stay ends
+// with a single combined tax invoice, from which per-room *bills* can
+// be printed — instead of N separate per-room invoices and no combined
+// one (the dead-end where the per-room-bill buttons can't appear).
+//
+// SAFETY: only runs when every live per-room invoice is FULLY PAID. A
+// fully-paid set means consolidation is pure bookkeeping — void the
+// equal paid per-room invoices, issue one combined invoice for the same
+// total, move the payments onto it. No credit notes, no partial-payment
+// edge cases, no money moved. If anything is unpaid/partial we leave the
+// per-room invoices as they are (staff can still collect on them).
+//
+// Returns the new combined invoice number, or null if no consolidation
+// happened. Must run inside the caller's transaction.
+async function autoConsolidatePerRoomInvoices(
+  tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
+  reservationId: string,
+  issuedBy: string,
+): Promise<string | null> {
+  const [resv] = await tx
+    .select()
+    .from(reservations)
+    .where(eq(reservations.id, reservationId))
+    .limit(1);
+  if (!resv) return null;
+
+  // Live, ordinary invoices on this reservation (exclude voided +
+  // credit notes).
+  const liveInvoices = await tx
+    .select()
+    .from(invoices)
+    .where(
+      and(
+        eq(invoices.reservationId, reservationId),
+        ne(invoices.status, "voided"),
+        eq(invoices.documentType, "invoice"),
+      ),
+    )
+    .orderBy(asc(invoices.createdAt));
+
+  // Need 2+ live PER-ROOM invoices to consolidate. If there's already a
+  // combined one, or fewer than 2 room invoices, nothing to do.
+  const roomScoped = liveInvoices.filter((i) => i.scope === "room");
+  const hasCombined = liveInvoices.some((i) => i.scope === "combined");
+  if (hasCombined || roomScoped.length < 2) return null;
+
+  // Only consolidate when EVERY live invoice is fully paid — keeps this
+  // a no-money bookkeeping merge (see SAFETY note above).
+  const allFullyPaid = liveInvoices.every(
+    (i) => Number(i.balanceDue) <= 0.009 && Number(i.totalPaid) > 0.009,
+  );
+  if (!allFullyPaid) return null;
+
+  // Build the combined invoice across every non-cancelled room, exactly
+  // like the manual combined-invoice path.
+  const [allResRooms, allCharges, settings] = await Promise.all([
+    tx
+      .select({ rr: reservationRooms, room: rooms })
+      .from(reservationRooms)
+      .innerJoin(rooms, eq(rooms.id, reservationRooms.roomId))
+      .where(eq(reservationRooms.reservationId, reservationId)),
+    tx.select().from(additionalCharges).where(eq(additionalCharges.reservationId, reservationId)),
+    getSettings(),
+  ]);
+  const scopeRooms = allResRooms.filter((x) => x.rr.status !== "cancelled");
+  if (scopeRooms.length < 2) return null;
+  const labelMap = await buildRoomTypeLabelMap();
+  const [booker] = await tx
+    .select()
+    .from(guests)
+    .where(eq(guests.id, resv.guestId))
+    .limit(1);
+  if (!booker) return null;
+
+  const built = buildInvoice({
+    reservation: {
+      stayType: resv.stayType,
+      durationHours: resv.durationHours,
+      checkInDate: resv.checkInDate,
+      checkOutDate: resv.checkOutDate,
+      numNights: resv.numNights,
+      gstRate: resv.gstRate,
+      gstMode: resv.gstMode,
+    },
+    rooms: scopeRooms.map((x) => ({ ...x.rr, room: x.room })) as never,
+    charges: allCharges,
+    labelMap,
+  });
+  const cgstRate = +(built.roomGstRate / 2).toFixed(2);
+  const sgstRate = +(built.roomGstRate / 2).toFixed(2);
+  const invoiceSeq = await nextInvoiceSequence(`SLDT-INV-%`, tx);
+  const invNumber = invoiceNumber(settings.invoicePrefix, invoiceSeq);
+  const replaced = roomScoped.map((i) => i.invoiceNumber).join(", ");
+  const [combined] = await tx
+    .insert(invoices)
+    .values({
+      invoiceNumber: invNumber,
+      propertyId: resv.propertyId,
+      reservationId,
+      guestId: booker.id,
+      hotelName: settings.hotelName,
+      hotelAddress: settings.hotelAddress,
+      hotelGstin: settings.hotelGstin,
+      guestName: booker.fullName,
+      guestAddress: booker.address ?? null,
+      guestGstin: booker.gstin ?? null,
+      subtotal: String(built.subtotal),
+      cgstRate: String(cgstRate),
+      cgstAmount: String(built.cgst),
+      sgstRate: String(sgstRate),
+      sgstAmount: String(built.sgst),
+      grandTotal: String(built.grandTotal),
+      walletCreditApplied: "0.00",
+      totalPaid: "0.00",
+      balanceDue: String(built.grandTotal),
+      status: "issued",
+      scope: "combined" as const,
+      scopeRoomIds: scopeRooms.map((x) => x.room.id),
+      issuedBy,
+      notes: `Auto-consolidated from ${replaced} at checkout`,
+    })
+    .returning();
+  await tx
+    .insert(invoiceLineItems)
+    .values(built.lineItems.map((li) => ({ invoiceId: combined!.id, ...li })));
+
+  // Move the paid per-room invoices' payments onto the combined one,
+  // void the per-room invoices, and relink every room to the combined.
+  const roomInvoiceIds = roomScoped.map((i) => i.id);
+  await tx
+    .update(payments)
+    .set({ invoiceId: combined!.id })
+    .where(
+      and(
+        eq(payments.reservationId, reservationId),
+        inArray(payments.invoiceId, roomInvoiceIds),
+      ),
+    );
+  await tx
+    .update(invoices)
+    .set({
+      status: "voided",
+      voidedReason: `Consolidated into ${invNumber} at checkout`,
+      voidedBy: issuedBy,
+      balanceDue: "0.00",
+      updatedAt: new Date(),
+    })
+    .where(inArray(invoices.id, roomInvoiceIds));
+  await tx
+    .update(reservationRooms)
+    .set({ invoiceId: combined!.id })
+    .where(eq(reservationRooms.reservationId, reservationId));
+
+  // Recompute the combined invoice's cached totals from the payments now
+  // attached to it.
+  await recomputeInvoiceTotals(tx, reservationId);
+  return invNumber;
+}
+
 router.post(
   "/:id/rooms/:roomId/check-out",
   requireAuth,
@@ -5600,6 +5790,9 @@ router.post(
     const now = new Date();
     let issuedInvoiceId: string | null = rr.invoiceId;
     let issuedInvoiceNumber: string | null = null;
+    // Set when the final checkout merges per-room invoices into one
+    // combined invoice (see autoConsolidatePerRoomInvoices).
+    let consolidatedInvoiceNumber: string | null = null;
 
     await db.transaction(async (tx) => {
       // 1. Issue the per-room invoice if it doesn't exist yet. The
@@ -5696,7 +5889,8 @@ router.post(
       const stillActive = siblings.some(
         (s) => s.status === "confirmed" || s.status === "checked_in",
       );
-      if (!stillActive && resv.status !== "checked_out") {
+      const reservationNowComplete = !stillActive && resv.status !== "checked_out";
+      if (reservationNowComplete) {
         await tx
           .update(reservations)
           .set({
@@ -5724,6 +5918,17 @@ router.post(
       if (issuedInvoiceId) {
         await attachOrphanPaymentsAndRecompute(tx, id, issuedInvoiceId);
       }
+      // When the last room just checked out and the per-room invoices
+      // are all fully paid, merge them into ONE combined invoice so the
+      // completed stay carries a single tax invoice (per-room *bills*
+      // print from it). Safe no-money bookkeeping; no-op otherwise.
+      if (reservationNowComplete) {
+        consolidatedInvoiceNumber = await autoConsolidatePerRoomInvoices(
+          tx,
+          id,
+          req.user!.id,
+        );
+      }
       await recomputeReservationBalance(tx, id);
     });
 
@@ -5748,6 +5953,9 @@ router.post(
       status: "checked_out" as const,
       invoiceId: issuedInvoiceId,
       invoiceNumber: issuedInvoiceNumber,
+      // Present when this was the final room and per-room invoices were
+      // merged into one combined invoice.
+      consolidatedInvoiceNumber,
       grandTotal,
     });
   },
@@ -6058,9 +6266,19 @@ router.post(
 //      payments across the new shape (proportional split, room hint
 //      preferred), then recompute reservation totals.
 //
-// Paid invoices ARE convertible — paid status doesn't lock the
-// invoice for void+reissue (only for in-place edits). The audit
-// trail keeps the originals intact for tax purposes.
+// Works from ANY starting shape — all per-room, all combined, or a
+// MIXED reservation (some rooms invoiced per-room, others on a combined
+// invoice). The reissue always rebuilds the chosen shape across every
+// non-cancelled room, so a mixed state normalises to a clean uniform
+// one. Refused only when there's nothing meaningful to do, or when
+// money has been recorded against a live invoice (see guard below).
+//
+// MONEY GUARD: reissue voids the live invoices. Voiding an invoice that
+// already has a payment recorded against it means cancelling a tax
+// document the guest has partly/fully settled — that needs a credit
+// note, not a silent void. So we block reissue when ANY live invoice
+// has totalPaid > 0 (partial OR paid). Reorganise bills BEFORE
+// collecting; once money is on a bill, void + credit-note manually.
 router.post(
   "/:id/convert-invoices",
   requireAuth,
@@ -6077,13 +6295,29 @@ router.post(
       .limit(1);
     if (!resv) return fail(res, 404, "NOT_FOUND", "Reservation not found");
 
-    const liveInvoices = await db
+    // Live ORDINARY invoices only — exclude voided ones and credit
+    // notes. A credit note is a reversal document (negative totals,
+    // never holds a payment); pulling them into this set corrupted the
+    // "all fully paid?" classification and let a second reissue
+    // credit-note its own credit notes, double-billing the stay.
+    const allLiveDocs = await db
       .select()
       .from(invoices)
       .where(
         and(eq(invoices.reservationId, id), ne(invoices.status, "voided")),
       )
       .orderBy(asc(invoices.createdAt));
+    // Originals already reversed by a live credit note are spent — they
+    // must not be reissued again.
+    const reversedOriginalIds = new Set(
+      allLiveDocs
+        .filter((i) => i.documentType === "credit_note" && i.creditNoteFor)
+        .map((i) => i.creditNoteFor as string),
+    );
+    const liveInvoices = allLiveDocs.filter(
+      (i) =>
+        i.documentType !== "credit_note" && !reversedOriginalIds.has(i.id),
+    );
 
     if (liveInvoices.length === 0) {
       return fail(
@@ -6094,46 +6328,124 @@ router.post(
       );
     }
 
-    // Direction validation: each target mode needs a starting shape
-    // that's clearly the opposite, otherwise the conversion is a
-    // no-op or ambiguous.
-    if (input.mode === "combined") {
-      const liveRoomScoped = liveInvoices.filter((i) => i.scope === "room");
-      if (liveRoomScoped.length < 2) {
+    // Classify the reissue by how settled the live invoices are:
+    //
+    //   • useCreditNotes = false (void path): no live invoice has any
+    //     payment. Safe to simply void + reissue.
+    //   • useCreditNotes = true (credit-note path): every live invoice is
+    //     FULLY paid (balance ~0). The originals are reversed with GST
+    //     credit notes (kept on file, not voided), the payment is moved
+    //     to the new invoices, and the new ones come out paid. This is
+    //     the "guest already paid a combined bill, now needs per-room
+    //     GST invoices for their office" case.
+    //
+    // Anything in between — a PARTIALLY paid invoice, or a mix of paid
+    // and unpaid live invoices — is refused: those need the desk to
+    // either finish collecting or refund first, because a credit note
+    // reverses a settled document, not a half-paid one.
+    const anyPayment = liveInvoices.some((i) => Number(i.totalPaid) > 0.009);
+    const allFullyPaid = liveInvoices.every(
+      (i) => Number(i.balanceDue) <= 0.009 && Number(i.totalPaid) > 0.009,
+    );
+    const useCreditNotes = anyPayment;
+    if (anyPayment && !allFullyPaid) {
+      return fail(
+        res,
+        409,
+        "INVOICE_PARTIALLY_PAID",
+        "Some invoices are partly paid. Finish collecting (or refund) so every bill is fully settled, then reissue with credit notes — a credit note can only reverse a fully-settled invoice.",
+      );
+    }
+
+    // Integrity guard for the credit-note path. The reissue detaches the
+    // payments on `liveInvoices` and reattaches them to the new ones, so
+    // those invoices must hold ALL of the reservation's received money.
+    // If money is sitting on an invoice NOT in this set (a stray bill
+    // from an earlier botched reissue), proceeding would silently move
+    // the wrong amount and double-bill the stay — exactly the tangle we
+    // just repaired. Refuse loudly instead.
+    if (useCreditNotes) {
+      const liveIds = liveInvoices.map((i) => i.id);
+      const [resvPaid] = await db
+        .select({ total: sql<string>`COALESCE(SUM(${payments.amount}), 0)::text` })
+        .from(payments)
+        .where(
+          and(
+            eq(payments.reservationId, id),
+            eq(payments.voided, false),
+            eq(payments.status, "received"),
+          ),
+        );
+      const [onLive] = await db
+        .select({ total: sql<string>`COALESCE(SUM(${payments.amount}), 0)::text` })
+        .from(payments)
+        .where(
+          and(
+            eq(payments.reservationId, id),
+            eq(payments.voided, false),
+            eq(payments.status, "received"),
+            liveIds.length > 0
+              ? inArray(payments.invoiceId, liveIds)
+              : sql`false`,
+          ),
+        );
+      if (Math.abs(Number(resvPaid?.total ?? 0) - Number(onLive?.total ?? 0)) > 0.009) {
         return fail(
           res,
           409,
-          "NOTHING_TO_CONSOLIDATE",
-          "Need at least 2 per-room invoices to consolidate into a combined invoice.",
+          "PAYMENT_NOT_ON_LIVE_INVOICES",
+          "Some of this reservation's payments are on an invoice that isn't part of this reissue. Resolve the invoices so all paid money sits on the current bills before reissuing.",
         );
       }
-      const anyCombined = liveInvoices.some((i) => i.scope === "combined");
-      if (anyCombined) {
+    }
+
+    // Count distinct non-cancelled rooms that WOULD be billed. With
+    // fewer than 2, per-room and combined are identical — nothing to
+    // convert either way.
+    const billableRoomCount = new Set(
+      (
+        await db
+          .select({ roomId: reservationRooms.roomId })
+          .from(reservationRooms)
+          .where(
+            and(
+              eq(reservationRooms.reservationId, id),
+              ne(reservationRooms.status, "cancelled"),
+            ),
+          )
+      ).map((x) => x.roomId),
+    ).size;
+    if (billableRoomCount < 2) {
+      return fail(
+        res,
+        409,
+        "NOT_MULTI_ROOM",
+        "Reissue needs at least 2 rooms — a single-room booking has only one possible bill.",
+      );
+    }
+
+    // No-op guard: refuse when the reservation is ALREADY in the target
+    // shape and uniform (so combine→combine / split→split do nothing).
+    // A mixed state is never uniform, so it always passes — that's the
+    // case the old rigid gates couldn't handle.
+    if (input.mode === "combined") {
+      const allCombined = liveInvoices.every((i) => i.scope === "combined");
+      if (allCombined && liveInvoices.length === 1) {
         return fail(
           res,
           409,
           "ALREADY_COMBINED",
-          "A combined invoice already exists on this reservation. Void it first if you want to redo the consolidation.",
+          "This reservation is already on a single combined invoice.",
         );
       }
     } else {
-      const liveCombined = liveInvoices.filter(
-        (i) => i.scope === "combined",
-      );
-      if (liveCombined.length !== 1) {
+      const allRoomScoped = liveInvoices.every((i) => i.scope === "room");
+      if (allRoomScoped) {
         return fail(
           res,
           409,
-          "NEED_EXACTLY_ONE_COMBINED",
-          "Splitting into per-room invoices requires exactly one live combined invoice.",
-        );
-      }
-      if ((liveCombined[0]!.scopeRoomIds ?? []).length < 2) {
-        return fail(
-          res,
-          409,
-          "NOT_MULTI_ROOM",
-          "Combined invoice covers fewer than 2 rooms — nothing to split.",
+          "ALREADY_PER_ROOM",
+          "Every room already has its own per-room invoice.",
         );
       }
     }
@@ -6167,7 +6479,9 @@ router.post(
     }
 
     const newInvoiceNumbers: string[] = [];
-    const voidedInvoiceNumbers = liveInvoices.map((i) => i.invoiceNumber);
+    // The originals being replaced — voided (void path) or reversed by a
+    // credit note (credit-note path).
+    const replacedInvoiceNumbers = liveInvoices.map((i) => i.invoiceNumber);
 
     await db.transaction(async (tx) => {
       // 1. Detach payments from the voided invoices so they're orphan
@@ -6237,7 +6551,7 @@ router.post(
             scope: "combined" as const,
             scopeRoomIds,
             issuedBy: req.user!.id,
-            notes: `Consolidated from ${voidedInvoiceNumbers.join(", ")}`,
+            notes: `Consolidated from ${replacedInvoiceNumbers.join(", ")}`,
           })
           .returning();
         await tx
@@ -6319,7 +6633,7 @@ router.post(
               scope: "room" as const,
               scopeRoomIds: [x.room.id],
               issuedBy: req.user!.id,
-              notes: `Split from ${voidedInvoiceNumbers.join(", ")}`,
+              notes: `Split from ${replacedInvoiceNumbers.join(", ")}`,
             })
             .returning();
           await tx
@@ -6336,20 +6650,100 @@ router.post(
         }
       }
 
-      // 3. Void the originals AFTER the new ones are issued, so the
-      //    successor numbers can be cited in the void reason.
+      // 3. Reverse the originals AFTER the new ones are issued, so the
+      //    successor numbers can be cited.
       const successorList = newInvoiceNumbers.join(", ");
-      for (const old of liveInvoices) {
-        await tx
-          .update(invoices)
-          .set({
-            status: "voided",
-            voidedReason: `Converted to ${successorList}`,
-            voidedBy: req.user!.id,
-            balanceDue: "0.00",
-            updatedAt: new Date(),
-          })
-          .where(eq(invoices.id, old.id));
+      if (!useCreditNotes) {
+        // Void path — no money on the originals, just mark them voided.
+        for (const old of liveInvoices) {
+          await tx
+            .update(invoices)
+            .set({
+              status: "voided",
+              voidedReason: `Reissued as ${successorList}`,
+              voidedBy: req.user!.id,
+              balanceDue: "0.00",
+              updatedAt: new Date(),
+            })
+            .where(eq(invoices.id, old.id));
+        }
+      } else {
+        // Credit-note path — the originals are PAID and stay valid on
+        // file. Issue a GST credit note reversing each one (negative
+        // money columns, same hotel/guest snapshot, document_type =
+        // credit_note, credit_note_for = the original). The original's
+        // status stays 'paid'; the credit note nets it on the GST
+        // return. The payment already detached in step 1 reattaches to
+        // the new invoices below.
+        for (const old of liveInvoices) {
+          const cnSeq = await nextCreditNoteSequence(tx);
+          const cnNumber = creditNoteNumber(cnSeq);
+          const [cnRow] = await tx
+            .insert(invoices)
+            .values({
+              invoiceNumber: cnNumber,
+              propertyId: old.propertyId,
+              reservationId: id,
+              guestId: old.guestId,
+              hotelName: old.hotelName,
+              hotelAddress: old.hotelAddress,
+              hotelGstin: old.hotelGstin,
+              guestName: old.guestName,
+              guestAddress: old.guestAddress,
+              guestGstin: old.guestGstin,
+              // Negative mirrors so the credit note nets against the
+              // original on every money surface.
+              subtotal: String(-Number(old.subtotal)),
+              cgstRate: old.cgstRate,
+              cgstAmount: String(-Number(old.cgstAmount)),
+              sgstRate: old.sgstRate,
+              sgstAmount: String(-Number(old.sgstAmount)),
+              grandTotal: String(-Number(old.grandTotal)),
+              walletCreditApplied: "0.00",
+              totalPaid: "0.00",
+              balanceDue: "0.00",
+              status: "issued",
+              documentType: "credit_note",
+              creditNoteFor: old.id,
+              scope: old.scope,
+              scopeRoomIds: old.scopeRoomIds,
+              issuedBy: req.user!.id,
+              notes: `Credit note reversing ${old.invoiceNumber} — reissued as ${successorList}`,
+            })
+            .returning();
+          // Mirror the original's line items as negatives so the credit
+          // note PDF itemises exactly what it reverses.
+          const oldItems = await tx
+            .select()
+            .from(invoiceLineItems)
+            .where(eq(invoiceLineItems.invoiceId, old.id));
+          if (oldItems.length > 0) {
+            await tx.insert(invoiceLineItems).values(
+              oldItems.map((li) => ({
+                invoiceId: cnRow!.id,
+                description: li.description,
+                sacCode: li.sacCode,
+                quantity: li.quantity,
+                rate: String(-Number(li.rate)),
+                amount: String(-Number(li.amount)),
+                gstRate: li.gstRate,
+                gstAmount: String(-Number(li.gstAmount)),
+                itemType: li.itemType,
+              })),
+            );
+          }
+          // Stamp the original so the UI can pair it with its credit note
+          // and collapse the reversed pair behind a toggle.
+          await tx
+            .update(invoices)
+            .set({
+              notes: old.notes
+                ? `${old.notes} · Reversed by ${cnNumber}; reissued as ${successorList}`
+                : `Reversed by ${cnNumber}; reissued as ${successorList}`,
+              updatedAt: new Date(),
+            })
+            .where(eq(invoices.id, old.id));
+        }
       }
 
       // 4. Redistribute the now-orphan payments across the new
@@ -6367,20 +6761,24 @@ router.post(
       entityType: "reservation",
       entityId: id,
       description:
-        `${resv.reservationNumber}: invoices converted to ${input.mode} — ` +
-        `voided ${voidedInvoiceNumbers.join(", ")}, issued ${newInvoiceNumbers.join(", ")}`,
+        `${resv.reservationNumber}: invoices reissued as ${input.mode} — ` +
+        `${useCreditNotes ? "credit-noted" : "voided"} ${replacedInvoiceNumbers.join(", ")}, issued ${newInvoiceNumbers.join(", ")}`,
       performedBy: req.user!.id,
       ipAddress: req.ip,
       metadata: {
         mode: input.mode,
-        voidedInvoiceNumbers,
+        method: useCreditNotes ? "credit_note" : "void",
+        replacedInvoiceNumbers,
         newInvoiceNumbers,
       },
     });
     await invalidateDashboard();
     return ok(res, {
       mode: input.mode,
-      voidedInvoiceNumbers,
+      method: useCreditNotes ? "credit_note" : "void",
+      // Back-compat: the web onSuccess reads voidedInvoiceNumbers.
+      voidedInvoiceNumbers: replacedInvoiceNumbers,
+      replacedInvoiceNumbers,
       newInvoiceNumbers,
     });
   },

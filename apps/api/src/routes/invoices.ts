@@ -36,6 +36,14 @@ router.get("/", requireAuth, requirePermission("view_invoices"), async (req, res
   const per_page = Math.min(100, Math.max(1, Number(req.query.per_page ?? 25)));
 
   const conditions = [];
+  // Invoices belonging to complimentary reservations are hidden from
+  // the Invoices page — they live only in the Complimentary report.
+  conditions.push(
+    sql`NOT EXISTS (
+      SELECT 1 FROM ${reservations} rc
+      WHERE rc.id = ${invoices.reservationId}
+        AND rc.booking_source = 'complimentary')`,
+  );
   if (status) conditions.push(eq(invoices.status, status as never));
   if (date_from) conditions.push(gte(invoices.createdAt, propertyDayStart(date_from)));
   if (date_to) conditions.push(lte(invoices.createdAt, propertyDayEnd(date_to)));
@@ -107,6 +115,13 @@ router.get("/summary", requireAuth, requirePermission("view_invoices"), async (r
   >;
 
   const conditions = [];
+  // Comp invoices are hidden from the Invoices page (see GET / above).
+  conditions.push(
+    sql`NOT EXISTS (
+      SELECT 1 FROM ${reservations} rc
+      WHERE rc.id = ${invoices.reservationId}
+        AND rc.booking_source = 'complimentary')`,
+  );
   if (status) conditions.push(eq(invoices.status, status as never));
   if (date_from) conditions.push(gte(invoices.createdAt, propertyDayStart(date_from)));
   if (date_to) conditions.push(lte(invoices.createdAt, propertyDayEnd(date_to)));
@@ -171,6 +186,13 @@ router.get("/export", requireAuth, requirePermission("view_invoices"), async (re
   >;
 
   const conditions = [];
+  // Comp invoices are hidden from the export too (see GET / above).
+  conditions.push(
+    sql`NOT EXISTS (
+      SELECT 1 FROM ${reservations} rc
+      WHERE rc.id = ${invoices.reservationId}
+        AND rc.booking_source = 'complimentary')`,
+  );
   if (status) conditions.push(eq(invoices.status, status as never));
   if (date_from) conditions.push(gte(invoices.createdAt, propertyDayStart(date_from)));
   if (date_to) conditions.push(lte(invoices.createdAt, propertyDayEnd(date_to)));
@@ -562,6 +584,137 @@ router.get("/:id/pdf", requireAuth, requirePermission("view_invoices"), async (r
   );
   return res.send(pdf);
 });
+
+// ---- Room-wise bill splits (money/paperwork split) --------------------
+// A combined tax invoice is the single money/GST record for the stay.
+// These endpoints render PRESENTATION-ONLY per-room bills from it, for
+// guests who want a room-by-room breakdown (e.g. a company splitting
+// cost). They create no DB rows, no new invoice numbers, no GST — they
+// just re-cut the parent invoice's line items by room.
+
+// Which rooms can this invoice be split into? Derived from its
+// room_charge line items (each names "Room <number> - …").
+router.get(
+  "/:id/room-bill-options",
+  requireAuth,
+  requirePermission("view_invoices"),
+  async (req, res) => {
+    const id = req.params.id!;
+    const inv = await db.select().from(invoices).where(eq(invoices.id, id)).limit(1);
+    if (!inv.length) return fail(res, 404, "NOT_FOUND", "Invoice not found");
+    const items = await db
+      .select()
+      .from(invoiceLineItems)
+      .where(eq(invoiceLineItems.invoiceId, id));
+    const roomNumbers = Array.from(
+      new Set(
+        items
+          .map((li) => li.description.match(/^Room (\S+)/i)?.[1])
+          .filter((n): n is string => !!n),
+      ),
+    );
+    return ok(res, {
+      invoiceNumber: inv[0]!.invoiceNumber,
+      roomNumbers,
+      // Splitting only makes sense for a multi-room bill.
+      splittable: roomNumbers.length >= 2,
+    });
+  },
+);
+
+// Render ONE room's presentation bill from the parent invoice.
+router.get(
+  "/:id/room-bill/:roomNumber/pdf",
+  requireAuth,
+  requirePermission("view_invoices"),
+  async (req, res) => {
+    const id = req.params.id!;
+    const roomNumber = req.params.roomNumber!;
+    const inv = await db.select().from(invoices).where(eq(invoices.id, id)).limit(1);
+    if (!inv.length) return fail(res, 404, "NOT_FOUND", "Invoice not found");
+    const invoice = inv[0]!;
+
+    const [allItems, [resRow]] = await Promise.all([
+      db.select().from(invoiceLineItems).where(eq(invoiceLineItems.invoiceId, id)),
+      db.select().from(reservations).where(eq(reservations.id, invoice.reservationId)).limit(1),
+    ]);
+
+    // This room's lines = its room_charge line(s). Reservation-wide
+    // additional charges (no room in the description) stay on the parent
+    // invoice only — we don't arbitrarily assign shared charges to one
+    // room's split.
+    const roomItems = allItems.filter((li) => {
+      const m = li.description.match(/^Room (\S+)/i);
+      return m?.[1] === roomNumber;
+    });
+    if (roomItems.length === 0) {
+      return fail(
+        res,
+        404,
+        "ROOM_NOT_ON_INVOICE",
+        `Room ${roomNumber} has no charges on ${invoice.invoiceNumber}.`,
+      );
+    }
+
+    // Recompute this room's totals from its own lines. GST split CGST/SGST
+    // half-and-half, mirroring how the parent invoice was built.
+    const subtotal = +roomItems.reduce((s, li) => s + Number(li.amount), 0).toFixed(2);
+    const totalGst = +roomItems.reduce((s, li) => s + Number(li.gstAmount), 0).toFixed(2);
+    const cgst = +(totalGst / 2).toFixed(2);
+    const sgst = +(totalGst - cgst).toFixed(2);
+    const grandTotal = +(subtotal + totalGst).toFixed(2);
+
+    // Synthetic invoice object — same shape the renderer expects, with
+    // this room's money. NOT persisted; purely for the PDF.
+    const roomInvoice: typeof invoice = {
+      ...invoice,
+      subtotal: String(subtotal),
+      cgstAmount: String(cgst),
+      sgstAmount: String(sgst),
+      grandTotal: String(grandTotal),
+      // A presentation split shows no payment ledger / balance of its
+      // own — the money lives on the parent invoice.
+      totalPaid: "0.00",
+      walletCreditApplied: "0.00",
+      balanceDue: "0.00",
+    };
+
+    const settings = await getSettings();
+    const guestExtra = await loadGuestExtra(invoice.reservationId);
+    const pdf = await renderInvoicePdf({
+      invoice: roomInvoice,
+      lineItems: roomItems,
+      payments: [], // no payment table on a split
+      settings,
+      stay: resRow
+        ? {
+            checkInDate: resRow.checkInDate,
+            checkOutDate: resRow.checkOutDate,
+            numNights: Number(resRow.numNights),
+            checkedInAt: resRow.checkedInAt ? resRow.checkedInAt.toISOString() : null,
+            plannedCheckInAt: resRow.plannedCheckInAt
+              ? resRow.plannedCheckInAt.toISOString()
+              : null,
+            plannedCheckOutAt: resRow.plannedCheckOutAt
+              ? resRow.plannedCheckOutAt.toISOString()
+              : null,
+          }
+        : undefined,
+      guestExtra,
+      roomBill: {
+        roomLabel: `Room ${roomNumber}`,
+        parentInvoiceNumber: invoice.invoiceNumber,
+      },
+    });
+    const inline = req.query.disposition === "inline";
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `${inline ? "inline" : "attachment"}; filename="${invoice.invoiceNumber}-Room-${roomNumber}.pdf"`,
+    );
+    return res.send(pdf);
+  },
+);
 
 // Looks up other bookings that were settled at the same desk visit as
 // this reservation's check-out. The "Collect previous balance" flow

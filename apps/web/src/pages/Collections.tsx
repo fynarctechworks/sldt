@@ -287,7 +287,7 @@ export default function Collections() {
                 sub="Total balance per guest across every reservation and invoice."
                 count={filteredByGuest.length}
               />
-              <div className="card !p-0 overflow-hidden">
+              <div className="card !p-0 overflow-x-auto">
                 <table className="table-base">
                   <thead>
                     <tr>
@@ -355,7 +355,7 @@ export default function Collections() {
                 sub="Bookings with a balance that haven't been checked out / invoiced yet."
                 count={filteredPreInvoice.length}
               />
-              <div className="card !p-0 overflow-hidden">
+              <div className="card !p-0 overflow-x-auto">
                 <table className="table-base">
                   <thead>
                     <tr>
@@ -429,7 +429,7 @@ export default function Collections() {
                 sub="Bills already printed. Older than 7 days = warm; older than 30 = stale."
                 count={filteredInvoices.length}
               />
-              <div className="card !p-0 overflow-hidden">
+              <div className="card !p-0 overflow-x-auto">
                 <table className="table-base">
                   <thead>
                     <tr>
@@ -505,7 +505,7 @@ export default function Collections() {
                 sub="Specific amounts the guest promised at check-out. Mark each as received once the cash arrives."
                 count={filteredPending.length}
               />
-              <div className="card !p-0 overflow-hidden">
+              <div className="card !p-0 overflow-x-auto">
                 <table className="table-base">
                   <thead>
                     <tr>

@@ -5,6 +5,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { api } from "@/lib/api";
 import { ArrivalAlerts } from "./ArrivalAlerts";
+import { BottomNav } from "./BottomNav";
 import { CheckoutAlerts } from "./CheckoutAlerts";
 import { CommandPalette } from "./CommandPalette";
 import { Sidebar } from "./Sidebar";
@@ -203,9 +204,17 @@ export function AppShell({ children }: { children: ReactNode }) {
           <CheckoutAlerts />
           <ArrivalAlerts />
         </div>
-        {/* Main content padding tightens on mobile so cards aren't crammed. */}
-        <main className="p-3 sm:p-5 md:p-6">{children}</main>
+        {/* Main content padding tightens on mobile so cards aren't crammed.
+            Extra bottom padding on phone so the fixed bottom tab bar never
+            covers the last row of content (pb-safe handles the home
+            indicator). */}
+        <main className="p-3 pb-bottomnav sm:p-5 md:p-6 md:pb-6">{children}</main>
       </div>
+
+      {/* Phone-first bottom tab bar. Hidden on md+ (sidebar handles nav)
+          and in focus mode (content goes edge-to-edge). "More" opens the
+          same drawer the top hamburger uses. */}
+      {!focusMode && <BottomNav onMore={() => setMobileOpen(true)} />}
 
       {/* Focus-mode toggle. Floats over the bottom-right corner so it's
           always reachable on any page. Click toggles in-app focus mode
@@ -231,7 +240,9 @@ export function AppShell({ children }: { children: ReactNode }) {
                 bottom: "1rem",
               }
         }
-        className="fixed z-[60] grid place-items-center w-11 h-11 rounded-full bg-brand-dark text-cream shadow-lg ring-1 ring-brass/30 hover:bg-brand-mid hover:text-brass transition-[left] duration-200 ease-out"
+        // Hidden on phone (<md): focus mode is a desktop/projection
+        // feature, and the bottom tab bar owns that corner on mobile.
+        className="hidden md:grid fixed z-[60] place-items-center w-11 h-11 rounded-full bg-brand-dark text-cream shadow-lg ring-1 ring-brass/30 hover:bg-brand-mid hover:text-brass transition-[left] duration-200 ease-out"
         aria-label={focusMode ? "Exit focus mode" : "Enter focus mode"}
         title={
           focusMode

@@ -498,7 +498,14 @@ router.get(
         createdAt: reservations.createdAt,
       })
       .from(reservations)
-      .where(inArray(reservations.id, allIds))
+      .where(
+        and(
+          inArray(reservations.id, allIds),
+          // Complimentary stays don't appear in the guest's profile
+          // history — they're visible only in the Complimentary report.
+          sql`${reservations.bookingSource} <> 'complimentary'`,
+        ),
+      )
       .orderBy(desc(reservations.checkInDate), desc(reservations.createdAt));
 
     const roomRows = await db

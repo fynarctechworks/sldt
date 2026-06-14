@@ -43,6 +43,14 @@ export const invoices = pgTable("invoices", {
   totalPaid: numeric("total_paid", { precision: 10, scale: 2 }).notNull().default("0"),
   balanceDue: numeric("balance_due", { precision: 10, scale: 2 }).notNull(),
   status: text("status", { enum: INVOICE_STATUSES }).notNull().default("issued"),
+  // Migration 0042 — credit notes share this table. 'invoice' = an
+  // ordinary tax invoice; 'credit_note' = a GST credit note that
+  // reverses creditNoteFor. A credit note carries NEGATIVE money columns
+  // (subtotal/grandTotal/etc.) so it nets against the original.
+  documentType: text("document_type", { enum: ["invoice", "credit_note"] as const })
+    .notNull()
+    .default("invoice"),
+  creditNoteFor: uuid("credit_note_for"),
   notes: text("notes"),
   issueDate: date("issue_date"),
   reissuedFrom: uuid("reissued_from"),

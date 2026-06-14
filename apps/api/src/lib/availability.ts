@@ -309,6 +309,14 @@ export async function nextReceiptSequence(_like: string, exec: Exec = db): Promi
   return Number(row?.nextval ?? 0);
 }
 
+export async function nextCreditNoteSequence(exec: Exec = db): Promise<number> {
+  const result = await exec.execute<{ nextval: string | number }>(
+    sql`SELECT nextval('sldt_credit_note_seq') AS nextval`,
+  );
+  const row = result[0] as { nextval: string | number } | undefined;
+  return Number(row?.nextval ?? 0);
+}
+
 // Per-room advisory lock for double-booking prevention. Hold inside a tx
 // across the availability check and the insert.
 export async function lockRoom(exec: Exec, roomId: string): Promise<void> {

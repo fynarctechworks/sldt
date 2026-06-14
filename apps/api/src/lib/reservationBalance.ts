@@ -112,12 +112,18 @@ export async function recomputeInvoiceTotals(
       grandTotal: invoices.grandTotal,
       walletCreditApplied: invoices.walletCreditApplied,
       status: invoices.status,
+      documentType: invoices.documentType,
     })
     .from(invoices)
     .where(eq(invoices.reservationId, reservationId));
 
   for (const inv of invs) {
     if (inv.status === "voided") continue;
+    // Credit notes carry fixed negative totals (they mirror the invoice
+    // they reverse). They never hold payments, so recomputing their
+    // balance from payment rows would wrongly flip them to a positive
+    // balance. Leave them exactly as issued.
+    if (inv.documentType === "credit_note") continue;
     const [paid] = await tx
       .select({
         total: sql<string>`COALESCE(SUM(${payments.amount}), 0)::text`,
@@ -230,12 +236,32 @@ export async function attachOrphanPaymentsAndRecompute(
   // 2. Snapshot each invoice's owed amount (grand total minus what's
   //    already attached). Voided invoices are excluded. We work on a
   //    local copy so we can drain it as we allocate.
-  const invs = await tx
+  // Only ordinary invoices that still expect money are candidates for
+  // the orphan payment. Exclude:
+  //   • credit notes (negative reversal docs, never hold payments), and
+  //   • any invoice that HAS a credit note pointing at it — that
+  //     original is fully settled and being reversed; its payment was
+  //     just detached and must flow to the NEW invoices, not back here.
+  const reversedRows = await tx
+    .select({ id: invoices.creditNoteFor })
+    .from(invoices)
+    .where(
+      and(
+        eq(invoices.reservationId, reservationId),
+        eq(invoices.documentType, "credit_note"),
+        sql`${invoices.creditNoteFor} IS NOT NULL`,
+      ),
+    );
+  const reversedOriginalIds = new Set(
+    reversedRows.map((r) => r.id).filter((x): x is string => !!x),
+  );
+  const allInvs = await tx
     .select({
       id: invoices.id,
       grandTotal: invoices.grandTotal,
       walletCreditApplied: invoices.walletCreditApplied,
       scopeRoomIds: invoices.scopeRoomIds,
+      documentType: invoices.documentType,
     })
     .from(invoices)
     .where(
@@ -245,6 +271,9 @@ export async function attachOrphanPaymentsAndRecompute(
       ),
     )
     .orderBy(invoices.createdAt);
+  const invs = allInvs.filter(
+    (i) => i.documentType !== "credit_note" && !reversedOriginalIds.has(i.id),
+  );
 
   // Map "201" → invoice UUID so receipt notes that name a room can
   // route there directly. Built from invoices.scope_room_ids ⨯ rooms.

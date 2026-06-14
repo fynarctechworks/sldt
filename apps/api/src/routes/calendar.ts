@@ -63,6 +63,9 @@ router.get(
         and(
           lte(reservations.checkInDate, lastDay),
           gte(reservations.checkOutDate, firstDay),
+          // Complimentary bookings stay off the calendar — they're only
+          // visible in the Complimentary report.
+          sql`${reservations.bookingSource} <> 'complimentary'`,
         ),
       )
       .orderBy(reservations.checkInDate);

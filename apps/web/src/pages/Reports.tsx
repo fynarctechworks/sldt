@@ -1310,11 +1310,23 @@ function GstTab({ from, to }: { from: string; to: string }) {
           total: string;
           count: number;
         }[];
+        creditNotes?: {
+          count: number;
+          subtotal: string;
+          cgst: string;
+          sgst: string;
+          total: string;
+        };
       }>("/reports/gst-summary", { date_from: from, date_to: to }),
   });
   if (!data) return <Loader />;
 
-  const totals = data.byStatus.reduce(
+  const cn = data.creditNotes;
+  const hasCreditNotes = !!cn && cn.count > 0;
+  // Invoice subtotals already exclude credit notes (the API splits them
+  // out). NET = invoices + credit notes (the CN amounts are negative),
+  // which is the figure that actually gets filed.
+  const invTotals = data.byStatus.reduce(
     (acc, r) => ({
       subtotal: acc.subtotal + Number(r.subtotal),
       cgst: acc.cgst + Number(r.cgst),
@@ -1324,14 +1336,31 @@ function GstTab({ from, to }: { from: string; to: string }) {
     }),
     { subtotal: 0, cgst: 0, sgst: 0, total: 0, count: 0 },
   );
+  const totals = {
+    subtotal: invTotals.subtotal + Number(cn?.subtotal ?? 0),
+    cgst: invTotals.cgst + Number(cn?.cgst ?? 0),
+    sgst: invTotals.sgst + Number(cn?.sgst ?? 0),
+    total: invTotals.total + Number(cn?.total ?? 0),
+    count: invTotals.count,
+  };
 
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <Kpi label="Invoices" value={totals.count} Icon={Receipt} />
         <Kpi label="Subtotal" value={inr(totals.subtotal)} Icon={Wallet} />
-        <Kpi label="Tax (CGST + SGST)" value={inr(totals.cgst + totals.sgst)} Icon={Percent} />
-        <Kpi label="Grand total" value={inr(totals.total)} Icon={TrendingUp} tone="success" />
+        <Kpi
+          label={hasCreditNotes ? "Net tax (CGST + SGST)" : "Tax (CGST + SGST)"}
+          value={inr(totals.cgst + totals.sgst)}
+          Icon={Percent}
+          hint={hasCreditNotes ? "after credit notes" : undefined}
+        />
+        <Kpi
+          label={hasCreditNotes ? "Net grand total" : "Grand total"}
+          value={inr(totals.total)}
+          Icon={TrendingUp}
+          tone="success"
+        />
       </div>
 
       <div>
@@ -1375,10 +1404,22 @@ function GstTab({ from, to }: { from: string; to: string }) {
                     <td className="text-right font-mono font-bold tabular-nums">{inr(r.total)}</td>
                   </tr>
                 ))}
+                {hasCreditNotes && (
+                  <tr className="text-danger">
+                    <td className="font-medium">Credit notes</td>
+                    <td className="text-right tabular-nums">{cn!.count}</td>
+                    <td className="text-right font-mono tabular-nums">{inr(cn!.subtotal)}</td>
+                    <td className="text-right font-mono tabular-nums">{inr(cn!.cgst)}</td>
+                    <td className="text-right font-mono tabular-nums">{inr(cn!.sgst)}</td>
+                    <td className="text-right font-mono font-bold tabular-nums">{inr(cn!.total)}</td>
+                  </tr>
+                )}
               </tbody>
               <tfoot>
                 <tr className="bg-brand-soft/40">
-                  <td className="font-semibold text-brand-dark">Total</td>
+                  <td className="font-semibold text-brand-dark">
+                    {hasCreditNotes ? "Net total" : "Total"}
+                  </td>
                   <td className="text-right font-semibold tabular-nums">{totals.count}</td>
                   <td className="text-right font-mono font-semibold tabular-nums">
                     {inr(totals.subtotal)}

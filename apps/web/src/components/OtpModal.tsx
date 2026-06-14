@@ -104,8 +104,8 @@ export function OtpModal({ reservationId, guestId, open, onClose, onVerified }: 
   const secs = String(secondsLeft % 60).padStart(2, "0");
 
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-brand-dark/40 p-4">
-      <div ref={dialogRef} className="w-full max-w-md bg-surface rounded-md shadow-xl border border-borderc">
+    <div className="fixed inset-0 z-50 flex items-end justify-center sm:grid sm:place-items-center bg-brand-dark/40 sm:p-4">
+      <div ref={dialogRef} className="w-full sm:max-w-md bg-surface rounded-t-2xl sm:rounded-md shadow-xl border border-borderc max-h-[92vh] overflow-y-auto pb-safe sm:pb-0">
         <div className="flex items-center justify-between px-5 py-3 border-b border-borderc">
           <div className="flex items-center gap-2 font-semibold text-textPrimary">
             <ShieldCheck className="w-5 h-5 text-brand" />

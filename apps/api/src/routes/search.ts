@@ -10,7 +10,7 @@
 // last4, room numbers, reservation numbers. We trim and reject queries
 // shorter than 2 chars to avoid table-scan-on-every-keystroke.
 
-import { asc, desc, eq, ilike, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, ilike, or, sql } from "drizzle-orm";
 import { Router } from "express";
 import { z } from "zod";
 import { db } from "../db/client.js";
@@ -77,10 +77,15 @@ router.get(
         .from(reservations)
         .innerJoin(guests, eq(guests.id, reservations.guestId))
         .where(
-          or(
-            ilike(reservations.reservationNumber, wild),
-            ilike(guests.fullName, wild),
-            ilike(guests.phone, wild),
+          and(
+            or(
+              ilike(reservations.reservationNumber, wild),
+              ilike(guests.fullName, wild),
+              ilike(guests.phone, wild),
+            ),
+            // Complimentary bookings don't surface in global search —
+            // only in the Complimentary report.
+            sql`${reservations.bookingSource} <> 'complimentary'`,
           ),
         )
         .orderBy(desc(reservations.createdAt))

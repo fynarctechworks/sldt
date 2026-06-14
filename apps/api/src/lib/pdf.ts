@@ -466,6 +466,66 @@ function brandHeader(
   `;
 }
 
+// Concise per-payment label for the totals block: prefer the payment's
+// own note (stripped of the per-room/split qualifiers, matching the
+// Payment History tag), otherwise a chronological Advance/Later tag.
+function paymentTotalsLabel(
+  p: { notes?: string | null; paymentDate: string | Date },
+  checkedInAtMs: number | null,
+): string {
+  const cleaned = (p.notes ?? "")
+    .trim()
+    .replace(/\s*·\s*part \d+\/\d+(?:\s*\(split from [^)]+\))?/g, "")
+    .replace(/\s*\(Room [^)]+\)/g, "")
+    .replace(/^Per-room share of check-out collection/, "Collected at check-out");
+  if (cleaned.length > 0) return cleaned;
+  const isLater =
+    checkedInAtMs !== null && new Date(p.paymentDate).getTime() > checkedInAtMs;
+  return isLater ? "Later payment" : "Advance at check-in";
+}
+
+// One "Paid" totals row per received payment, each labelled. Falls back
+// to a single "Total Paid" line when there are no itemisable rows (e.g.
+// payment list not supplied). `paidFallback` is the cached total used
+// for that single-line case.
+function paidLinesHtml(
+  payments: Array<{
+    notes?: string | null;
+    paymentDate: string | Date;
+    amount: string | number;
+    voided?: boolean;
+    status?: string | null;
+  }>,
+  opts: {
+    currency: string;
+    rowClass: string;
+    numClass: string;
+    checkedInAtMs: number | null;
+    paidFallback: string | number;
+    totalLabel: string;
+  },
+): string {
+  const received = payments.filter(
+    (p) => !p.voided && (!p.status || p.status === "received"),
+  );
+  if (received.length === 0) {
+    return `<tr class="${opts.rowClass}"><td>${opts.totalLabel}</td><td class="${opts.numClass}">${inr(opts.paidFallback, opts.currency)}</td></tr>`;
+  }
+  const rows = received
+    .map(
+      (p) =>
+        `<tr class="${opts.rowClass}"><td>Paid · ${esc(paymentTotalsLabel(p, opts.checkedInAtMs))}</td><td class="${opts.numClass}">${inr(p.amount, opts.currency)}</td></tr>`,
+    )
+    .join("");
+  // Keep a bold total line when there's more than one payment so the
+  // sum is obvious; a single payment is self-evidently the total.
+  const totalRow =
+    received.length > 1
+      ? `<tr class="${opts.rowClass}"><td><strong>${opts.totalLabel}</strong></td><td class="${opts.numClass}"><strong>${inr(opts.paidFallback, opts.currency)}</strong></td></tr>`
+      : "";
+  return rows + totalRow;
+}
+
 function renderInvoiceHtml(data: {
   invoice: Invoice;
   lineItems: InvoiceLineItem[];
@@ -517,9 +577,33 @@ function renderInvoiceHtml(data: {
     reservationNumber: string;
     amount: string;
   }[];
+  // Per-room bill mode (money/paperwork split). When set, this PDF is a
+  // PRESENTATION-ONLY split of the parent tax invoice for ONE room — it
+  // carries the parent invoice number with a "· Room N" suffix, a
+  // banner clarifying it's not a separate tax document, and only that
+  // room's line items. No new invoice number, no new GST, no money.
+  roomBill?: {
+    roomLabel: string; // e.g. "Room 302"
+    parentInvoiceNumber: string; // e.g. "SLDT-INV-0044"
+  };
 }) {
   const { invoice, lineItems, payments, settings, stay, companionCollections } = data;
   const L = layoutFromSettings(settings);
+
+  const roomBill = data.roomBill;
+  // Credit notes reuse this template but read as a reversal: the title
+  // says "CREDIT NOTE", a reference line names the invoice being
+  // reversed, and amounts are already negative in the data.
+  const isCreditNote =
+    (invoice as { documentType?: string }).documentType === "credit_note";
+  const docTitle = roomBill
+    ? "ROOM BILL"
+    : isCreditNote
+      ? "CREDIT NOTE"
+      : L.invoiceTitle;
+  const reversalRef = isCreditNote
+    ? ((invoice.notes ?? "").match(/reversing\s+(SLDT-INV-\d+)/i)?.[1] ?? null)
+    : null;
 
   const itemRows = lineItems
     .map(
@@ -599,12 +683,22 @@ ${L.showLogo && L.logoUrl ? `<div class="watermark"><img src="${esc(L.logoUrl)}"
   <div class="header">
     ${brandHeader(L, invoice.hotelName, invoice.hotelAddress, invoice.hotelGstin, data.settings.hotelPhone, data.settings.ownerPhone)}
     <div class="meta">
-      <div class="doc-label">${esc(L.invoiceTitle)}</div>
-      <div class="doc-no">${esc(invoice.invoiceNumber)}</div>
+      <div class="doc-label">${esc(docTitle)}</div>
+      <div class="doc-no">${esc(roomBill ? `${roomBill.parentInvoiceNumber} · ${roomBill.roomLabel}` : invoice.invoiceNumber)}</div>
       <div class="doc-date">Date: ${format(new Date(invoice.createdAt), "dd MMM yyyy")}</div>
-      <div class="status-pill">${esc(invoice.status)}</div>
+      ${reversalRef ? `<div class="doc-date">Against: ${esc(reversalRef)}</div>` : ""}
+      <div class="status-pill">${esc(roomBill ? "room split" : isCreditNote ? "credit note" : invoice.status)}</div>
     </div>
   </div>
+
+  ${
+    roomBill
+      ? `<div style="margin:8px 0 4px;padding:7px 11px;border:1px solid #d8c9a8;background:#fbf6ea;border-radius:5px;font-size:10px;color:#6b6358;line-height:1.4;">
+           Room-wise split of tax invoice <strong>${esc(roomBill.parentInvoiceNumber)}</strong> — provided for the customer's reference.
+           The full tax invoice for the stay is ${esc(roomBill.parentInvoiceNumber)}; this split is not a separate tax invoice.
+         </div>`
+      : ""
+  }
 
   <div class="info-grid">
     <div class="info-card">
@@ -710,33 +804,16 @@ ${L.showLogo && L.logoUrl ? `<div class="watermark"><img src="${esc(L.logoUrl)}"
           ? `<tr class="paid"><td>Wallet credit applied</td><td class="num mono">−${inr(invoice.walletCreditApplied, L.currency)}</td></tr>`
           : ""
       }
-      ${(() => {
-        // Split total paid into Advance (at/before check-in) and Later
-        // when both exist. Reads from the actual payment rows so the
-        // numbers always match Payment History below. Falls back to a
-        // single "Total Paid" line when there's nothing to split.
-        const checkedInAt = data.stay?.checkedInAt
+      ${paidLinesHtml(payments, {
+        currency: L.currency,
+        rowClass: "paid",
+        numClass: "num mono",
+        checkedInAtMs: data.stay?.checkedInAt
           ? new Date(data.stay.checkedInAt).getTime()
-          : null;
-        let advance = 0;
-        let later = 0;
-        for (const p of payments) {
-          if (p.voided) continue;
-          if (p.status && p.status !== "received") continue;
-          const ts = new Date(p.paymentDate).getTime();
-          if (checkedInAt !== null && ts > checkedInAt) later += Number(p.amount);
-          else advance += Number(p.amount);
-        }
-        advance = +advance.toFixed(2);
-        later = +later.toFixed(2);
-        if (advance > 0.009 && later > 0.009) {
-          return `
-      <tr class="paid"><td>Advance Paid (at check-in)</td><td class="num mono">${inr(advance, L.currency)}</td></tr>
-      <tr class="paid"><td>Later Payments</td><td class="num mono">${inr(later, L.currency)}</td></tr>
-      <tr class="paid"><td>Total Paid</td><td class="num mono">${inr(invoice.totalPaid, L.currency)}</td></tr>`;
-        }
-        return `<tr class="paid"><td>Total Paid</td><td class="num mono">${inr(invoice.totalPaid, L.currency)}</td></tr>`;
-      })()}
+          : null,
+        paidFallback: invoice.totalPaid,
+        totalLabel: "Total Paid",
+      })}
       <tr class="balance"><td>Balance Due</td><td class="num mono ${balanceClass}">${inr(invoice.balanceDue, L.currency)}</td></tr>
     </table>
   </div>
@@ -860,6 +937,11 @@ export async function renderInvoicePdf(data: {
     reservationNumber: string;
     amount: string;
   }[];
+  // Per-room presentation split — see renderInvoiceHtml.roomBill.
+  roomBill?: {
+    roomLabel: string;
+    parentInvoiceNumber: string;
+  };
 }): Promise<Buffer> {
   const browser = await getBrowser();
   const page = await browser.newPage();
@@ -1252,37 +1334,16 @@ ${L.showLogo && L.logoUrl ? `<div class="watermark"><img src="${esc(L.logoUrl)}"
         </tr>`
           : ""
       }
-      ${(() => {
-        // Split paid into Advance (at/before check-in) vs Later when both
-        // exist. Driven by reservation.checkedInAt — payments dated before
-        // are "advance", after are "later". Falls back to the single
-        // "Paid" line when allPayments isn't provided OR only one bucket
-        // has anything in it.
-        if (!allPayments || !allPayments.length) {
-          return `<tr class="paid"><td>Paid</td><td class="num">${inr(paidSoFar, L.currency)}</td></tr>`;
-        }
-        const checkedInAt = reservation.checkedInAt
+      ${paidLinesHtml(allPayments ?? [], {
+        currency: L.currency,
+        rowClass: "paid",
+        numClass: "num",
+        checkedInAtMs: reservation.checkedInAt
           ? new Date(reservation.checkedInAt).getTime()
-          : null;
-        let advance = 0;
-        let later = 0;
-        for (const p of allPayments) {
-          if (p.voided) continue;
-          if (p.status && p.status !== "received") continue;
-          const ts = new Date(p.paymentDate).getTime();
-          if (checkedInAt !== null && ts > checkedInAt) later += Number(p.amount);
-          else advance += Number(p.amount);
-        }
-        advance = +advance.toFixed(2);
-        later = +later.toFixed(2);
-        if (advance > 0.009 && later > 0.009) {
-          return `
-        <tr class="paid"><td>Advance Paid (at check-in)</td><td class="num">${inr(advance, L.currency)}</td></tr>
-        <tr class="paid"><td>Later Payments</td><td class="num">${inr(later, L.currency)}</td></tr>
-        <tr class="paid"><td>Total Paid</td><td class="num">${inr(paidSoFar, L.currency)}</td></tr>`;
-        }
-        return `<tr class="paid"><td>Paid</td><td class="num">${inr(paidSoFar, L.currency)}</td></tr>`;
-      })()}
+          : null,
+        paidFallback: paidSoFar,
+        totalLabel: "Paid",
+      })}
       <tr class="bal">
         <td>Balance Due</td>
         <td class="num">${inr(balanceDue, L.currency)}</td>

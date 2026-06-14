@@ -2,7 +2,45 @@
 
 A single-tenant property management system (PMS) built for **SLDT Stay Inn**, a small hotel in Sabbavaram, Visakhapatnam (Andhra Pradesh, India). The system was originally scaffolded as a generic "HotelDesk" template and then specialized for this one property — package names and a few historical references still say `hoteldesk`, the user-facing brand is **SLDT Stay Inn**.
 
+**Platform:** web-only (no native app), and now **fully responsive — phone, tablet, and desktop**. On phones (<768px) it presents a phone-first UI: a **bottom tab bar** (`components/BottomNav.tsx` — Home / Bookings / Rooms / Guests / More) instead of the sidebar, **stacked card layouts** for the data pages (Reservations, Invoices, Expenses, Guests render cards; Collections/Credits/Reports tables scroll horizontally), **bottom-sheet modals** (`ModalShell`, OTP, KYC slide up full-width), and a **one-pane Messages** view (list-or-chat with a back button). On `md+` (tablet/desktop — the front-desk target device) the original layout is unchanged: fixed left sidebar, dense multi-column tables, centered modals. The breakpoint switches between them; the desktop experience is never degraded.
+
 This document is the comprehensive reference for everything in the codebase. It is intentionally exhaustive — read top-to-bottom for full context, or jump to a section.
+
+---
+
+## ⚡ Recent major changes (June 2026) — READ THIS FIRST
+
+Several core behaviours changed after the original draft of this document. Where an older section below contradicts this list, **this list wins**; the relevant sections have been patched but skim here first.
+
+### 1. Invoice model: ONE combined invoice per stay; per-room is print-only
+The biggest change. **Revenue lives on the reservation + a single combined tax invoice.** Per-room "invoices" are no longer separate money-bearing records by default.
+
+- **Checkout defaults to ONE combined invoice** (the modal's default radio; per-room is an opt-in for the rare standalone-GST-invoice case).
+- **Per-room bills are presentation-only PDFs** rendered on demand from the combined invoice — `GET /invoices/:id/room-bill/:roomNumber/pdf`. They carry the parent invoice number with a `· Room N` suffix, a "not a separate tax invoice" banner, and create **zero** DB rows / GST / money. UI: small per-room buttons on a combined invoice row in `ReservationDetail`.
+- **Auto-consolidation at final checkout**: when the last room of a multi-room stay checks out via the per-room flow AND every per-room invoice is fully paid, they are automatically merged into one combined invoice (`autoConsolidatePerRoomInvoices` in `reservations.ts`). Safe no-money bookkeeping. So even per-room checkout ends with one combined invoice.
+- The old **"Reissue invoices" / convert-between-shapes UI is removed** (the endpoint `convert-invoices` still exists but is no longer surfaced). It caused double-billing tangles.
+
+### 2. Credit notes (migration 0042)
+`invoices` now doubles as a credit-note store via `document_type` (`'invoice' | 'credit_note'`) + `credit_note_for` (self-FK) + a `sldt_credit_note_seq` sequence (`SLDT-CN-NNNN`). A credit note is a negative-amount reversal of a paid invoice (GST-correct way to change a settled bill). The GST report nets credit notes out of period tax. Reversed pairs collapse behind a "Show reversed" toggle on the reservation page.
+
+### 3. Complimentary reservations go fully silent
+Marking a reservation complimentary now hides it **everywhere except the Complimentary report** (retroactively): no notifications (and conversion deletes any it already generated), no guest/owner WhatsApp, no arrival reminders, no no-show banner, excluded from activity feed, calendar, global search, reservation list, guest-profile stay history, the Invoices page, and all revenue/GST/occupancy reports. **Kept visible:** dashboard room tiles/occupancy and housekeeping tasks (a comp guest physically occupies the room).
+
+### 4. IST date filters everywhere
+All `date_from`/`date_to` filters (invoices, payments, activity, audit, reports, GST) interpret `yyyy-MM-dd` as a **full property-local (IST) calendar day** via `lib/propertyTime.ts` (`propertyDayStart`/`propertyDayEnd`). Previously single-day windows like "Today" matched nothing or were skewed on a UTC server.
+
+### 5. Conflict-aware availability + extend-continue
+- `findAvailableRooms` only hides physically-occupied/dirty rooms when the search window **includes today**; future-dated searches go by date-overlap alone. Opt-in `include_conflicts=1` returns conflicted rooms flagged so the booking picker shows them as disabled "BOOKED" cards instead of hiding them.
+- New `GET /reservations/:id/extend-options` (per-room availability for the extension window + free alternative rooms) and `POST /reservations/:id/extend-continue` (OTP-verified continuation booking in a different room for the same guest).
+
+### 6. Other
+- **Daily Report** (`/reports/daily-ledger` + Reports tab): per-day rooms, guests, nightly price, collected, expenses, net + CSV.
+- **Sticky filter bars** on all list pages (`components/StickyBar.tsx`).
+- **Cancel + no-show** now dispatch in-app notifications.
+- **Equal advance split** at per-room checkout (was proportional).
+- **Per-payment totals** on invoice/receipt PDFs (each payment itemised, not an advance/later summary).
+- **Calendar** day-details now open in a modal; **Messages** rewritten WhatsApp-style; **Expenses** rows open a detail page (inline actions removed) with an "EDITED" chip.
+- **Refund method is never preselected** — staff must choose cash vs wallet explicitly.
 
 ---
 
@@ -39,7 +77,7 @@ A small hotel runs day-to-day operations on this app. Front-desk staff create re
 
 - **Single-tenant.** One hotel, one Supabase project, one Twilio account. Nothing here is multi-tenant. The schema has no `tenant_id`. There are no plans for a SaaS pivot.
 - **Indian-tax-aware.** GST slabs (0/5/18%) baked into reservation pricing. CGST + SGST split is automatic. Invoices follow Indian format conventions.
-- **Front-desk-first.** Every screen optimised for someone who is on their feet, often interrupted, juggling guests at the desk. Optimistic updates, big buttons, minimal modals.
+- **Front-desk-first, tablet/desktop target.** Every screen optimised for a receptionist at a counter on a tablet or PC — often interrupted, juggling guests. Dense tables, optimistic updates, big tap targets. Responsive down to phone size (stacking/scrolling), but the desk device is the design target, not a phone in the hand.
 - **Owner observability built-in.** The hotel owner is treated as a primary stakeholder, not just a user — separate WhatsApp alerts, a dedicated Collections page, and outstanding-balance reports.
 
 ### The 4 main verbs the system supports
@@ -48,7 +86,7 @@ A small hotel runs day-to-day operations on this app. Front-desk staff create re
 |---|---|---|
 | **Book** | `/reservations/new?mode=booking` | A future reservation is created with an advance optionally collected; rooms blocked. |
 | **Check in** | `/reservations/<id>` "Verify & Check In", or `/reservations/new?mode=walkin` | Reservation flips to `checked_in`, room → `occupied`, KYC must be on file, advance can be collected, OTP can be required, WhatsApp fires. |
-| **Check out** | `/reservations/<id>` "Check Out & Generate Invoice" | Tax invoice is computed (room nights × rate + extras, GST split), payment is taken or marked **unpaid**, room → `dirty`, WhatsApp + invoice link fires. |
+| **Check out** | `/reservations/<id>` "Check Out & Generate Invoice" | **One combined tax invoice** is computed (all room nights × rate + extras, GST split — combined is the default), payment is taken or marked **unpaid**, rooms → `dirty`, WhatsApp + invoice link fires. Per-room bills print from the combined invoice on demand. |
 | **Collect later** | Settings → Collections → "Mark Received" | A pending payment row flips from `pending` → `received`, invoice flips to `paid`. |
 
 Everything else is supporting infrastructure for those four flows.
@@ -138,7 +176,8 @@ hoteldesk/
 │   │       │   ├── notify.ts      # dispatchNotification, notifyOwner, etc.
 │   │       │   ├── numbers.ts     # SLDT-RES/INV/RCP-NNNN format
 │   │       │   ├── otp.ts         # generate/hash/expire helpers
-│   │       │   ├── pdf.ts         # Puppeteer renderers (invoice, receipt)
+│   │       │   ├── propertyTime.ts # IST day-bound helpers for date filters
+│   │       │   ├── pdf.ts         # Puppeteer renderers (invoice, credit note, room bill, receipt)
 │   │       │   ├── receipt.ts     # generateReceiptNumber
 │   │       │   ├── redis.ts       # Cache + pub/sub for dashboard
 │   │       │   ├── response.ts    # ok(), fail(), list() helpers
@@ -418,19 +457,17 @@ Individual rentable units.
 | `room_type` | Slug FK → `room_types` |
 | `base_rate` | Default rate |
 | `max_occupancy` | Capacity |
-| `status` | One of available / occupied / reserved / dirty / clean / inspected / maintenance |
+| `status` | One of available / occupied / reserved / dirty / maintenance |
 | `created_at`, `updated_at` | Audit |
 
-**Status meaning:**
+**Status meaning** (the multi-step clean→inspected workflow was collapsed in migration 0034 to a single `dirty → available` step):
 - `available` — bookable, no live reservation
 - `reserved` — has a `confirmed` reservation overlapping today
 - `occupied` — has a `checked_in` reservation
-- `dirty` — guest just checked out; needs housekeeping
-- `clean` — housekeeping done, awaiting inspection
-- `inspected` — verified ready
+- `dirty` — guest just checked out; needs housekeeping → cleaned → back to `available`
 - `maintenance` — out of service
 
-These statuses are **derived** for the dashboard but stored physically — see "Effective room status" in Business Rules.
+These statuses are stored physically on the `rooms` row. The dashboard **derives** an effective status (occupied/reserved from live reservations) on top — see "Effective room status" in Business Rules. Note: deleting reservations does NOT auto-reset a room's physical status, so a bulk DB wipe can leave "ghost" reserved rooms that need resetting to `available`.
 
 ### `guests`
 
@@ -511,8 +548,15 @@ Generated atomically at check-out.
 | `total_paid` | Sum of `received` payments (excluding pending) |
 | `balance_due` | grand_total − total_paid |
 | `status` | issued / partial / paid / voided |
+| `scope` | `combined` (whole stay — the default) / `room` (one room) / `partial` |
+| `scope_room_ids` | uuid[] of rooms this invoice covers |
+| `document_type` | `invoice` or `credit_note` (migration 0042) |
+| `credit_note_for` | self-FK → the invoice a credit note reverses (NULL on ordinary invoices) |
+| `wallet_credit_applied` | Wallet credit redeemed against this invoice |
 | `voided_reason`, `voided_by`, `voided_at` | Audit on void |
 | `issued_by`, `created_at`, `updated_at` | Audit |
+
+**Credit notes** share this table: `document_type='credit_note'`, negative money columns, `credit_note_for` pointing at the reversed invoice. They never hold payments and are excluded from the orphan-payment redistribution logic. Numbered `SLDT-CN-NNNN`.
 
 ### `invoice_line_items`
 
@@ -696,16 +740,30 @@ The biggest route file. Handles the entire stay lifecycle.
 | `/reservations/:id/late-checkout` | POST | Charge late-checkout fee as an additional charge |
 | `/reservations/:id/add-room` | POST | Add a room mid-stay |
 | `/reservations/:id/rooms/:roomId` | PATCH | Edit per-room rate |
+| `/reservations/:id/rooms/:roomId/check-out` | POST | Per-room checkout. Issues that room's invoice; at the FINAL room, auto-consolidates fully-paid per-room invoices into one combined invoice. |
+| `/reservations/:id/rooms/:roomId/checkout-quote` | GET | Pre-checkout bill for one room (equal advance share) |
+| `/reservations/:id/extend-options` | GET | Which rooms are free for an extension window + free alternative rooms |
+| `/reservations/:id/extend-continue` | POST | OTP-verified continuation booking for the same guest in a different room |
+| `/reservations/:id/make-complimentary` | POST | Reclassify as complimentary (silences it everywhere; deletes its existing notifications) |
+| `/reservations/:id/no-show` | POST | Mark a confirmed booking no-show (advance forfeit) |
+| `/reservations/:id/apply-wallet-credit` | POST | Redeem guest wallet credit against the reservation |
+| `/reservations/:id/convert-invoices` | POST | (Legacy — reshape per-room ↔ combined. No longer surfaced in UI.) |
 
 ### `invoices.ts`
 
 | Route | Method | Purpose |
 |---|---|---|
+| `/invoices` | GET | List with status/date/scope/search filters. Excludes comp-reservation invoices. Date filters are IST-day bounds. |
+| `/invoices/summary` | GET | Money rollup (gross/paid/owing) for the filtered set |
+| `/invoices/export` | GET | Flat CSV of every matching invoice (CA-grade detail) |
 | `/invoices/:id` | GET | Full invoice with line items + payments |
-| `/invoices/:id/pdf` | GET | Renders Puppeteer PDF, returns as `application/pdf` |
+| `/invoices/:id/pdf` | GET | Renders Puppeteer PDF (invoice or credit-note variant), `application/pdf`. Resolver accepts `SLDT-INV-` and `SLDT-CN-` numbers. |
+| `/invoices/:id/room-bill-options` | GET | Which rooms a combined invoice can be split into (for the per-room bill buttons) |
+| `/invoices/:id/room-bill/:roomNumber/pdf` | GET | **Presentation-only** per-room bill PDF — one room's slice of the combined invoice. No DB row, no GST, no money. |
 | `/invoices/:id` | PATCH | Edit (admin only, locked once paid) |
 | `/invoices/:id/void` | POST | Admin only. Sets status=voided. |
-| `/invoices/:id/reissue` | POST | Voids the original, creates a new invoice with the same data |
+
+> The old `/invoices/:id/reissue` and the reservation-level `convert-invoices` "reshape per-room ↔ combined" flow are no longer surfaced in the UI (convert-invoices endpoint still exists but is unused). Reshaping is obsolete: there's one combined invoice, and per-room is just a printable view of it.
 
 ### `payments.ts`
 
@@ -726,10 +784,8 @@ The biggest route file. Handles the entire stay lifecycle.
 | `/housekeeping/:roomId/maintenance` | POST | Flag for maintenance with a reason |
 | `/housekeeping/:roomId/resolve` | POST | Resolve a maintenance flag (admin only) |
 
-**Allowed transitions** (from `routes/housekeeping.ts`):
-- `dirty` → `clean`, `maintenance`
-- `clean` → `inspected`, `dirty`
-- `inspected` → `available`, `dirty`
+**Allowed transitions** (from `routes/housekeeping.ts`; the multi-hop clean/inspected ladder was collapsed in migration 0034):
+- `dirty` → `available`, `maintenance`
 - `available` → `dirty`, `maintenance`
 - `maintenance` → `available`, `dirty`
 - `occupied` / `reserved` → no transitions (those are reservation-driven)
@@ -776,9 +832,10 @@ The biggest route file. Handles the entire stay lifecycle.
 | Route | Method | Purpose |
 |---|---|---|
 | `/reports/occupancy` | GET | Daily occupied-room count over a date range |
-| `/reports/revenue` | GET | Daily collected revenue |
+| `/reports/daily-ledger` | GET | Day book: per-day rooms occupied (+ guest, nightly price), collected, expenses, net |
+| `/reports/revenue` | GET | Daily collected revenue (payments grouped by IST day) |
 | `/reports/collections` | GET | Daily collection breakdown |
-| `/reports/gst-summary` | GET | Monthly CGST/SGST totals by status |
+| `/reports/gst-summary` | GET | CGST/SGST totals by status, with a **credit-notes** line that nets out reversed tax |
 | `/reports/outstanding` | GET | Returns: list of unpaid invoices, list of pending payments, by-guest aggregate, total outstanding |
 | `/reports/outstanding/remind/:guestId` | POST | Sends `payment_reminder_guest_sms` WhatsApp to the guest |
 | `/reports/room-performance` | GET | Per-room nights occupied + revenue |
@@ -974,11 +1031,12 @@ Tabbed: Occupancy / Revenue / Collections / GST / Outstanding / Rooms / Guests /
 4. Staff types the **final payment amount** (defaults to the balance) and picks method
 5. **Special: "Unpaid · Collect later"** — invoice is generated as unpaid, payment row stored with `status=pending`. Notes are required.
 6. Submit → `POST /reservations/:id/check-out`
-   - Server snapshots line items (each room × nights with GST)
+   - Server snapshots line items (each room × nights with GST) onto **ONE combined invoice** (the default)
    - Generates `SLDT-INV-NNNN`
    - Inserts payment with `status=received` (or `pending` if unpaid)
    - Updates reservation to `checked_out`
    - Updates rooms to `dirty`
+   - (Per-room checkout is a separate flow — `POST /reservations/:id/rooms/:roomId/check-out` — that bills each room, then auto-consolidates the fully-paid per-room invoices into one combined invoice when the last room leaves.)
 7. **Async** (in `void IIFE` so it doesn't block the response):
    - Renders invoice PDF via Puppeteer
    - Uploads to public Supabase Storage `documents/invoices/SLDT-INV-NNNN.pdf`
@@ -1101,8 +1159,12 @@ All PDFs are server-side via Puppeteer (`apps/api/src/lib/pdf.ts`).
 | Doc | Function | Page size (default) | When |
 |---|---|---|---|
 | Invoice | `renderInvoicePdf` | A4 | At check-out (auto-uploaded to public bucket; downloadable from reservation page) |
+| Credit note | `renderInvoicePdf` (same renderer; `documentType='credit_note'` retitles to "CREDIT NOTE", shows the reversed invoice ref, negative amounts) | A4 | When a paid invoice is reversed |
+| Room bill | `renderInvoicePdf` with the `roomBill` option | A4 | On demand — a presentation-only per-room slice of a combined invoice. Titled "ROOM BILL", references the parent invoice number, banner says it's not a separate tax invoice. |
 | Payment Receipt | `renderReceiptPdf` | A5 | At advance payment + each subsequent payment; downloadable from payment row |
 | Check-in slip | (HTML rendered in `CheckInReceiptModal.tsx` and printed via browser CSS, NOT Puppeteer) | A4 | Right after check-in |
+
+Invoice + receipt PDFs list **each payment individually** in the totals block (e.g. "Paid · Advance at booking ₹1,000", "Paid · Collected at check-out ₹500") via the shared `paidLinesHtml` helper, instead of an advance/later summary.
 
 Why the check-in slip is browser-printed: it needs to print immediately at the front desk without a download step. The `@media print` CSS hides everything except the receipt card.
 
@@ -1154,16 +1216,17 @@ Each charge has its own GST rate (default 18% from settings.additional_charge_de
 
 Old format (deprecated, kept for legacy rows): `RES-20260506-0001`, `INV-202605-0012`, `RCP-20260506-0014`.
 
-**Current format:** `SLDT-RES-NNNN`, `SLDT-INV-NNNN`, `SLDT-RCP-NNNN` — pure sequence, never resets, branded.
+**Current format:** `SLDT-RES-NNNN`, `SLDT-INV-NNNN`, `SLDT-RCP-NNNN`, `SLDT-CN-NNNN` (credit notes) — pure sequence, branded. Formatting helpers in `lib/numbers.ts` (`reservationNumber`, `invoiceNumber`, `receiptNumber`, `creditNoteNumber`).
 
 ### How the next sequence is computed
 
-`lib/availability.ts`:
-- `nextDailySequence(prefix, like)` — `SELECT MAX(SPLIT_PART(reservation_number, '-', 3)::INT) ... WHERE reservation_number LIKE 'SLDT-RES-%'`
-- `nextInvoiceSequence(like)` — same against `invoices`
-- `nextReceiptSequence(like)` — same against `payments`
+Numbers come from **real Postgres sequences** (atomic — `nextval`), not max+1 reads. Helpers in `lib/availability.ts`:
+- `nextDailySequence()` → `sldt_reservation_seq`
+- `nextInvoiceSequence()` → `sldt_invoice_seq`
+- `nextReceiptSequence()` → `sldt_receipt_seq`
+- `nextCreditNoteSequence()` → `sldt_credit_note_seq`
 
-These are simple max+1 reads, NOT atomic counters. Two concurrent checkouts could theoretically produce the same number — but the unique constraint on the column would reject the duplicate. In practice, single-hotel volume makes this a non-issue.
+Because they're sequences, two concurrent checkouts can't collide. The sequences can be `ALTER SEQUENCE ... RESTART WITH 1` to renumber from scratch (e.g. after a DB reset for fresh testing).
 
 ### Why no fiscal-year reset
 
@@ -1250,9 +1313,13 @@ See `deploy/README.md`. Summary:
 
 ---
 
-## Migration scripts
+## Migrations
 
-`apps/api/scripts/` holds one-off migration / maintenance scripts. Run with `npx tsx scripts/<name>.ts`. They use raw `postgres-js` to avoid Drizzle ESM quirks.
+> **Current scheme:** numbered SQL files live in `apps/api/migrations/` (`0001_baseline.sql` … `0042_credit_notes.sql`, 34+ applied). The production deploy script (`deploy/deploy.sh`) applies any pending ones idempotently on each deploy (already-applied files skip on the "already exists" error). The latest is **0042 (credit-note columns + `sldt_credit_note_seq`)** — it MUST run in production for the credit-note feature. To apply locally, run the SQL against the dev DB (the dev DB is the same Supabase project, so it's usually already applied).
+>
+> The `schema_migrations` table tracks applied migrations.
+
+The older `apps/api/scripts/` directory holds one-off maintenance/backfill scripts (run with `npx tsx scripts/<name>.ts`, raw `postgres-js`). Historical examples below; new schema work goes in `migrations/`, not here.
 
 | Script | Purpose |
 |---|---|
@@ -1282,18 +1349,9 @@ We don't use `drizzle-kit push` because of an ESM resolution bug with the projec
 
 ## Known issues and gotchas
 
-### TypeScript warnings on the API (~7 warnings)
+### Type-checking and lint
 
-These appear when you run `npx tsc --noEmit` on the API. None affect runtime:
-
-| Issue | Cause |
-|---|---|
-| `pino-http` not callable | ESM/CJS interop. Function works at runtime. |
-| `IORedis` not constructable (×2) + implicit any on subscribe callback | Same ESM/CJS interop. |
-| `payments.ts:eq(invoiceId, X)` where X is `string \| null` | Drizzle 0.36 strictness. Code has a null check before; runtime is correct. |
-| `reservations.ts: set({ numNights: ... })` (×2) | `numNights` is a generated column. Drizzle drops the field at SQL level — exactly what we want — but TS complains. |
-
-These are framework friction. Fixing them needs invasive `as any` casts or framework upgrades.
+Both apps type-check clean (`npx tsc --noEmit -p apps/api/tsconfig.json` and the web equivalent) and lint clean (`npx eslint`). Any historical ESM/CJS-interop or generated-column friction has been resolved. Run both before committing — every change this session was gated on a clean type-check + lint.
 
 ### Twilio sandbox limitations
 
@@ -1440,6 +1498,10 @@ These were built and then removed. If you find references in old commits or sche
 | OTP email channel | WhatsApp-only deployment |
 | Top-bar notification bell | Sidebar Notifications item handles this |
 | Numeric badge on Collections nav | Replaced with pulsing dot for visual consistency |
+| Separate per-room tax invoices as the default | Replaced by one combined invoice + printable per-room bills (June 2026). Per-room tax invoices remain an opt-in at checkout. |
+| "Reissue invoices" / reshape per-room ↔ combined UI | Caused double-billing; obsoleted by the combined-invoice model (the endpoint still exists, unused) |
+| Proportional advance split at per-room checkout | Now an equal split per remaining room |
+| Advance/Later payment summary on PDFs | Replaced with per-payment itemised lines |
 
 ---
 

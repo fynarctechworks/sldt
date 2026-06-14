@@ -5,6 +5,7 @@ import {
   BedDouble,
   CalendarPlus,
   CheckCircle2,
+  ChevronDown,
   ChevronLeft,
   Clock,
   CreditCard,
@@ -255,9 +256,9 @@ export default function ReservationDetail() {
   const [showOtp, setShowOtp] = useState(false);
   const [showCancel, setShowCancel] = useState(false);
   const [showCombinedInvoice, setShowCombinedInvoice] = useState(false);
-  // Open the invoice-conversion confirmation modal. The mode is set at
-  // open time so the same modal handles both directions.
-  const [convertMode, setConvertMode] = useState<"combined" | "per_room" | null>(null);
+  // Toggle for showing reversed documents (credit notes + the paid
+  // invoices they reverse). Hidden by default to keep the list clean.
+  const [showReversed, setShowReversed] = useState(false);
   // After issuing a combined invoice without collecting payment in the
   // same shot, we surface a "Collect now?" prompt pre-filled with the new
   // invoice's balance. Null = no prompt active.
@@ -377,22 +378,6 @@ export default function ReservationDetail() {
     onError: (e: Error) => setErr(e.message),
   });
 
-  // Convert this reservation's invoices between per-room and combined.
-  // Voids the live invoice(s), reissues with the new shape, redistributes
-  // payments. Used when the original choice turns out to be wrong.
-  const convertInvoices = useMutation({
-    mutationFn: (mode: "combined" | "per_room") =>
-      api.post<{ voidedInvoiceNumbers: string[]; newInvoiceNumbers: string[] }>(
-        `/reservations/${id}/convert-invoices`,
-        { mode },
-      ),
-    onSuccess: () => {
-      setConvertMode(null);
-      invalidate();
-    },
-    onError: (e: Error) => setErr(e.message),
-  });
-
   // No-show: guest never arrived. Advance is forfeit (kept as revenue,
   // not refunded). Rooms release immediately. Distinct from Cancel so
   // reports can separate true cancellations from no-shows.
@@ -433,6 +418,21 @@ export default function ReservationDetail() {
       url: `${import.meta.env.VITE_API_URL}/invoices/${invoiceNumber}/pdf`,
       title: `Invoice · ${invoiceNumber}`,
       filename: `${invoiceNumber}.pdf`,
+    });
+  }
+
+  // Open a room-wise SPLIT of a tax invoice — a presentation-only PDF
+  // for the customer's reference. No money/GST of its own; the parent
+  // invoice is the tax document.
+  function previewRoomBill(
+    invoiceNumber: string,
+    invoiceId: string,
+    roomNumber: string,
+  ) {
+    setPdfPreview({
+      url: `${import.meta.env.VITE_API_URL}/invoices/${invoiceId}/room-bill/${roomNumber}/pdf`,
+      title: `${invoiceNumber} · Room ${roomNumber}`,
+      filename: `${invoiceNumber}-Room-${roomNumber}.pdf`,
     });
   }
 
@@ -1019,78 +1019,87 @@ export default function ReservationDetail() {
       {(data.invoices ?? (invoice ? [invoice] : [])).length > 0 && (
         <div className="card p-0">
           <div className="px-4 py-3 border-b flex items-center justify-between">
-            <strong>Invoices ({(data.invoices ?? [invoice]).filter(Boolean).length})</strong>
+            <strong>
+              Invoices (
+              {(() => {
+                const docs = (data.invoices ?? (invoice ? [invoice] : [])).filter(
+                  Boolean,
+                ) as Array<{ id: string; documentType?: string; creditNoteFor?: string | null }>;
+                const reversed = new Set<string>();
+                for (const d of docs)
+                  if (d.documentType === "credit_note") {
+                    reversed.add(d.id);
+                    if (d.creditNoteFor) reversed.add(d.creditNoteFor);
+                  }
+                return docs.filter((d) => !reversed.has(d.id)).length;
+              })()}
+              )
+            </strong>
             <div className="flex items-center gap-2">
-              {/* Convert per-room ↔ combined. Visibility depends on
-                  what's currently live. Per-room invoices on 2+ rooms →
-                  offer Consolidate. A single combined invoice covering
-                  2+ rooms → offer Split. Anything else hides both. */}
               {(() => {
                 const liveInvs = (data.invoices ?? []).filter(
-                  (i) => i && (i as { status: string }).status !== "voided",
+                  (i) =>
+                    i &&
+                    (i as { status: string }).status !== "voided" &&
+                    (i as { documentType?: string }).documentType !== "credit_note",
                 ) as Array<{
                   id: string;
                   status: string;
                   scope?: "combined" | "room" | "partial";
                   scopeRoomIds?: string[] | null;
                 }>;
-                const liveRoomScoped = liveInvs.filter((i) => i.scope === "room");
-                const liveCombined = liveInvs.filter((i) => i.scope === "combined");
-                const canConsolidate =
-                  liveRoomScoped.length >= 2 && liveCombined.length === 0;
-                const canSplit =
-                  liveCombined.length === 1 &&
-                  (liveCombined[0]!.scopeRoomIds ?? []).length >= 2;
-                if (canConsolidate) {
-                  return (
-                    <button
-                      className="btn-secondary !h-8 text-xs inline-flex items-center gap-1"
-                      onClick={() => setConvertMode("combined")}
-                      title="Void the per-room invoices and reissue as one combined invoice"
-                    >
-                      Consolidate to Combined
-                    </button>
-                  );
-                }
-                if (canSplit) {
-                  return (
-                    <button
-                      className="btn-secondary !h-8 text-xs inline-flex items-center gap-1"
-                      onClick={() => setConvertMode("per_room")}
-                      title="Void the combined invoice and reissue as per-room invoices"
-                    >
-                      Split into Per-Room
-                    </button>
-                  );
-                }
-                return null;
-              })()}
-              {/* Combined invoice generator — shown whenever 2+ rooms
-                  still have no invoice. A reservation can have more than
-                  one combined invoice (e.g. two groups paying separately
-                  after some rooms were already settled per-room). With
-                  only one un-invoiced room left, the per-room "Issue
-                  Invoice" button on the room row is the right path
-                  instead. */}
-              {(() => {
-                const uninvoicedRoomCount = (data.rooms ?? []).filter(
-                  (rm) => !(rm as { roomInvoiceId?: string | null }).roomInvoiceId,
-                ).length;
-                if (uninvoicedRoomCount < 2) return null;
+                // A room is "billed" only when it points at a LIVE
+                // invoice — a link to a voided invoice does not count.
+                const liveInvoiceIds = new Set(liveInvs.map((i) => i.id));
+                const billableRooms = (data.rooms ?? []).filter(
+                  (rm) => (rm as { roomStatus?: string }).roomStatus !== "cancelled",
+                );
+                const uninvoicedRooms = billableRooms.filter((rm) => {
+                  const link = (rm as { roomInvoiceId?: string | null }).roomInvoiceId;
+                  return !link || !liveInvoiceIds.has(link);
+                });
                 return (
-                  <button
-                    className="btn-secondary !h-8 text-xs inline-flex items-center gap-1"
-                    onClick={() => setShowCombinedInvoice(true)}
-                  >
-                    + Combined Invoice
-                  </button>
+                  <>
+                    {/* Combined-invoice GENERATOR — only when 2+ rooms
+                        still have no live invoice. Per-room paperwork is
+                        produced as presentation-only splits of this one
+                        combined tax invoice (see the row's "Per-room
+                        bills" buttons), so there is no separate per-room
+                        invoice to create and no "reissue" step. */}
+                    {uninvoicedRooms.length >= 2 && (
+                      <button
+                        className="btn-secondary !h-8 text-xs inline-flex items-center gap-1"
+                        onClick={() => setShowCombinedInvoice(true)}
+                      >
+                        + Combined Invoice
+                      </button>
+                    )}
+                  </>
                 );
               })()}
             </div>
           </div>
-          <ul className="divide-y divide-borderc">
-            {(data.invoices ?? (invoice ? [invoice] : [])).map((inv) => {
-              if (!inv) return null;
+          {(() => {
+            const allDocs = (data.invoices ?? (invoice ? [invoice] : [])).filter(
+              Boolean,
+            ) as Array<{
+              id: string;
+              documentType?: string;
+              creditNoteFor?: string | null;
+            }>;
+            // Reversed set = every credit note + the original invoice it
+            // reverses. These collapse behind a toggle so the everyday
+            // view only shows live, in-effect documents.
+            const reversedIds = new Set<string>();
+            for (const d of allDocs) {
+              if (d.documentType === "credit_note") {
+                reversedIds.add(d.id);
+                if (d.creditNoteFor) reversedIds.add(d.creditNoteFor);
+              }
+            }
+            const activeDocs = allDocs.filter((d) => !reversedIds.has(d.id));
+            const reversedDocs = allDocs.filter((d) => reversedIds.has(d.id));
+            const renderInvoiceRow = (inv: (typeof allDocs)[number]) => {
               // The legacy `invoice` object is narrower than the new
               // `invoices` array entries; widen here to a shared shape.
               const richInv = inv as {
@@ -1099,10 +1108,12 @@ export default function ReservationDetail() {
                 status: string;
                 grandTotal: string;
                 balanceDue: string;
+                documentType?: string;
                 scope?: "combined" | "room" | "partial";
                 scopeRoomIds?: string[] | null;
                 guestName?: string;
               };
+              const isCreditNote = richInv.documentType === "credit_note";
               const scope = richInv.scope ?? "combined";
               const scopeRoomIds = richInv.scopeRoomIds ?? null;
               const scopedRooms = scopeRoomIds
@@ -1123,8 +1134,14 @@ export default function ReservationDetail() {
                   <div className="min-w-0">
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="font-mono font-bold text-navy">{richInv.invoiceNumber}</span>
-                      <StatusBadge status={richInv.status} />
-                      {showScopeBadge && (
+                      {isCreditNote ? (
+                        <span className="text-[10px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded border bg-danger/10 text-danger border-danger/30">
+                          Credit note
+                        </span>
+                      ) : (
+                        <StatusBadge status={richInv.status} />
+                      )}
+                      {showScopeBadge && !isCreditNote && (
                         <span
                           className={`text-[10px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded border ${scope === "room" ? "bg-brand-soft text-brand-dark border-brand-dark/30" : "bg-accentBlue/10 text-accentBlue border-accentBlue/30"}`}
                         >
@@ -1152,32 +1169,92 @@ export default function ReservationDetail() {
                       )}
                     </div>
                   </div>
-                  <div className="flex gap-2 shrink-0">
-                    {Number(richInv.balanceDue) > 0.009 && richInv.status !== "voided" && (
+                  <div className="flex flex-col items-end gap-1.5 shrink-0">
+                    <div className="flex gap-2">
+                      {Number(richInv.balanceDue) > 0.009 && richInv.status !== "voided" && (
+                        <button
+                          className="btn-primary !h-8 text-xs inline-flex items-center gap-1"
+                          onClick={() =>
+                            setPostIssuePay({
+                              invoiceId: richInv.id,
+                              invoiceNumber: richInv.invoiceNumber,
+                              balanceDue: Number(richInv.balanceDue),
+                            })
+                          }
+                        >
+                          <CreditCard className="w-3.5 h-3.5" /> Collect {inr(richInv.balanceDue)}
+                        </button>
+                      )}
                       <button
-                        className="btn-primary !h-8 text-xs inline-flex items-center gap-1"
-                        onClick={() =>
-                          setPostIssuePay({
-                            invoiceId: richInv.id,
-                            invoiceNumber: richInv.invoiceNumber,
-                            balanceDue: Number(richInv.balanceDue),
-                          })
-                        }
+                        className="btn-secondary !h-8 text-xs inline-flex items-center gap-1"
+                        onClick={() => previewInvoice(richInv.id, richInv.invoiceNumber)}
                       >
-                        <CreditCard className="w-3.5 h-3.5" /> Collect {inr(richInv.balanceDue)}
+                        <FileDown className="w-3.5 h-3.5" /> Preview
                       </button>
-                    )}
-                    <button
-                      className="btn-secondary !h-8 text-xs inline-flex items-center gap-1"
-                      onClick={() => previewInvoice(richInv.id, richInv.invoiceNumber)}
-                    >
-                      <FileDown className="w-3.5 h-3.5" /> Preview
-                    </button>
+                    </div>
+                    {/* Per-room bills — presentation-only splits of this
+                        tax invoice, one PDF per room. For customer
+                        reference (e.g. a company splitting cost); no new
+                        invoice, no money. Only on a combined bill of 2+
+                        rooms, and never on credit notes. */}
+                    {!isCreditNote &&
+                      scope !== "room" &&
+                      scopedRooms &&
+                      scopedRooms.length >= 2 && (
+                        <div className="flex items-center gap-1 flex-wrap justify-end">
+                          <span className="text-[10px] text-textSecondary">
+                            Per-room bills:
+                          </span>
+                          {scopedRooms.map((rm) => {
+                            const num = (rm as { roomNumber: string }).roomNumber;
+                            return (
+                              <button
+                                key={num}
+                                onClick={() =>
+                                  previewRoomBill(richInv.invoiceNumber, richInv.id, num)
+                                }
+                                className="text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded-sm border border-borderc text-brand-dark hover:border-brand hover:bg-brand-soft/40"
+                                title={`Room ${num} bill (split of ${richInv.invoiceNumber})`}
+                              >
+                                {num}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
                   </div>
                 </li>
               );
-            })}
-          </ul>
+            };
+            return (
+              <>
+                <ul className="divide-y divide-borderc">
+                  {activeDocs.map(renderInvoiceRow)}
+                </ul>
+                {reversedDocs.length > 0 && (
+                  <div className="border-t border-borderc">
+                    <button
+                      onClick={() => setShowReversed((v) => !v)}
+                      className="w-full px-4 py-2 text-left text-xs text-textSecondary hover:bg-bg flex items-center gap-1.5"
+                    >
+                      <ChevronDown
+                        className={`w-3.5 h-3.5 transition-transform ${showReversed ? "rotate-180" : ""}`}
+                      />
+                      {showReversed ? "Hide" : "Show"} reversed ({reversedDocs.length})
+                      <span className="text-[10px] text-textSecondary/70">
+                        — paid invoices replaced via credit note, kept for GST
+                      </span>
+                    </button>
+                    {showReversed && (
+                      <ul className="divide-y divide-borderc bg-bg/30">
+                        {reversedDocs.map(renderInvoiceRow)}
+                      </ul>
+                    )}
+                  </div>
+                )}
+              </>
+            );
+          })()}
         </div>
       )}
 
@@ -1574,30 +1651,6 @@ export default function ReservationDetail() {
               onSuccess: () => setShowCancel(false),
             });
           }}
-        />
-      )}
-      {convertMode && (
-        <ConvertInvoicesModal
-          mode={convertMode}
-          reservationNumber={r.reservationNumber}
-          liveInvoices={
-            (r.invoices ?? []).filter(
-              (i) => (i as { status: string }).status !== "voided",
-            ) as Array<{
-              id: string;
-              invoiceNumber: string;
-              grandTotal: string;
-              scope?: "combined" | "room" | "partial";
-              scopeRoomIds?: string[] | null;
-            }>
-          }
-          rooms={(r.rooms ?? []).map((rm) => ({
-            id: rm.id,
-            roomNumber: rm.roomNumber,
-          }))}
-          isSubmitting={convertInvoices.isPending}
-          onClose={() => setConvertMode(null)}
-          onConfirm={() => convertInvoices.mutate(convertMode)}
         />
       )}
       {showAddRoom && (
@@ -3991,135 +4044,6 @@ function ExtendModal(props: {
 // (cash or wallet credit). The server computes refundable as
 // advance_paid − fee, then either records a negative refund row
 // (cash) or issues a credit_issued ledger entry (credit).
-// Convert-invoices confirmation modal. Shows the operator exactly
-// what will be voided and reissued, so they confirm with intent. No
-// editable fields — the conversion is a one-shot operation; if they
-// need to tune amounts they have to use Edit Invoice afterwards on
-// the newly-issued invoice.
-function ConvertInvoicesModal(props: {
-  mode: "combined" | "per_room";
-  reservationNumber: string;
-  liveInvoices: Array<{
-    id: string;
-    invoiceNumber: string;
-    grandTotal: string;
-    scope?: "combined" | "room" | "partial";
-    scopeRoomIds?: string[] | null;
-  }>;
-  rooms: Array<{ id: string; roomNumber: string }>;
-  isSubmitting: boolean;
-  onClose: () => void;
-  onConfirm: () => void;
-}) {
-  const roomMap = new Map(props.rooms.map((r) => [r.id, r.roomNumber]));
-  const liveTotal = props.liveInvoices.reduce(
-    (s, i) => s + Number(i.grandTotal),
-    0,
-  );
-  return (
-    <ModalShell
-      title={
-        props.mode === "combined"
-          ? "Consolidate to Combined Invoice"
-          : "Split into Per-Room Invoices"
-      }
-      onClose={props.onClose}
-      size="md"
-    >
-      <div className="space-y-4">
-        <div className="text-sm text-textSecondary">
-          {props.mode === "combined" ? (
-            <>
-              Reservation{" "}
-              <strong className="text-brand-dark">
-                {props.reservationNumber}
-              </strong>{" "}
-              will have its per-room invoices voided and replaced with{" "}
-              <strong>one combined invoice</strong> for the same total. Every
-              payment recorded so far reattaches to the new invoice. This is
-              the right path when the guest wants a single bill for the whole
-              booking after they've already been issued per-room invoices.
-            </>
-          ) : (
-            <>
-              Reservation{" "}
-              <strong className="text-brand-dark">
-                {props.reservationNumber}
-              </strong>{" "}
-              will have its combined invoice voided and replaced with{" "}
-              <strong>one invoice per room</strong>. Payments split across
-              the new invoices in proportion to each room's bill. This is
-              the right path when occupants want separate receipts after a
-              combined invoice was already issued.
-            </>
-          )}
-        </div>
-
-        <div className="rounded-sm border border-borderc bg-bg/40 p-3 space-y-2 text-sm">
-          <div className="text-xs font-semibold uppercase tracking-wider text-textSecondary">
-            Will be voided
-          </div>
-          <ul className="space-y-1">
-            {props.liveInvoices.map((inv) => {
-              const roomNumbers = (inv.scopeRoomIds ?? [])
-                .map((rid) => roomMap.get(rid))
-                .filter(Boolean)
-                .join(", ");
-              return (
-                <li
-                  key={inv.id}
-                  className="flex items-center justify-between gap-2"
-                >
-                  <span className="font-mono">
-                    {inv.invoiceNumber}
-                    {roomNumbers && (
-                      <span className="text-textSecondary ml-1">
-                        · room{roomNumbers.includes(",") ? "s " : " "}
-                        {roomNumbers}
-                      </span>
-                    )}
-                  </span>
-                  <span className="font-mono">{inr(inv.grandTotal)}</span>
-                </li>
-              );
-            })}
-          </ul>
-          <div className="flex items-center justify-between border-t border-borderc pt-2 mt-2 text-sm">
-            <strong>Total voided</strong>
-            <strong className="font-mono">{inr(liveTotal)}</strong>
-          </div>
-        </div>
-
-        <div className="text-[11px] text-textSecondary">
-          The original invoice numbers stay on file as VOIDED with a
-          "Converted to …" reason for the audit trail. The new invoice
-          numbers will be the next ones in the SLDT-INV-… sequence.
-        </div>
-
-        <div className="flex items-center justify-end gap-2 pt-1">
-          <button
-            className="btn-secondary"
-            onClick={props.onClose}
-            disabled={props.isSubmitting}
-          >
-            Cancel
-          </button>
-          <button
-            className="btn-primary"
-            onClick={props.onConfirm}
-            disabled={props.isSubmitting}
-          >
-            {props.isSubmitting
-              ? "Converting…"
-              : props.mode === "combined"
-                ? "Consolidate"
-                : "Split"}
-          </button>
-        </div>
-      </div>
-    </ModalShell>
-  );
-}
 
 function CancelReservationModal(props: {
   reservationNumber: string;
@@ -5269,104 +5193,6 @@ function CombinedInvoiceModal({
   );
 }
 
-function CombineConfirmDialog({
-  remainingRooms,
-  alreadyInvoicedRooms,
-  collecting,
-  method,
-  onCancel,
-  onConfirm,
-  submitting,
-}: {
-  remainingRooms: { roomNumber: string; occupantName: string | null }[];
-  alreadyInvoicedRooms: { roomNumber: string; invoiceNumber: string }[];
-  collecting: number;
-  method: string;
-  onCancel: () => void;
-  onConfirm: () => void;
-  submitting: boolean;
-}) {
-  return (
-    <div
-      className="fixed inset-0 z-[60] grid place-items-center bg-brand-dark/50 p-4"
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget) onCancel();
-      }}
-    >
-      <div className="w-full max-w-md bg-surface rounded-md shadow-xl border border-borderc overflow-hidden">
-        <div className="px-5 py-3 border-b border-borderc bg-warning/5 flex items-start gap-2">
-          <ShieldAlert className="w-5 h-5 text-warning mt-0.5 shrink-0" />
-          <div>
-            <div className="font-semibold text-textPrimary">Combine into one invoice?</div>
-            <div className="text-xs text-textSecondary mt-0.5">
-              This rolls every remaining room into a single tax invoice. It can't be split later
-              without voiding and re-issuing.
-            </div>
-          </div>
-        </div>
-
-        <div className="p-5 space-y-3 text-sm">
-          <div>
-            <div className="text-[10px] uppercase tracking-wider text-textSecondary font-semibold mb-1.5">
-              Rooms on the combined invoice ({remainingRooms.length})
-            </div>
-            <div className="flex flex-wrap gap-1.5">
-              {remainingRooms.map((r) => (
-                <span
-                  key={r.roomNumber}
-                  className="inline-flex items-center gap-1 px-2 py-1 rounded-sm bg-brand-soft text-brand-dark text-xs font-mono font-semibold"
-                >
-                  {r.roomNumber}
-                </span>
-              ))}
-            </div>
-          </div>
-
-          {alreadyInvoicedRooms.length > 0 && (
-            <div>
-              <div className="text-[10px] uppercase tracking-wider text-textSecondary font-semibold mb-1.5">
-                Not included · already invoiced separately
-              </div>
-              <ul className="text-xs space-y-0.5">
-                {alreadyInvoicedRooms.map((r) => (
-                  <li key={r.roomNumber} className="text-textSecondary">
-                    Room <span className="font-mono font-semibold text-textPrimary">{r.roomNumber}</span>{" "}
-                    → invoice <span className="font-mono text-textPrimary">{r.invoiceNumber}</span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-
-          <div className="border-t border-borderc pt-3">
-            <div className="text-[10px] uppercase tracking-wider text-textSecondary font-semibold mb-1.5">
-              Collecting now
-            </div>
-            <div className="flex justify-between text-sm">
-              <span className="text-textSecondary capitalize">{method.replace("_", " ")}</span>
-              <span className="font-mono font-semibold">{inr(collecting)}</span>
-            </div>
-            <div className="text-[11px] text-textSecondary mt-1">
-              The server recomputes the invoice total from the rooms above. Any difference between
-              this amount and the recomputed bill becomes a balance on the invoice (or a refund if
-              over-collected).
-            </div>
-          </div>
-        </div>
-
-        <div className="flex justify-end gap-2 px-5 py-3 border-t border-borderc bg-bg/50">
-          <button className="btn-secondary" onClick={onCancel} disabled={submitting}>
-            Back
-          </button>
-          <button className="btn-primary" onClick={onConfirm} disabled={submitting}>
-            {submitting ? "Issuing…" : "Yes, combine & check out"}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 function InvoiceModeToggle({
   value,
   onChange,
@@ -5385,17 +5211,18 @@ function InvoiceModeToggle({
         <input
           type="radio"
           name="invoiceMode"
-          checked={!value}
-          onChange={() => onChange(false)}
+          checked={value}
+          onChange={() => onChange(true)}
           className="mt-1 accent-brand-dark"
         />
         <div className="flex-1 text-sm">
           <div className="font-medium text-textPrimary">
-            One tax invoice per room <span className="text-success text-xs">· default</span>
+            One combined invoice <span className="text-success text-xs">· default</span>
           </div>
           <div className="text-xs text-textSecondary">
-            Each room gets its own GST invoice — friends sharing a booking can each claim their
-            own tax credit. Payment is split proportionally.
+            All rooms + extras on a single tax invoice. You can still print a per-room bill for each
+            room from it (for guests splitting the cost) — those are reference copies, not separate
+            tax invoices.
           </div>
         </div>
       </label>
@@ -5403,15 +5230,15 @@ function InvoiceModeToggle({
         <input
           type="radio"
           name="invoiceMode"
-          checked={value}
-          onChange={() => onChange(true)}
+          checked={!value}
+          onChange={() => onChange(false)}
           className="mt-1 accent-brand-dark"
         />
         <div className="flex-1 text-sm">
-          <div className="font-medium text-textPrimary">Combine into one invoice</div>
+          <div className="font-medium text-textPrimary">One tax invoice per room</div>
           <div className="text-xs text-textSecondary">
-            All rooms + extras roll into a single bill addressed to the booker. Use this when one
-            person is paying for everyone.
+            Each room gets its own separate GST invoice. Only needed when each guest requires a
+            standalone tax invoice with its own number; payment is split proportionally.
           </div>
         </div>
       </label>
@@ -5449,14 +5276,15 @@ function CheckoutModal(props: {
   // Intra-state GST split (same rule used everywhere else in the app).
   const cgst = +(props.totalGst / 2).toFixed(2);
   const sgst = +(props.totalGst - cgst).toFixed(2);
-  // Default per-room when there are 2+ remaining rooms. Staff can flip
-  // the checkbox to issue one combined invoice instead.
-  const [combineIntoOne, setCombineIntoOne] = useState(false);
+  // Default to ONE combined invoice — the stay's single tax document.
+  // Per-room bills print from it as reference copies. Staff can flip to
+  // separate per-room tax invoices in the rare case a guest needs a
+  // standalone GST invoice with its own number.
+  const [combineIntoOne, setCombineIntoOne] = useState(true);
   // Second-gate confirmation for the combined path. Set when the user
   // hits Complete Check-out while invoiceMode === "combined" and there
   // are ≥2 rooms about to roll into one invoice. They must explicitly
   // accept before the API call goes out.
-  const [pendingCombineConfirm, setPendingCombineConfirm] = useState(false);
   // Pull the guest's previous unpaid balances so we can offer to collect
   // them in the same visit. Two streams:
   //  - `invoices`        : balances on already-issued invoices
@@ -5608,8 +5436,9 @@ function CheckoutModal(props: {
       // the stay with a zero-cash payment. The server reduces the
       // reservation balance inside apply-wallet-credit so the subsequent
       // /check-out sees the right amount due.
-      // For multi-room reservations, default to per_room invoices. Staff
-      // can opt into a single combined invoice by ticking the checkbox.
+      // Default to ONE combined invoice (the stay's single tax document;
+      // per-room bills print from it). Staff can switch to separate
+      // per-room tax invoices for the rare standalone-invoice case.
       const invoiceMode =
         props.remainingRoomCount > 1 && !combineIntoOne ? "per_room" : "combined";
 
@@ -5948,36 +5777,13 @@ function CheckoutModal(props: {
           <button className="btn-secondary" onClick={props.onClose}>Cancel</button>
           <button
             className="btn-primary"
-            onClick={() => {
-              // Combining ≥2 rooms into one invoice is a one-way action
-              // (you'd need to void + re-issue to undo), so gate it
-              // behind an explicit confirm step.
-              if (combineIntoOne && props.remainingRoomCount > 1) {
-                setPendingCombineConfirm(true);
-                return;
-              }
-              act.mutate();
-            }}
+            onClick={() => act.mutate()}
             disabled={act.isPending || submitDisabled}
           >
             {act.isPending ? "Processing…" : "Complete Check-out"}
           </button>
         </div>
       </div>
-      {pendingCombineConfirm && (
-        <CombineConfirmDialog
-          remainingRooms={props.remainingRooms}
-          alreadyInvoicedRooms={props.alreadyInvoicedRooms}
-          collecting={finalAmount}
-          method={method}
-          onCancel={() => setPendingCombineConfirm(false)}
-          onConfirm={() => {
-            setPendingCombineConfirm(false);
-            act.mutate();
-          }}
-          submitting={act.isPending}
-        />
-      )}
     </ModalShell>
   );
 }
@@ -6107,19 +5913,25 @@ function ModalShell({
 }) {
   const widthCls =
     size === "xl"
-      ? "max-w-4xl"
+      ? "sm:max-w-4xl"
       : size === "lg"
-        ? "max-w-3xl"
-        : "max-w-lg";
+        ? "sm:max-w-3xl"
+        : "sm:max-w-lg";
   return (
+    // Phone: a bottom sheet — backdrop, content pinned to the bottom,
+    // full width, rounded top corners, slides up. sm+: the classic
+    // centered card. Same markup, responsive positioning.
     <div
-      className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
+      className="fixed inset-0 bg-black/50 flex items-end justify-center sm:items-center z-50 sm:p-4"
       onClick={onClose}
     >
       <div
-        className={`bg-surface rounded-md w-full ${widthCls} p-5 max-h-[90vh] overflow-y-auto`}
+        className={`bg-surface w-full rounded-t-2xl sm:rounded-md ${widthCls} p-5 pb-safe max-h-[92vh] sm:max-h-[90vh] overflow-y-auto`}
         onClick={(e) => e.stopPropagation()}
       >
+        {/* Grab handle — a small affordance that this sheet drags up
+            from the bottom on phone. Hidden on sm+. */}
+        <div className="sm:hidden mx-auto mb-3 h-1 w-10 rounded-full bg-borderc" aria-hidden />
         <h2 className="text-lg font-semibold text-navy mb-3">{title}</h2>
         {children}
       </div>
