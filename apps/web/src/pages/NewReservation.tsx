@@ -528,6 +528,20 @@ export default function NewReservation() {
   // the staff selected is never tracked, so it's never swept.
   const freshGuestIdsRef = useRef<string[]>([]);
 
+  // Remove any guest rows we minted in the current booking attempt. Called
+  // when the attempt fails or is abandoned before the reservation is
+  // confirmed, so an unconfirmed booking never leaves an orphan guest on
+  // file. Each cleanup is self-guarding server-side (zero stays + recently
+  // created only), so it can never touch an established record; errors are
+  // swallowed because this is best-effort.
+  const sweepFreshGuests = () => {
+    const ids = freshGuestIdsRef.current;
+    freshGuestIdsRef.current = [];
+    for (const gid of ids) {
+      api.post(`/guests/${gid}/abandon-cleanup`, {}).catch(() => {});
+    }
+  };
+
   // Flip a dirty room straight to available so staff can re-let it
   // without leaving this page. The single-step workflow (migration
   // 0034) makes dirty→available one hop. The optimistic update bumps
@@ -551,9 +565,51 @@ export default function NewReservation() {
       // Reset the sweep list for this attempt — only guests we mint below
       // get tracked for abandoned-booking cleanup.
       freshGuestIdsRef.current = [];
+
+      // ── Validate EVERYTHING before writing any guest row. ────────────
+      // A guest POST is a real DB write that the duplicate-phone guard
+      // then blocks on retry, so we must never create a guest only to
+      // throw on a later check. All purely-local validation happens here,
+      // up front, so the guest row is minted only once the whole booking
+      // is certain to proceed to the OTP step.
+      if (useNewGuest && !newGuest.gender)
+        throw new Error("Gender is required for new guest");
+      if (!useNewGuest && !selectedGuest?.id) throw new Error("Guest required");
+
+      // Walk-in KYC guard. We bypass it when the selected existing guest
+      // already has a verified record on file — re-uploading every time is
+      // pure friction. Staff can still attach replacements via the optional
+      // "Replace" buttons in the KYC card below.
+      if (mode === "walkin" && !kycOnFile) {
+        if (!kycFront)
+          throw new Error("KYC front photo is required for walk-in check-in");
+        if (!kycPhoto)
+          throw new Error("Customer photo is required for walk-in check-in");
+      }
+
+      // Co-guest validation (no writes yet) — decide whether a new co-guest
+      // will be created and pre-validate its fields here so we never create
+      // the booker only to choke on a malformed co-guest afterwards.
+      const startedNewCoGuest =
+        needsCoGuest &&
+        coGuestUseNew &&
+        (coGuestForm.fullName.trim() !== "" ||
+          coGuestForm.phone.trim() !== "" ||
+          coGuestForm.idProofNumber.trim() !== "");
+      if (startedNewCoGuest) {
+        if (!coGuestForm.fullName || !coGuestForm.phone || !coGuestForm.idProofNumber)
+          throw new Error(
+            "Fill in the second guest's name, phone and ID number — or clear all three to skip",
+          );
+        if (!coGuestForm.gender)
+          throw new Error("Gender is required for the second guest");
+      }
+
+      // ── Writes start here. From this point on, any failure must sweep
+      // the guest rows we created (freshGuestIdsRef), which the caller and
+      // onError handler do. ───────────────────────────────────────────
       let guestId = selectedGuest?.id;
       if (useNewGuest) {
-        if (!newGuest.gender) throw new Error("Gender is required for new guest");
         const g = await api.post<Guest>("/guests", {
           ...newGuest,
           phone: normalizeIndianPhone(newGuest.phone),
@@ -564,18 +620,6 @@ export default function NewReservation() {
       }
       if (!guestId) throw new Error("Guest required");
 
-      // Walk-in KYC guard. We bypass it when the selected existing guest
-      // already has a verified record on file — re-uploading every time is
-      // pure friction. Staff can still attach replacements via the optional
-      // "Replace" buttons in the KYC card below.
-      if (mode === "walkin" && !kycOnFile) {
-        if (!kycFront) {
-          throw new Error("KYC front photo is required for walk-in check-in");
-        }
-        if (!kycPhoto) {
-          throw new Error("Customer photo is required for walk-in check-in");
-        }
-      }
       // Only auto-upload when we just created the guest. For existing
       // guests, the KYC pickers in this page are display-only — overwriting
       // their on-file documents on every booking would silently destroy
@@ -589,31 +633,10 @@ export default function NewReservation() {
         await api.upload(`/guests/${guestId}/kyc`, form);
       }
 
-      // Co-guest (2nd occupant). OPTIONAL — front-desk policy decides
-      // when to collect KYC for the second guest. If staff didn't pick
-      // an existing co-guest AND didn't start a new one, we just let
-      // the booking through. If they DID start one, we still require
-      // the bare minimum (name + phone + ID number) so we don't write
-      // a malformed guest row.
       const coGuestIds: string[] = [];
       if (needsCoGuest) {
         let coGuestId = coGuest?.id;
-        // "Started a new co-guest" = any of the identifying fields
-        // is non-empty. Picking up a partial half-record would write
-        // junk to the guests table, so we ask staff to either complete
-        // it or clear it.
-        const startedNew =
-          coGuestUseNew &&
-          (coGuestForm.fullName.trim() !== "" ||
-            coGuestForm.phone.trim() !== "" ||
-            coGuestForm.idProofNumber.trim() !== "");
-        if (startedNew) {
-          if (!coGuestForm.fullName || !coGuestForm.phone || !coGuestForm.idProofNumber)
-            throw new Error(
-              "Fill in the second guest's name, phone and ID number — or clear all three to skip",
-            );
-          if (!coGuestForm.gender)
-            throw new Error("Gender is required for the second guest");
+        if (startedNewCoGuest) {
           const g2 = await api.post<Guest>("/guests", {
             ...coGuestForm,
             phone: normalizeIndianPhone(coGuestForm.phone),
@@ -647,7 +670,14 @@ export default function NewReservation() {
       setPendingOtpGuestId(guestId);
       setPendingCoGuestIds(coGuestIds);
     },
-    onError: (e: Error) => setError(describeApiError(e)),
+    onError: (e: Error) => {
+      // A write failed AFTER we created one or more guest rows (e.g. a KYC
+      // upload or the co-guest POST). Sweep them so a failed attempt leaves
+      // no orphan. (Pure-validation failures created nothing, so the sweep
+      // list is empty and this is a no-op.)
+      sweepFreshGuests();
+      setError(describeApiError(e));
+    },
   });
 
   const createAfterOtp = useMutation({
@@ -2127,14 +2157,7 @@ export default function NewReservation() {
           // row(s) DID get minted before this step (OTP is anchored on a
           // guestId). Sweep the ones we created in this attempt so an
           // unconfirmed booking never leaves an orphan guest on file.
-          // Each cleanup is self-guarding server-side (zero stays + recent
-          // only), so it can never touch an established record; errors are
-          // swallowed because this is best-effort.
-          const toSweep = freshGuestIdsRef.current;
-          freshGuestIdsRef.current = [];
-          for (const gid of toSweep) {
-            api.post(`/guests/${gid}/abandon-cleanup`, {}).catch(() => {});
-          }
+          sweepFreshGuests();
           setPendingOtpGuestId(null);
         }}
         onVerified={async (code) => {
