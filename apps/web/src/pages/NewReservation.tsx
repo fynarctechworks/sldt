@@ -3,7 +3,7 @@ import { addDays, differenceInCalendarDays, format } from "date-fns";
 import { AlertTriangle, ChevronLeft, FileText, ShieldCheck, Snowflake, Sparkles, Tv, Upload, Wifi, X } from "lucide-react";
 import { CheckInReceiptModal, type CheckInReceiptData } from "@/components/CheckInReceiptModal";
 import { OtpModal } from "@/components/OtpModal";
-import { useEffect, useId, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { Loader } from "@/components/Loader";
 import { Combobox } from "@/components/Combobox";
@@ -521,6 +521,13 @@ export default function NewReservation() {
   const [pendingOtpGuestId, setPendingOtpGuestId] = useState<string | null>(null);
   const [pendingCoGuestIds, setPendingCoGuestIds] = useState<string[]>([]);
 
+  // Guest IDs we created in THIS booking attempt (booker and/or co-guest).
+  // The OTP flow forces the guest row to exist before the reservation is
+  // confirmed, so if staff abandon the OTP step we must remove the rows we
+  // just minted. Only freshly-created guests land here — an existing guest
+  // the staff selected is never tracked, so it's never swept.
+  const freshGuestIdsRef = useRef<string[]>([]);
+
   // Flip a dirty room straight to available so staff can re-let it
   // without leaving this page. The single-step workflow (migration
   // 0034) makes dirty→available one hop. The optimistic update bumps
@@ -541,6 +548,9 @@ export default function NewReservation() {
 
   const create = useMutation({
     mutationFn: async () => {
+      // Reset the sweep list for this attempt — only guests we mint below
+      // get tracked for abandoned-booking cleanup.
+      freshGuestIdsRef.current = [];
       let guestId = selectedGuest?.id;
       if (useNewGuest) {
         if (!newGuest.gender) throw new Error("Gender is required for new guest");
@@ -550,6 +560,7 @@ export default function NewReservation() {
           email: newGuest.email || undefined,
         });
         guestId = g.id;
+        freshGuestIdsRef.current.push(g.id);
       }
       if (!guestId) throw new Error("Guest required");
 
@@ -609,6 +620,7 @@ export default function NewReservation() {
             email: coGuestForm.email || undefined,
           });
           coGuestId = g2.id;
+          freshGuestIdsRef.current.push(g2.id);
           if (coGuestKycFront || coGuestKycPhoto || coGuestKycBack) {
             const form = new FormData();
             if (coGuestKycFront) form.append("front", coGuestKycFront);
@@ -697,8 +709,11 @@ export default function NewReservation() {
       return { reservation, navigateOnly: mode !== "walkin" && !tookAdvance };
     },
     onSuccess: ({ reservation, navigateOnly }) => {
-      // Close the OTP modal only after all the work above resolved,
+      // Booking confirmed — these guests now belong to a real reservation,
+      // so drop them from the sweep list (and the server guard would refuse
+      // anyway). Close the OTP modal only after all the work above resolved,
       // so the spinner doesn't blink off mid-flight.
+      freshGuestIdsRef.current = [];
       setPendingOtpGuestId(null);
       invalidateReservationData(qc, { reservationId: reservation.id });
       if (navigateOnly)
@@ -2108,9 +2123,18 @@ export default function NewReservation() {
         guestId={pendingOtpGuestId ?? undefined}
         open={!!pendingOtpGuestId}
         onClose={() => {
-          // OTP abandoned: no reservation row was ever created. Nothing
-          // to clean up server-side. Just dismiss the modal and leave
-          // staff on the form so they can retry or back out.
+          // OTP abandoned. No reservation row was created, but the guest
+          // row(s) DID get minted before this step (OTP is anchored on a
+          // guestId). Sweep the ones we created in this attempt so an
+          // unconfirmed booking never leaves an orphan guest on file.
+          // Each cleanup is self-guarding server-side (zero stays + recent
+          // only), so it can never touch an established record; errors are
+          // swallowed because this is best-effort.
+          const toSweep = freshGuestIdsRef.current;
+          freshGuestIdsRef.current = [];
+          for (const gid of toSweep) {
+            api.post(`/guests/${gid}/abandon-cleanup`, {}).catch(() => {});
+          }
           setPendingOtpGuestId(null);
         }}
         onVerified={async (code) => {

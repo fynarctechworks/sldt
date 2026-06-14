@@ -498,14 +498,7 @@ router.get(
         createdAt: reservations.createdAt,
       })
       .from(reservations)
-      .where(
-        and(
-          inArray(reservations.id, allIds),
-          // Complimentary stays don't appear in the guest's profile
-          // history — they're visible only in the Complimentary report.
-          sql`${reservations.bookingSource} <> 'complimentary'`,
-        ),
-      )
+      .where(inArray(reservations.id, allIds))
       .orderBy(desc(reservations.checkInDate), desc(reservations.createdAt));
 
     const roomRows = await db
@@ -1558,6 +1551,83 @@ router.get(
       )
       .orderBy(asc(guestFollowUps.dueDate));
     return ok(res, rows);
+  },
+);
+
+// Cleanup for an abandoned booking. The new-reservation flow creates the
+// guest BEFORE the OTP step (OTP is anchored on a guestId), so if staff
+// close the OTP modal without confirming, the guest row would otherwise
+// linger as an orphan with no reservation. This endpoint removes exactly
+// that orphan — and ONLY that.
+//
+// Two hard guards make it impossible to touch an established record:
+//   1. Zero reservation links (booker / occupant / co-guest). Same check
+//      the real delete uses.
+//   2. Created within the last 30 minutes. An old guest can never be
+//      swept by an abandoned booking.
+// It runs under view_reservations (the same permission as creating a
+// reservation) so front-desk staff who can book can also undo their own
+// abandoned booking without holding delete_guests.
+router.post(
+  "/:id/abandon-cleanup",
+  requireAuth,
+  requirePermission("view_reservations"),
+  async (req, res) => {
+    const id = req.params.id!;
+
+    const [g] = await db.select().from(guests).where(eq(guests.id, id)).limit(1);
+    if (!g) return ok(res, { deleted: false, reason: "not_found" });
+
+    // Guard 2: never sweep a guest that's been on file for a while.
+    const ageMs = Date.now() - new Date(g.createdAt).getTime();
+    if (ageMs > 30 * 60 * 1000) {
+      return ok(res, { deleted: false, reason: "too_old" });
+    }
+
+    // Guard 1: any reservation link means this guest belongs to a real
+    // booking — leave it alone.
+    const [bookerCount, occupantCount, coGuestCount] = await Promise.all([
+      db
+        .select({ n: sql<number>`count(*)::int` })
+        .from(reservations)
+        .where(eq(reservations.guestId, id)),
+      db
+        .select({ n: sql<number>`count(*)::int` })
+        .from(reservationRooms)
+        .where(eq(reservationRooms.guestId, id)),
+      db
+        .select({ n: sql<number>`count(*)::int` })
+        .from(reservationCoGuests)
+        .where(eq(reservationCoGuests.guestId, id)),
+    ]);
+    if (
+      (bookerCount[0]?.n ?? 0) +
+        (occupantCount[0]?.n ?? 0) +
+        (coGuestCount[0]?.n ?? 0) >
+      0
+    ) {
+      return ok(res, { deleted: false, reason: "has_stays" });
+    }
+
+    await db.transaction(async (tx) => {
+      await tx.delete(guestPhoneHistory).where(eq(guestPhoneHistory.guestId, id));
+      await tx.delete(guests).where(eq(guests.id, id));
+    });
+
+    // Best-effort KYC cleanup — storage failures must not fail the request.
+    const kycPaths = [g.guestPhoto, g.idProofPhotoFront, g.idProofPhotoBack].filter(
+      (p): p is string => !!p,
+    );
+    for (const p of kycPaths) {
+      try {
+        await deleteKycFile(p);
+      } catch (err) {
+        logger.warn({ err, path: p }, "kyc cleanup failed during abandon-cleanup");
+      }
+    }
+
+    logger.info({ guestId: id }, "abandoned-booking guest swept");
+    return ok(res, { deleted: true });
   },
 );
 
