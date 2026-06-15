@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useState } from "react";
+import { Suspense, lazy, useEffect, useId, useMemo, useState } from "react";
 import { Navigate, useLocation } from "react-router-dom";
 import {
   AlertCircle,
@@ -13,6 +13,10 @@ import { useAuth } from "@/auth/AuthContext";
 import { useDialog } from "@/components/Dialog";
 import { api } from "@/lib/api";
 import { supabase } from "@/lib/supabase";
+
+// Heavy WebGL backdrop (three + r3f) — lazy so it only loads on /login and
+// never weighs down the rest of the app bundle.
+const Silk = lazy(() => import("@/components/Silk"));
 
 export default function Login() {
   const { signIn, verifyMfa, session, mfaPending } = useAuth();
@@ -199,52 +203,70 @@ export default function Login() {
 
   return (
     <div className="min-h-screen grid lg:grid-cols-2 bg-ivory">
-      <aside className="hidden lg:flex relative overflow-hidden bg-brand-dark text-cream p-12 flex-col justify-between">
-        <div className="absolute inset-0 opacity-[0.18] [background:radial-gradient(circle_at_18%_15%,#E8E2D3_0,transparent_45%),radial-gradient(circle_at_82%_85%,#B08A4A_0,transparent_55%)]" />
+      <aside className="hidden lg:block relative overflow-hidden bg-brand-dark text-cream min-h-screen">
+        {/* Animated WebGL "silk" backdrop in the brand jade. Lazy-loaded;
+            a plain brand fill shows until it mounts. */}
+        <div aria-hidden className="absolute inset-0 bg-brand-dark">
+          <Suspense fallback={null}>
+            <Silk speed={4} scale={1.1} color="#1F5C44" noiseIntensity={1.2} rotation={0.2} />
+          </Suspense>
+        </div>
+        {/* Subtle darkening so text stays legible over the animation. */}
+        <div aria-hidden className="absolute inset-0 bg-gradient-to-tr from-brand-dark/55 via-brand-dark/25 to-transparent" />
         <div className="absolute inset-y-0 right-0 w-px bg-brass/20" />
-        <div className="relative flex items-center gap-3 font-semibold text-lg">
-          <img src="/logo.jpg" alt="SLDT Stay Inn" className="w-14 h-14 rounded-xl object-contain bg-cream shadow-md ring-1 ring-brass/30" />
+
+        {/* Logo + name, top-left. */}
+        <div className="absolute top-10 left-10 xl:left-14 flex items-center gap-3 pointer-events-none">
+          <img src="/logo.jpg" alt="SLDT Stay Inn" className="w-14 h-14 rounded-2xl object-contain bg-cream shadow-md ring-1 ring-brass/30" />
           <div className="leading-tight">
-            <div className="text-cream">SLDT Stay Inn</div>
-            <div className="text-[11px] font-normal text-brass tracking-wide">SABBAVARAM</div>
+            <div className="text-cream font-semibold text-lg">SLDT Stay Inn</div>
+            <div className="text-[11px] font-normal text-brass tracking-[0.18em] uppercase">Sabbavaram</div>
           </div>
         </div>
 
-        <div className="relative space-y-5 max-w-md">
-          <div className="inline-flex items-center gap-2 text-[11px] font-medium tracking-[0.18em] uppercase px-3 py-1 rounded-full bg-brass/15 text-brass ring-1 ring-brass/30">
+        {/* Overlay content — vertically centered, left-aligned. */}
+        <div className="absolute inset-0 flex flex-col items-start justify-center text-left p-10 xl:p-14 pointer-events-none">
+          <span className="inline-flex items-center rounded-full border border-brass/40 bg-brass/10 backdrop-blur px-4 py-1.5 text-xs font-semibold tracking-[0.18em] uppercase text-brass mb-6">
             Front Office Suite
-          </div>
-          <h2 className="text-[2.2rem] font-semibold leading-[1.15] text-cream whitespace-nowrap">
-            Welcome to your <span className="text-brass italic font-serif">front desk.</span>
+          </span>
+
+          <h2 className="text-cream text-4xl xl:text-5xl font-bold leading-tight drop-shadow-sm max-w-md">
+            Welcome to your{" "}
+            <span className="italic font-serif text-brass">front desk.</span>
           </h2>
-          <p className="text-cream/70 text-sm leading-relaxed">
+
+          <p className="text-cream/85 text-base leading-relaxed mt-5 max-w-md">
             Reservations, housekeeping, guest profiles and reports, all in one
             calm workspace, made for SLDT Stay Inn.
           </p>
-          <ul className="space-y-3 text-sm text-cream/90 pt-3">
-            <li className="flex items-center gap-3">
-              <span className="grid place-items-center w-7 h-7 rounded-full bg-brass/15 ring-1 ring-brass/40">
-                <ShieldCheck className="w-3.5 h-3.5 text-brass" />
-              </span>
-              Role-based staff access
-            </li>
-            <li className="flex items-center gap-3">
-              <span className="grid place-items-center w-7 h-7 rounded-full bg-brass/15 ring-1 ring-brass/40">
-                <ShieldCheck className="w-3.5 h-3.5 text-brass" />
-              </span>
-              Encrypted guest data &amp; KYC
-            </li>
-            <li className="flex items-center gap-3">
-              <span className="grid place-items-center w-7 h-7 rounded-full bg-brass/15 ring-1 ring-brass/40">
-                <ShieldCheck className="w-3.5 h-3.5 text-brass" />
-              </span>
-              Real-time housekeeping sync
-            </li>
+
+          <ul className="mt-8 space-y-4">
+            {[
+              "Role-based staff access",
+              "Encrypted guest data & KYC",
+              "Real-time housekeeping sync",
+            ].map((label) => (
+              <li key={label} className="flex items-center gap-3">
+                <span className="flex items-center justify-center w-9 h-9 rounded-full border border-brass/30 bg-brass/10 backdrop-blur text-brass">
+                  <ShieldCheck className="w-4 h-4" />
+                </span>
+                <span className="text-cream/90 text-[15px] font-medium">{label}</span>
+              </li>
+            ))}
           </ul>
         </div>
 
-        <div className="relative text-[11px] tracking-wider text-cream/40">
-          © {new Date().getFullYear()} SLDT STAY INN · SABBAVARAM
+        {/* FYN ARC footer, bottom-left. */}
+        <div className="absolute bottom-8 left-10 xl:left-14 flex items-center gap-2.5 pointer-events-none">
+          <img
+            src="/fyn-arc-logo.png"
+            alt="FYN ARC Techworks"
+            className="h-6 w-auto opacity-80"
+          />
+          <span className="text-xs text-cream/60 tracking-wide leading-tight">
+            <span className="block">© {new Date().getFullYear()} SLDT Stay Inn · Sabbavaram</span>
+            <span className="block">Powered by FYN ARC Techworks</span>
+          </span>
         </div>
       </aside>
 
@@ -253,8 +275,15 @@ export default function Login() {
           card floats on something rich instead of empty cream. On lg+ it
           reverts to plain ivory next to the brand aside. */}
       <main className="relative flex items-center justify-center p-6 sm:p-10 bg-brand-dark lg:bg-ivory overflow-hidden">
-        {/* Decorative layers — phone/tablet only. */}
-        <div className="lg:hidden absolute inset-0 opacity-[0.18] [background:radial-gradient(circle_at_18%_12%,#E8E2D3_0,transparent_45%),radial-gradient(circle_at_82%_88%,#B08A4A_0,transparent_55%)]" aria-hidden />
+        {/* Animated silk backdrop — phone/tablet only (lg+ has the brand
+            aside). Same lazy WebGL silk so the card floats on living jade,
+            with a dark overlay to keep the card and logo legible. */}
+        <div aria-hidden className="lg:hidden absolute inset-0">
+          <Suspense fallback={null}>
+            <Silk speed={4} scale={1.1} color="#1F5C44" noiseIntensity={1.2} rotation={0.2} />
+          </Suspense>
+        </div>
+        <div aria-hidden className="lg:hidden absolute inset-0 bg-brand-dark/55" />
         <img
           src="/logo.jpg"
           alt=""
@@ -507,6 +536,19 @@ export default function Login() {
             </div>
           )}
         </form>
+
+          {/* FYN ARC footer — phone/tablet only (lg+ shows it in the aside). */}
+          <div className="lg:hidden mt-6 flex items-center gap-2.5">
+            <img
+              src="/fyn-arc-logo.png"
+              alt="FYN ARC Techworks"
+              className="h-5 w-auto opacity-80"
+            />
+            <span className="text-[11px] text-cream/60 tracking-wide leading-tight">
+              <span className="block">© {new Date().getFullYear()} SLDT Stay Inn · Sabbavaram</span>
+              <span className="block">Powered by FYN ARC Techworks</span>
+            </span>
+          </div>
         </div>
       </main>
     </div>
