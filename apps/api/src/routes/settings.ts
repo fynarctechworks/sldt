@@ -167,6 +167,7 @@ router.post(
       label: string;
       defaultRate: number;
       maxOccupancy: number;
+      extraPersonRate: number;
       description?: string | null;
       isActive: boolean;
       shortStayBands?: Array<{ label: string; hours: number; rate: number }>;
@@ -182,6 +183,7 @@ router.post(
         label: input.label,
         defaultRate: String(input.defaultRate),
         maxOccupancy: String(input.maxOccupancy),
+        extraPersonRate: String(input.extraPersonRate ?? 0),
         description: input.description ?? null,
         isActive: input.isActive,
         shortStayBands: input.shortStayBands ?? [],
@@ -216,7 +218,8 @@ router.put(
     const update: Record<string, unknown> = { updatedAt: new Date() };
     for (const [k, v] of Object.entries(input)) {
       if (v === undefined) continue;
-      if (k === "defaultRate" || k === "maxOccupancy") update[k] = String(v);
+      if (k === "defaultRate" || k === "maxOccupancy" || k === "extraPersonRate")
+        update[k] = String(v);
       else update[k] = v;
     }
 

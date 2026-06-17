@@ -193,6 +193,36 @@ export function buildInvoice(args: BuilderArgs): BuiltInvoice {
     return { direction: "to", roomNumber: chain[idx + 1]!.roomNumber };
   }
 
+  // Emit the extra-bed (additional-person) line for a room, if any. Billed
+  // at the same GST slab as the room — extra-bed revenue is part of the
+  // room tariff. quantity = beds × units; rate = per-bed, per-unit fee.
+  // Mutates subtotal/totalGst/lineItems (closures over the loop state).
+  function pushExtraBedLine(
+    rr: (typeof rooms)[number],
+    units: number,
+    roomNumber: string,
+  ) {
+    const beds = Number(rr.extraBeds ?? 0);
+    const bedRate = Number(rr.extraBedRate ?? 0);
+    if (beds <= 0 || bedRate <= 0 || units <= 0) return;
+    const bedQty = beds * units;
+    const bedGross = bedRate * bedQty;
+    const bedBreak = calcGstBreakdown(bedGross, roomGstRate, gstMode);
+    subtotal += bedBreak.subtotal;
+    totalGst += bedBreak.gstAmount;
+    const unitWord = isShort ? "day" : "night";
+    lineItems.push({
+      description: `Room ${roomNumber} - Extra bed (${beds} × ${units} ${unitWord}${bedQty === 1 ? "" : "s"})`,
+      sacCode: "996311",
+      quantity: bedQty,
+      rate: String(+(bedBreak.subtotal / bedQty).toFixed(2)),
+      amount: String(+bedBreak.subtotal.toFixed(2)),
+      gstRate: String(roomGstRate),
+      gstAmount: String(+bedBreak.gstAmount.toFixed(2)),
+      itemType: "room_charge",
+    });
+  }
+
   for (const rr of rooms) {
     const storedRate = Number(rr.ratePerNight);
     const displayType = combinedRoomTypeLabel(
@@ -261,6 +291,7 @@ export function buildInvoice(args: BuilderArgs): BuiltInvoice {
           itemType: "room_charge",
         });
       }
+      pushExtraBedLine(rr, rowNights, rr.room.roomNumber);
       continue;
     }
 
@@ -300,6 +331,7 @@ export function buildInvoice(args: BuilderArgs): BuiltInvoice {
       gstAmount: String(+roomGst.toFixed(2)),
       itemType: "room_charge",
     });
+    pushExtraBedLine(rr, roomUnits, rr.room.roomNumber);
   }
 
   // Decide whether the extension deltas were actually merged. They are

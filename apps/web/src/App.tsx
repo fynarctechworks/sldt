@@ -80,7 +80,12 @@ export default function App() {
           element={
             <ProtectedRoute>
               <AppShell>
-                <PermissionGuard any={["edit_rooms"]}>
+                {/* RoomDetail is the maintenance-history view (see its
+                    header comment) — no room editing happens here, so it
+                    gates on view_maintenance, not edit_rooms. Front desk /
+                    housekeeping reach it from the Housekeeping board's
+                    "room details + maintenance history" link. */}
+                <PermissionGuard any={["view_maintenance"]}>
                   <RoomDetail />
                 </PermissionGuard>
               </AppShell>

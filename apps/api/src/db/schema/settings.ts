@@ -102,6 +102,12 @@ export const roomTypes = pgTable("room_types", {
   label: text("label").notNull(),
   defaultRate: numeric("default_rate", { precision: 10, scale: 2 }).notNull(),
   maxOccupancy: numeric("max_occupancy").notNull().default("2"),
+  // Per-night charge for each extra person (extra bed) over a room's
+  // base max_occupancy, for rooms of this type. 0 (the default) means
+  // extra beds are not offered — the booking form hides the stepper.
+  extraPersonRate: numeric("extra_person_rate", { precision: 10, scale: 2 })
+    .notNull()
+    .default("0"),
   description: text("description"),
   isActive: boolean("is_active").notNull().default(true),
   // Day-use bands shown on the reservation form when stay_type='short_stay'.

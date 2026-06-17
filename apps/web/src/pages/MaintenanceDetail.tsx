@@ -293,7 +293,7 @@ export default function MaintenanceDetail() {
           onClick={() => setShowResolve(false)}
         >
           <div
-            className="bg-surface rounded-md w-full max-w-md p-5 space-y-3"
+            className="bg-surface rounded-md w-full max-w-md p-6 space-y-4"
             onClick={(e) => e.stopPropagation()}
           >
             <h2 className="text-lg font-semibold text-brand-dark">

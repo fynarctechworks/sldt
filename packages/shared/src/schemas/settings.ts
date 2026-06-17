@@ -130,6 +130,9 @@ export const roomTypeCreateSchema = z.object({
   label: z.string().min(1).max(60),
   defaultRate: z.coerce.number().positive(),
   maxOccupancy: z.coerce.number().int().min(1).max(20).default(2),
+  // Per-night charge for each extra person (extra bed) over a room's
+  // base occupancy. 0 means extra beds aren't offered for this type.
+  extraPersonRate: z.coerce.number().min(0).max(100000).default(0),
   description: z.string().max(300).optional().nullable(),
   isActive: z.boolean().default(true),
   shortStayBands: z.array(shortStayBandSchema).max(10).optional(),

@@ -1,6 +1,6 @@
 import { format } from "date-fns";
 import { Printer, X } from "lucide-react";
-import { useEffect } from "react";
+import { Fragment, useEffect } from "react";
 import { supabase } from "@/lib/supabase";
 import { formatTime, inr } from "@/lib/utils";
 
@@ -60,6 +60,9 @@ export interface CheckInReceiptData {
     // (older payloads), we fall back to the raw roomType.
     displayType?: string;
     ratePerNight: string;
+    // Extra beds (additional persons) on this room, when any (0043).
+    extraBeds?: number;
+    extraBedRate?: string;
   }[];
   subtotal: string;
   gstRate: string;
@@ -519,15 +522,28 @@ export function CheckInReceiptModal({ data, onClose, variant = "checkin" }: Prop
               </thead>
               <tbody>
                 {data.rooms.map((rm) => (
-                  <tr key={rm.roomNumber}>
-                    <td className="py-1.5 border-b border-borderc font-mono font-bold">{rm.roomNumber}</td>
-                    <td className="py-1.5 border-b border-borderc capitalize">
-                      {rm.displayType ?? rm.roomType.replace(/_/g, " ")}
-                    </td>
-                    <td className="py-1.5 border-b border-borderc text-right font-mono">
-                      {inr(rm.ratePerNight)}
-                    </td>
-                  </tr>
+                  <Fragment key={rm.roomNumber}>
+                    <tr>
+                      <td className="py-1.5 border-b border-borderc font-mono font-bold">{rm.roomNumber}</td>
+                      <td className="py-1.5 border-b border-borderc capitalize">
+                        {rm.displayType ?? rm.roomType.replace(/_/g, " ")}
+                      </td>
+                      <td className="py-1.5 border-b border-borderc text-right font-mono">
+                        {inr(rm.ratePerNight)}
+                      </td>
+                    </tr>
+                    {Number(rm.extraBeds ?? 0) > 0 && Number(rm.extraBedRate ?? 0) > 0 && (
+                      <tr>
+                        <td className="py-1.5 border-b border-borderc"></td>
+                        <td className="py-1.5 border-b border-borderc text-textSecondary">
+                          + Extra bed × {rm.extraBeds}
+                        </td>
+                        <td className="py-1.5 border-b border-borderc text-right font-mono text-textSecondary">
+                          {inr(rm.extraBedRate!)}
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
                 ))}
               </tbody>
             </table>

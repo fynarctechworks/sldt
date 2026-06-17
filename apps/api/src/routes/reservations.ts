@@ -410,6 +410,9 @@ router.get("/:id", requireAuth, requirePermission("view_reservations"), async (r
           reservationRoomId: x.rr.id,
           ratePerNight: x.rr.ratePerNight,
           soldAsType: x.rr.soldAsType,
+          // Extra beds (additional persons) booked on this room (0043).
+          extraBeds: x.rr.extraBeds,
+          extraBedRate: x.rr.extraBedRate,
           roomStatus: x.rr.status,
           roomCheckedInAt: x.rr.checkedInAt,
           roomCheckedOutAt: x.rr.checkedOutAt,
@@ -612,12 +615,27 @@ router.post(
     // We compute a single `roomAmount` that represents the user's input,
     // then derive both the stored subtotal (net) and the grand total
     // through calcGstBreakdown which handles both modes.
-    const roomAmount = isShortStay
-      ? +input.rooms.reduce((a, r) => a + r.ratePerNight, 0).toFixed(2)
-      : +input.rooms.reduce((a, r) => a + r.ratePerNight * nights, 0).toFixed(2);
+    //
+    // Extra beds (additional persons over a room's capacity) carry a
+    // per-night, per-person fee. We keep the BASE room amount separate so
+    // the GST slab is decided purely from the room rate (extra-bed money
+    // must not push a room into a higher slab), then add the extra-bed
+    // amount into the taxable roomAmount at that same slab — extra-bed
+    // revenue is part of the room tariff.
+    const billingUnits = isShortStay ? 1 : nights;
+    const roomBaseAmount = +input.rooms
+      .reduce((a, r) => a + r.ratePerNight * billingUnits, 0)
+      .toFixed(2);
+    const extraBedAmount = +input.rooms
+      .reduce(
+        (a, r) => a + (r.extraBeds ?? 0) * (r.extraBedRate ?? 0) * billingUnits,
+        0,
+      )
+      .toFixed(2);
+    const roomAmount = +(roomBaseAmount + extraBedAmount).toFixed(2);
     const avgRate = isShortStay
-      ? roomAmount / input.rooms.length
-      : roomAmount / (nights * input.rooms.length);
+      ? roomBaseAmount / input.rooms.length
+      : roomBaseAmount / (nights * input.rooms.length);
     const gstRate = getGstRate(avgRate, {
       exemptBelow: Number(settings.gstSlabExemptBelow),
       lowRate: Number(settings.gstSlabLowRate),
@@ -780,6 +798,8 @@ router.post(
             roomId: rm.roomId,
             ratePerNight: String(rm.ratePerNight),
             soldAsType: rm.soldAsType ?? null,
+            extraBeds: rm.extraBeds ?? 0,
+            extraBedRate: String(rm.extraBedRate ?? 0),
             // Per-room (0017): default the occupant to the booker. The
             // operator can reassign each room to a different guest via
             // POST /reservations/:id/rooms/:roomId/assign-guest after
@@ -2094,6 +2114,32 @@ router.post(
         gstAmount: String(gstAmount),
         itemType: "room_charge",
       });
+
+      // Extra beds (additional persons) for this room, billed at the same
+      // GST slab as the room. Quantity = beds × units; rate = per-bed,
+      // per-unit fee. Emitted as its own line so the bill itemises it.
+      const beds = Number(rr.rr.extraBeds ?? 0);
+      const bedRate = Number(rr.rr.extraBedRate ?? 0);
+      if (beds > 0 && bedRate > 0) {
+        const bedQty = beds * roomUnits;
+        const bedGross = +(bedRate * bedQty).toFixed(2);
+        const bedBreakdown = calcGstBreakdown(bedGross, roomGstRate, reservationGstMode);
+        const bedNetRate =
+          reservationGstMode === "inclusive" && bedQty > 0
+            ? +(bedBreakdown.subtotal / bedQty).toFixed(2)
+            : bedRate;
+        subtotal += bedBreakdown.subtotal;
+        lineItems.push({
+          description: `Room ${rr.room.roomNumber} - Extra bed (${beds} × ${roomUnits} ${isShortStayInvoice ? "day" : "night"}${roomUnits === 1 && beds === 1 ? "" : "s"})`,
+          sacCode: "996311",
+          quantity: bedQty,
+          rate: String(bedNetRate),
+          amount: String(bedBreakdown.subtotal),
+          gstRate: String(roomGstRate),
+          gstAmount: String(bedBreakdown.gstAmount),
+          itemType: "room_charge",
+        });
+      }
     }
 
     // The room GST is already captured per-line above. Sum it instead of
@@ -4885,6 +4931,34 @@ router.get(
         itemType: "room_charge",
         createdAt: now,
       });
+
+      // Extra beds for this room — mirrors the real checkout builder so
+      // the preview total matches the invoice that will be issued.
+      const beds = Number(rr.rr.extraBeds ?? 0);
+      const bedRate = Number(rr.rr.extraBedRate ?? 0);
+      if (beds > 0 && bedRate > 0) {
+        const bedQty = beds * rowUnits;
+        const bedGross = +(bedRate * bedQty).toFixed(2);
+        const bedBreakdown = calcGstBreakdown(bedGross, roomGstRate, previewGstMode);
+        const bedNetRate =
+          previewGstMode === "inclusive" && bedQty > 0
+            ? +(bedBreakdown.subtotal / bedQty).toFixed(2)
+            : bedRate;
+        subtotal += bedBreakdown.subtotal;
+        lineItems.push({
+          id: `preview-${rr.room.id}-${String(rowFrom)}-xbed`,
+          invoiceId: "preview",
+          description: `Room ${rr.room.roomNumber} - Extra bed (${beds} × ${rowUnits} ${isShortStayPreview ? "day" : "night"}${rowUnits === 1 && beds === 1 ? "" : "s"})`,
+          sacCode: "996311",
+          quantity: bedQty,
+          rate: String(bedNetRate),
+          amount: String(bedBreakdown.subtotal),
+          gstRate: String(roomGstRate),
+          gstAmount: String(bedBreakdown.gstAmount),
+          itemType: "room_charge",
+          createdAt: now,
+        });
+      }
     }
 
     // Sum room-line GST instead of re-applying the rate to the subtotal —

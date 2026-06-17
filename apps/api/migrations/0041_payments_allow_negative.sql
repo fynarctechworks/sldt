@@ -14,5 +14,17 @@
 ALTER TABLE payments
   DROP CONSTRAINT IF EXISTS payment_amount_nonneg;
 
-ALTER TABLE payments
-  ADD CONSTRAINT payment_amount_not_null CHECK (amount IS NOT NULL);
+-- Idempotent add: some environments already created this constraint by
+-- hand before the migration was authored, which made a bare ADD
+-- CONSTRAINT collide ("already exists") and abort the whole batch.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'payment_amount_not_null'
+      AND conrelid = 'payments'::regclass
+  ) THEN
+    ALTER TABLE payments
+      ADD CONSTRAINT payment_amount_not_null CHECK (amount IS NOT NULL);
+  END IF;
+END $$;

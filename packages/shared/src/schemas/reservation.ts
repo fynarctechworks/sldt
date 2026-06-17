@@ -17,6 +17,13 @@ export const reservationCreateSchema = z
           roomId: z.string().uuid(),
           ratePerNight: z.coerce.number().positive(),
           soldAsType: z.string().min(1).max(64).optional().nullable(),
+          // Extra beds (additional persons over the room's base
+          // max_occupancy). extraBedRate is the per-night, per-person
+          // fee the client read from the room type's extraPersonRate.
+          // Both default 0 (no extra beds). The server re-derives the
+          // amount and folds it into the room tariff + GST.
+          extraBeds: z.coerce.number().int().min(0).max(10).optional().default(0),
+          extraBedRate: z.coerce.number().min(0).optional().default(0),
         }),
       )
       .min(1),
@@ -57,11 +64,12 @@ export const reservationCreateSchema = z
     // the reservation insert, then proceeds. Omitting this rejects the
     // create unless an admin override flag is added later.
     otpCode: z.string().min(4).max(8).optional(),
-    // Co-guests (migration 0020). Up to 1 additional guest with full
-    // KYC is required when numAdults >= 2. Capped at 1 since we only
-    // require KYC for the first 2 adults total; further adults beyond
-    // 2 don't need their own record. Each id must be a real Guest row.
-    coGuestIds: z.array(z.string().uuid()).max(1).optional().default([]),
+    // Co-guests (migration 0020). Additional adults whose KYC was
+    // captured at booking. At least one is expected when numAdults >= 2,
+    // but the desk may record every accompanying adult for larger groups.
+    // Each id must be a real Guest row; the booker can't be among them.
+    // Capped generously to bound the insert without limiting real groups.
+    coGuestIds: z.array(z.string().uuid()).max(20).optional().default([]),
   })
   .superRefine((d, ctx) => {
     if (d.stayType === "short_stay") {

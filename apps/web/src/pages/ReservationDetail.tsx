@@ -3749,7 +3749,7 @@ function ExtendModal(props: {
 
   return (
     <ModalShell title="Extend Stay" onClose={props.onClose}>
-      <div className="space-y-3">
+      <div className="space-y-4">
         <OverdueWarning minutesOverdue={props.minutesOverdue ?? 0} />
         <div className="text-sm text-textSecondary">
           Current check-out: <strong>{format(new Date(props.currentCheckOut), "dd MMM yyyy")}</strong>
@@ -5926,13 +5926,15 @@ function ModalShell({
       onClick={onClose}
     >
       <div
-        className={`bg-surface w-full rounded-t-2xl sm:rounded-md ${widthCls} p-5 pb-safe max-h-[92vh] sm:max-h-[90vh] overflow-y-auto`}
+        className={`bg-surface w-full rounded-t-2xl sm:rounded-md ${widthCls} p-6 sm:p-7 pb-safe max-h-[92vh] sm:max-h-[90vh] overflow-y-auto`}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Grab handle — a small affordance that this sheet drags up
             from the bottom on phone. Hidden on sm+. */}
-        <div className="sm:hidden mx-auto mb-3 h-1 w-10 rounded-full bg-borderc" aria-hidden />
-        <h2 className="text-lg font-semibold text-navy mb-3">{title}</h2>
+        <div className="sm:hidden mx-auto mb-4 h-1 w-10 rounded-full bg-borderc" aria-hidden />
+        <h2 className="text-lg font-semibold text-navy mb-5 pb-3 border-b border-borderc">
+          {title}
+        </h2>
         {children}
       </div>
     </div>

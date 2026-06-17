@@ -116,7 +116,7 @@ export function OtpModal({ reservationId, guestId, open, onClose, onVerified }: 
           </button>
         </div>
 
-        <div className="p-5 space-y-4">
+        <div className="p-6 space-y-4">
           {step === "choose" && (
             <>
               <p className="text-sm text-textSecondary">

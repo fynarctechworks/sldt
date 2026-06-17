@@ -90,6 +90,7 @@ async function buildDashboard() {
     forecastRows,
     upcomingArrivalsRow,
     likelyNoShowsRow,
+    revenueByMethodTodayRows,
   ] = await Promise.all([
       db.select().from(rooms).orderBy(rooms.floor, rooms.roomNumber),
       db
@@ -463,6 +464,27 @@ async function buildDashboard() {
           ),
         )
         .orderBy(reservations.checkInDate),
+      // Revenue today, broken down by payment method (Cash / UPI / Card /
+      // Bank transfer / Cheque). Same filter as revenue_today above:
+      // received, not voided, non-complimentary, paid today. Drives the
+      // dashboard's daily money overview / owner cash-up.
+      db
+        .select({
+          method: payments.paymentMethod,
+          total: sql<string>`COALESCE(SUM(${payments.amount}), 0)::text`,
+          count: sql<number>`count(*)::int`,
+        })
+        .from(payments)
+        .innerJoin(reservations, eq(reservations.id, payments.reservationId))
+        .where(
+          and(
+            gte(payments.paymentDate, startOfDay),
+            eq(payments.voided, false),
+            eq(payments.status, "received"),
+            sql`${reservations.bookingSource} <> 'complimentary'`,
+          ),
+        )
+        .groupBy(payments.paymentMethod),
     ]);
 
   const occupiedCount = occupiedRows[0]?.count ?? 0;
@@ -637,7 +659,15 @@ async function buildDashboard() {
         effectiveCheckoutAt: new Date(effectiveMs).toISOString(),
       };
     }),
-    revenue_today: { total_collected: Number(revenueRow[0]?.total ?? 0) },
+    revenue_today: {
+      total_collected: Number(revenueRow[0]?.total ?? 0),
+      // Per-method split for the daily money overview / owner cash-up.
+      by_method: revenueByMethodTodayRows.map((m) => ({
+        method: m.method,
+        total: +Number(m.total).toFixed(2),
+        count: m.count,
+      })),
+    },
     // Industry-standard hospitality KPIs.
     //   MTD revenue          = total collected since the 1st of this month.
     //   Outstanding balance  = total unpaid across every non-cancelled

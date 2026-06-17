@@ -468,7 +468,7 @@ function AddGuestModal({ onClose }: { onClose: () => void }) {
       onClick={onClose}
     >
       <div
-        className="bg-surface rounded-md w-full max-w-2xl p-5 space-y-3 max-h-[90vh] overflow-y-auto"
+        className="bg-surface rounded-md w-full max-w-2xl p-6 space-y-4 max-h-[90vh] overflow-y-auto"
         onClick={(e) => e.stopPropagation()}
       >
         <h2 className="text-lg font-semibold text-navy">Add Guest</h2>

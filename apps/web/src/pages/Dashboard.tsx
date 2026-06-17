@@ -43,7 +43,12 @@ interface DashboardData {
   };
   // Omitted by the API for users without `view_revenue`. We still render
   // the Dashboard, just without the Revenue Today tile.
-  revenue_today?: { total_collected: number };
+  revenue_today?: {
+    total_collected: number;
+    // Per-payment-method split of today's collections for the daily
+    // money overview / owner cash-up.
+    by_method?: { method: string; total: number; count: number }[];
+  };
   revenue_kpis?: {
     mtd_collected: number;
     outstanding_balance: number;
@@ -193,6 +198,16 @@ export default function Dashboard() {
           )}
         </div>
       )}
+
+      {/* Today's money overview — collections split by payment method
+          (Cash / UPI / Card / Bank transfer / Cheque). Gated behind
+          view_revenue like the rupee tiles. Gives the desk a quick
+          end-of-day cash-up to hand the owner. */}
+      <Can do="view_revenue">
+        {data.revenue_today && (
+          <TodaysCollections data={data.revenue_today} />
+        )}
+      </Can>
 
       <div className="card">
         <h2 className="font-semibold text-brand-dark mb-3">Availability by Floor</h2>
@@ -474,6 +489,95 @@ function StatCard({
       </div>
       <div className="text-2xl font-bold text-navy mt-2">{value}</div>
       <div className="text-xs text-textSecondary mt-1">{sub}</div>
+    </div>
+  );
+}
+
+// Human labels for the payment_method enum, in the order we want them
+// shown on the cash-up. Any method not listed (future additions) still
+// renders with a title-cased fallback so nothing silently disappears.
+const PAYMENT_METHOD_LABELS: Record<string, string> = {
+  cash: "Cash",
+  upi: "UPI",
+  card: "Card",
+  bank_transfer: "Bank Transfer",
+  cheque: "Cheque",
+};
+const PAYMENT_METHOD_ORDER = ["cash", "upi", "card", "bank_transfer", "cheque"];
+
+function methodLabel(method: string): string {
+  return (
+    PAYMENT_METHOD_LABELS[method] ??
+    method.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())
+  );
+}
+
+// Today's collections broken down by payment method — the daily money
+// overview the front desk hands to the owner at end of day.
+function TodaysCollections({
+  data,
+}: {
+  data: { total_collected: number; by_method?: { method: string; total: number; count: number }[] };
+}) {
+  const rows = (data.by_method ?? [])
+    .filter((m) => m.total !== 0 || m.count > 0)
+    .slice()
+    .sort(
+      (a, b) =>
+        PAYMENT_METHOD_ORDER.indexOf(a.method) - PAYMENT_METHOD_ORDER.indexOf(b.method),
+    );
+  const totalTxns = rows.reduce((s, m) => s + m.count, 0);
+
+  return (
+    <div className="card">
+      <div className="flex items-center justify-between mb-3">
+        <div>
+          <h2 className="font-semibold text-brand-dark">Today's Collections by Method</h2>
+          <p className="text-xs text-textSecondary mt-0.5">
+            Money received today, split by payment mode — for the daily cash-up.
+          </p>
+        </div>
+        <Wallet className="w-5 h-5 text-accentBlue" />
+      </div>
+
+      {rows.length === 0 ? (
+        <div className="text-sm text-textSecondary py-2">
+          No payments collected today yet.
+        </div>
+      ) : (
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+          {rows.map((m) => (
+            <div
+              key={m.method}
+              className="rounded-sm border border-borderc bg-bg p-3"
+            >
+              <div className="text-xs uppercase tracking-wide text-textSecondary">
+                {methodLabel(m.method)}
+              </div>
+              <div className="text-lg font-bold text-navy mt-1 font-mono">
+                {inr(m.total)}
+              </div>
+              <div className="text-[11px] text-textSecondary mt-0.5">
+                {m.count} payment{m.count === 1 ? "" : "s"}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="flex items-center justify-between mt-3 pt-3 border-t border-borderc">
+        <span className="text-sm font-semibold text-brand-dark">
+          Total collected today
+          {totalTxns > 0 && (
+            <span className="text-textSecondary font-normal">
+              {" "}· {totalTxns} payment{totalTxns === 1 ? "" : "s"}
+            </span>
+          )}
+        </span>
+        <span className="text-lg font-bold font-mono text-brand-dark">
+          {inr(data.total_collected)}
+        </span>
+      </div>
     </div>
   );
 }

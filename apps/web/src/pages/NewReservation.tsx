@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { addDays, differenceInCalendarDays, format } from "date-fns";
-import { AlertTriangle, ChevronLeft, FileText, ShieldCheck, Snowflake, Sparkles, Tv, Upload, Wifi, X } from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronLeft, FileText, Minus, Plus, ShieldCheck, Snowflake, Sparkles, Trash2, Tv, Upload, Users, Wifi, X } from "lucide-react";
 import { CheckInReceiptModal, type CheckInReceiptData } from "@/components/CheckInReceiptModal";
 import { OtpModal } from "@/components/OtpModal";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
@@ -33,6 +33,71 @@ interface Guest {
   // dropdown so staff can visually confirm they're picking the right
   // person before continuing. Null when the guest has no photo on file.
   photoUrl?: string | null;
+}
+
+// A single co-guest (2nd+ occupant) capture slot. Either an existing
+// guest picked via search, or a fresh new-guest form + its own KYC files.
+interface CoGuestForm {
+  fullName: string;
+  phone: string;
+  email: string;
+  gender: "" | "male" | "female" | "other" | "prefer_not_to_say";
+  idProofType: "aadhaar" | "pan" | "passport" | "driving_license" | "voter_id";
+  idProofNumber: string;
+  address: string;
+  city: string;
+  state: string;
+  nationality: string;
+}
+
+interface CoGuestEntry {
+  // Stable key so React keeps each card's inputs/focus stable across
+  // add/remove without remounting siblings.
+  id: string;
+  useNew: boolean;
+  query: string;
+  selected: Guest | null;
+  form: CoGuestForm;
+  kycPhoto: File | null;
+  kycFront: File | null;
+  kycBack: File | null;
+}
+
+let coGuestSeq = 0;
+function makeCoGuestEntry(): CoGuestEntry {
+  coGuestSeq += 1;
+  return {
+    id: `cg-${coGuestSeq}`,
+    useNew: false,
+    query: "",
+    selected: null,
+    form: {
+      fullName: "",
+      phone: "",
+      email: "",
+      gender: "",
+      idProofType: "aadhaar",
+      idProofNumber: "",
+      address: "",
+      city: "",
+      state: "",
+      nationality: "Indian",
+    },
+    kycPhoto: null,
+    kycFront: null,
+    kycBack: null,
+  };
+}
+
+// An entry counts as "started" when staff picked an existing guest or
+// typed any of the three required new-guest fields.
+function isCoGuestStarted(c: CoGuestEntry): boolean {
+  if (c.selected) return true;
+  return (
+    c.form.fullName.trim() !== "" ||
+    c.form.phone.trim() !== "" ||
+    c.form.idProofNumber.trim() !== ""
+  );
 }
 
 interface AvailableRoom {
@@ -154,27 +219,33 @@ export default function NewReservation() {
   });
   const [useNewGuest, setUseNewGuest] = useState(false);
 
-  // Co-guest (2nd occupant). Required when numAdults >= 2.
-  // Mirror the booker state: existing-guest search OR new-guest form.
-  const [coGuest, setCoGuest] = useState<Guest | null>(null);
-  const [coGuestUseNew, setCoGuestUseNew] = useState(false);
-  const [coGuestForm, setCoGuestForm] = useState({
-    fullName: "",
-    phone: "",
-    email: "",
-    gender: "" as "" | "male" | "female" | "other" | "prefer_not_to_say",
-    idProofType: "aadhaar" as "aadhaar" | "pan" | "passport" | "driving_license" | "voter_id",
-    idProofNumber: "",
-    address: "",
-    city: "",
-    state: "",
-    nationality: "Indian",
-  });
-  const [coGuestQuery, setCoGuestQuery] = useState("");
-  const [coGuestKycPhoto, setCoGuestKycPhoto] = useState<File | null>(null);
-  const [coGuestKycFront, setCoGuestKycFront] = useState<File | null>(null);
-  const [coGuestKycBack, setCoGuestKycBack] = useState<File | null>(null);
+  // Co-guests (2nd+ occupants). Required when numAdults >= 2. Each entry
+  // mirrors the booker state: existing-guest search OR new-guest form,
+  // plus its own KYC files. The list auto-grows to (adults - 1) but staff
+  // can also Add/Remove cards manually for groups of any size.
+  const [coGuests, setCoGuests] = useState<CoGuestEntry[]>([]);
   const needsCoGuest = adults >= 2;
+
+  const updateCoGuest = (id: string, patch: Partial<CoGuestEntry>) =>
+    setCoGuests((prev) => prev.map((c) => (c.id === id ? { ...c, ...patch } : c)));
+  const addCoGuest = () => setCoGuests((prev) => [...prev, makeCoGuestEntry()]);
+  const removeCoGuest = (id: string) =>
+    setCoGuests((prev) => prev.filter((c) => c.id !== id));
+
+  // Show ONE co-guest card by default once there are 2+ adults — that's
+  // the second guest whose KYC is legally required. Staff add the rest
+  // (for larger groups) via the "Add another guest" button, so we don't
+  // flood the form with empty cards for every head in the adults count.
+  // Shrinking only trims trailing EMPTY cards so typed data is never lost.
+  useEffect(() => {
+    const minCards = adults >= 2 ? 1 : 0;
+    setCoGuests((prev) => {
+      if (prev.length >= minCards) return prev;
+      const next = prev.slice();
+      while (next.length < minCards) next.push(makeCoGuestEntry());
+      return next;
+    });
+  }, [adults]);
 
   const [selectedRooms, setSelectedRooms] = useState<
     {
@@ -183,6 +254,16 @@ export default function NewReservation() {
       roomNumber: string;
       soldAsType: string | null;
       nativeType: string;
+      // Base capacity of the physical room (room.maxOccupancy), captured
+      // at selection so the capacity gate doesn't need the availability
+      // list to recompute.
+      maxOccupancy: number;
+      // Extra beds (additional persons) staff added to this room. Each
+      // raises effective capacity by 1 and adds extraBedRate/night.
+      extraBeds: number;
+      // Per-bed, per-night fee for this room, read from its (sold-as or
+      // native) room type's extraPersonRate. 0 → extra beds not offered.
+      extraBedRate: number;
       // Original native base rate captured when the room was first
       // picked. Used to revert the price when staff switches "Sell as"
       // back to the native option.
@@ -197,6 +278,19 @@ export default function NewReservation() {
       } | null;
     }[]
   >([]);
+  // Per-room collapsed state for the selected-room controls panel. A room
+  // not in the set is expanded (the default when freshly selected); adding
+  // its id collapses the Sell-as / Rate / Extra-beds panel to a compact
+  // summary. Selection itself is unaffected — this is purely a dropdown.
+  const [collapsedRooms, setCollapsedRooms] = useState<Set<string>>(new Set());
+  const toggleRoomCollapsed = (roomId: string) =>
+    setCollapsedRooms((prev) => {
+      const next = new Set(prev);
+      if (next.has(roomId)) next.delete(roomId);
+      else next.add(roomId);
+      return next;
+    });
+
   // Sticky confirmation: when one or more selected rooms have a
   // future reservation, staff has to tick a single "I'll vacate
   // before [date]" box before the create button enables.
@@ -225,17 +319,38 @@ export default function NewReservation() {
     if (mode === "walkin" && checkInDate !== todayStr) setCheckInDate(todayStr);
   }, [mode, checkInDate]);
 
-  // Short-stay is by definition same-day. When the user picks short_stay or
-  // changes check-in while in short_stay, snap check-out to match. When
-  // switching back to overnight, push check-out to the following day so the
-  // form is immediately submit-ready.
+  // Short-stay is by definition same-day: keep check-out pinned to
+  // check-in. For overnight we DON'T silently snap an invalid check-out
+  // here — that would hide the same-date mistake. Instead the invalid
+  // state stands and an inline error (see overnightDateError below) tells
+  // staff to fix it, and submit is blocked. We only auto-fix check-out
+  // on the mode switch INTO overnight, so the form starts in a valid
+  // state rather than carrying the day-use same-date value.
   useEffect(() => {
     if (isShortStay) {
       if (checkOutDate !== checkInDate) setCheckOutDate(checkInDate);
-    } else if (checkOutDate <= checkInDate) {
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isShortStay, checkInDate]);
+
+  // When the user switches the stay type to overnight, ensure check-out is
+  // at least one night out (the day-use value would have been same-date).
+  useEffect(() => {
+    if (!isShortStay && checkOutDate <= checkInDate) {
       setCheckOutDate(format(addDays(new Date(checkInDate), 1), "yyyy-MM-dd"));
     }
-  }, [isShortStay, checkInDate, checkOutDate]);
+    // Only run on the stay-type transition, not on every date keystroke,
+    // so a manual same-date entry surfaces the error instead of snapping.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stayType]);
+
+  // Overnight bookings need at least one night — check-out strictly after
+  // check-in. Drives the inline error and blocks submit. Day-use is exempt
+  // (same calendar day by definition).
+  const overnightDateError =
+    !isShortStay && checkOutDate <= checkInDate
+      ? "Check-out must be at least 1 night after check-in (overnight stays can't end the same day)."
+      : null;
 
   // OTP verification is mandatory for every booking. The reservation row
   // is never created until OTP succeeds, so abandoning the OTP modal /
@@ -267,6 +382,13 @@ export default function NewReservation() {
   // next configured price tier). Otherwise pro-rate the overnight default
   // rate over 24 h. Either way, the returned value is the price for the
   // whole short-stay block.
+  // Per-night extra-bed fee for a room type slug. 0 when the type
+  // doesn't offer extra beds (or isn't loaded yet).
+  function extraBedRateForType(slug: string): number {
+    const rt = roomTypesQ.data?.find((t) => t.slug === slug);
+    return rt ? Number(rt.extraPersonRate) : 0;
+  }
+
   function shortStayRateForType(slug: string): { rate: number; bandLabel: string | null } {
     const rt = roomTypesQ.data?.find((t) => t.slug === slug);
     if (!rt) return { rate: 0, bandLabel: null };
@@ -297,6 +419,9 @@ export default function NewReservation() {
           slug: string;
           label: string;
           defaultRate: string;
+          // Per-night charge for each extra bed (person over max occupancy)
+          // for this type. "0" means extra beds aren't offered.
+          extraPersonRate: string;
           // Day-use bands (hours+rate) configured per room type in
           // Settings → Room Types. Empty when the property hasn't set any
           // up — we then derive a custom-hours price by pro-rating the
@@ -427,21 +552,34 @@ export default function NewReservation() {
               ratePerNight: Number(room.baseRate),
               roomNumber: room.roomNumber,
               soldAsType: null,
+              maxOccupancy: room.maxOccupancy,
+              extraBeds: 0,
+              extraBedRate: extraBedRateForType(room.roomType),
               nativeType: room.roomType,
               nativeBaseRate: Number(room.baseRate),
             },
           ],
     );
-  }, [preselectRoomId, availRooms.data]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [preselectRoomId, availRooms.data, roomTypesQ.data]);
 
   // Short-stay: ratePerNight on each selected room already holds the FLAT
   // short-stay price for the chosen block. Overnight: multiply by nights.
-  // `roomAmount` is the raw user-typed total — its meaning depends on the
-  // GST mode (net in exclusive, gross in inclusive).
-  const roomAmount = selectedRooms.reduce(
-    (a, r) => a + r.ratePerNight * (isShortStay ? 1 : nights),
+  // Extra beds carry a per-night, per-person fee on top. We keep the BASE
+  // room amount separate (it decides the GST slab — extra-bed money must
+  // not push a room into a higher slab) and add the extra-bed amount into
+  // the taxable `roomAmount` at the same slab. Mirrors the server exactly
+  // (apps/api/src/routes/reservations.ts).
+  const billingUnits = isShortStay ? 1 : nights;
+  const roomBaseAmount = selectedRooms.reduce(
+    (a, r) => a + r.ratePerNight * billingUnits,
     0,
   );
+  const extraBedAmount = selectedRooms.reduce(
+    (a, r) => a + r.extraBeds * r.extraBedRate * billingUnits,
+    0,
+  );
+  const roomAmount = +(roomBaseAmount + extraBedAmount).toFixed(2);
   const gstMode = publicSettings.data?.gstMode ?? "inclusive";
 
   // GST preview — mirrors apps/api/src/lib/gst.ts so the booking screen shows
@@ -459,10 +597,10 @@ export default function NewReservation() {
   const avgRatePerNight =
     isShortStay
       ? selectedRooms.length > 0
-        ? roomAmount / selectedRooms.length
+        ? roomBaseAmount / selectedRooms.length
         : 0
       : selectedRooms.length > 0 && nights > 0
-        ? roomAmount / (nights * selectedRooms.length)
+        ? roomBaseAmount / (nights * selectedRooms.length)
         : 0;
   const gstRate =
     avgRatePerNight === 0
@@ -587,23 +725,22 @@ export default function NewReservation() {
           throw new Error("Customer photo is required for walk-in check-in");
       }
 
-      // Co-guest validation (no writes yet) — decide whether a new co-guest
-      // will be created and pre-validate its fields here so we never create
-      // the booker only to choke on a malformed co-guest afterwards.
-      const startedNewCoGuest =
-        needsCoGuest &&
-        coGuestUseNew &&
-        (coGuestForm.fullName.trim() !== "" ||
-          coGuestForm.phone.trim() !== "" ||
-          coGuestForm.idProofNumber.trim() !== "");
-      if (startedNewCoGuest) {
-        if (!coGuestForm.fullName || !coGuestForm.phone || !coGuestForm.idProofNumber)
+      // Co-guest validation (no writes yet) — for every started co-guest
+      // card, pre-validate its fields here so we never create the booker
+      // only to choke on a malformed co-guest afterwards. A card counts as
+      // "new" work only when it's in new-guest mode AND has been started.
+      const activeCoGuests = needsCoGuest ? coGuests : [];
+      activeCoGuests.forEach((c, i) => {
+        const startedNew = c.useNew && isCoGuestStarted(c);
+        if (!startedNew) return;
+        const ord = i + 2; // booker is guest 1; co-guests start at 2
+        if (!c.form.fullName || !c.form.phone || !c.form.idProofNumber)
           throw new Error(
-            "Fill in the second guest's name, phone and ID number — or clear all three to skip",
+            `Fill in guest ${ord}'s name, phone and ID number — or clear all three to skip`,
           );
-        if (!coGuestForm.gender)
-          throw new Error("Gender is required for the second guest");
-      }
+        if (!c.form.gender)
+          throw new Error(`Gender is required for guest ${ord}`);
+      });
 
       // ── Writes start here. From this point on, any failure must sweep
       // the guest rows we created (freshGuestIdsRef), which the caller and
@@ -634,31 +771,32 @@ export default function NewReservation() {
       }
 
       const coGuestIds: string[] = [];
-      if (needsCoGuest) {
-        let coGuestId = coGuest?.id;
-        if (startedNewCoGuest) {
+      for (const c of activeCoGuests) {
+        let coGuestId = c.selected?.id;
+        const startedNew = c.useNew && isCoGuestStarted(c);
+        if (startedNew) {
           const g2 = await api.post<Guest>("/guests", {
-            ...coGuestForm,
-            phone: normalizeIndianPhone(coGuestForm.phone),
-            email: coGuestForm.email || undefined,
+            ...c.form,
+            phone: normalizeIndianPhone(c.form.phone),
+            email: c.form.email || undefined,
           });
           coGuestId = g2.id;
           freshGuestIdsRef.current.push(g2.id);
-          if (coGuestKycFront || coGuestKycPhoto || coGuestKycBack) {
+          if (c.kycFront || c.kycPhoto || c.kycBack) {
             const form = new FormData();
-            if (coGuestKycFront) form.append("front", coGuestKycFront);
-            if (coGuestKycBack) form.append("back", coGuestKycBack);
-            if (coGuestKycPhoto) form.append("photo", coGuestKycPhoto);
+            if (c.kycFront) form.append("front", c.kycFront);
+            if (c.kycBack) form.append("back", c.kycBack);
+            if (c.kycPhoto) form.append("photo", c.kycPhoto);
             await api.upload(`/guests/${coGuestId}/kyc`, form);
           }
         }
-        // Only push the co-guest id when we actually have one — empty
-        // array is fine, the server schema allows it.
-        if (coGuestId) {
-          if (coGuestId === guestId)
-            throw new Error("Booker can't also be the second guest");
-          coGuestIds.push(coGuestId);
-        }
+        // Skip empty cards; an empty coGuestIds array is fine server-side.
+        if (!coGuestId) continue;
+        if (coGuestId === guestId)
+          throw new Error("The booker can't also be listed as a co-guest");
+        if (coGuestIds.includes(coGuestId))
+          throw new Error("The same guest is listed twice — pick a different person");
+        coGuestIds.push(coGuestId);
       }
 
       return { guestId, coGuestIds };
@@ -717,6 +855,8 @@ export default function NewReservation() {
           roomId: r.roomId,
           ratePerNight: r.ratePerNight,
           soldAsType: r.soldAsType ?? undefined,
+          extraBeds: r.extraBeds > 0 ? r.extraBeds : undefined,
+          extraBedRate: r.extraBeds > 0 ? r.extraBedRate : undefined,
         })),
         coGuestIds: pendingCoGuestIds.length > 0 ? pendingCoGuestIds : undefined,
         advancePaid: isCreditBooking ? 0 : advance > 0 ? advance : 0,
@@ -805,6 +945,8 @@ export default function NewReservation() {
               soldAsType?: string | null;
               displayType?: string;
               ratePerNight: string;
+              extraBeds?: number;
+              extraBedRate?: string;
             }[];
             payments: {
               id: string;
@@ -871,6 +1013,8 @@ export default function NewReservation() {
             soldAsType: r.soldAsType ?? null,
             displayType: r.displayType,
             ratePerNight: r.ratePerNight,
+            extraBeds: r.extraBeds,
+            extraBedRate: r.extraBedRate,
           })),
           subtotal: detail.subtotal,
           gstRate: detail.gstRate,
@@ -912,7 +1056,17 @@ export default function NewReservation() {
   function toggleRoom(room: AvailableRoom) {
     setSelectedRooms((prev) => {
       const exists = prev.find((r) => r.roomId === room.id);
-      if (exists) return prev.filter((r) => r.roomId !== room.id);
+      if (exists) {
+        // Deselecting — drop any collapsed flag so a later re-select
+        // opens expanded again.
+        setCollapsedRooms((c) => {
+          if (!c.has(room.id)) return c;
+          const next = new Set(c);
+          next.delete(room.id);
+          return next;
+        });
+        return prev.filter((r) => r.roomId !== room.id);
+      }
       // For short-stay, the initial rate is the FLAT short-stay price for
       // the selected hours (derived from this room type's bands). The
       // user can still override per-room.
@@ -926,12 +1080,32 @@ export default function NewReservation() {
           ratePerNight: initialRate,
           roomNumber: room.roomNumber,
           soldAsType: null,
+          maxOccupancy: room.maxOccupancy,
+          extraBeds: 0,
+          extraBedRate: extraBedRateForType(room.roomType),
           nativeType: room.roomType,
           nativeBaseRate: Number(room.baseRate),
           nextReservation: room.nextReservation ?? null,
         },
       ];
     });
+  }
+
+  // Add / remove an extra bed on a room. Capacity gate caps the total at
+  // a sane ceiling (+3 over base), enforced where the stepper renders.
+  function updateExtraBeds(roomId: string, beds: number) {
+    setSelectedRooms((prev) =>
+      prev.map((r) => (r.roomId === roomId ? { ...r, extraBeds: Math.max(0, beds) } : r)),
+    );
+  }
+
+  // Per-booking override of the extra-bed rate. Seeded from the room
+  // type's configured extraPersonRate but editable here so the desk can
+  // negotiate the extra-bed fee for this stay.
+  function updateExtraBedRate(roomId: string, rate: number) {
+    setSelectedRooms((prev) =>
+      prev.map((r) => (r.roomId === roomId ? { ...r, extraBedRate: Math.max(0, rate) } : r)),
+    );
   }
 
   function updateRate(roomId: string, rate: number) {
@@ -956,7 +1130,14 @@ export default function NewReservation() {
             ? shortStayRateForType(r.nativeType).rate || r.nativeBaseRate
             : r.nativeBaseRate;
         }
-        return { ...r, soldAsType: slug, ratePerNight: nextRate };
+        // Extra-bed fee follows the effective (sold-as, else native) type.
+        const effectiveType = slug ?? r.nativeType;
+        return {
+          ...r,
+          soldAsType: slug,
+          ratePerNight: nextRate,
+          extraBedRate: extraBedRateForType(effectiveType),
+        };
       }),
     );
   }
@@ -968,11 +1149,25 @@ export default function NewReservation() {
   useEffect(() => {
     if (reletRooms.length === 0 && reletConfirmed) setReletConfirmed(false);
   }, [reletRooms.length, reletConfirmed]);
+
+  // Occupancy gate. The selected rooms must sleep at least `adults`
+  // (children don't consume a bed slot — see the capacity decision).
+  // Effective capacity = Σ(base maxOccupancy) + Σ(extra beds added).
+  const baseCapacity = selectedRooms.reduce((a, r) => a + (r.maxOccupancy || 0), 0);
+  const extraBedCapacity = selectedRooms.reduce((a, r) => a + r.extraBeds, 0);
+  const effectiveCapacity = baseCapacity + extraBedCapacity;
+  const capacityShortfall = Math.max(0, adults - effectiveCapacity);
+  // Only gate once rooms are picked — before that the Rooms section
+  // already tells staff to select rooms.
+  const capacityOk = selectedRooms.length === 0 || capacityShortfall === 0;
+
   const canSubmit =
     canPriceStay &&
+    !overnightDateError &&
     selectedRooms.length > 0 &&
     (selectedGuest || (useNewGuest && newGuest.fullName && newGuest.phone && newGuest.idProofNumber)) &&
     !advanceTooHigh &&
+    capacityOk &&
     (reletRooms.length === 0 || reletConfirmed);
 
   return (
@@ -1083,7 +1278,11 @@ export default function NewReservation() {
               {isShortStay ? "Check-out (same day)" : "Check-out"}
             </label>
             <input
-              className="input"
+              className={`input ${
+                overnightDateError
+                  ? "border-danger focus:border-danger focus:ring-danger/30"
+                  : ""
+              }`}
               type="date"
               value={checkOutDate}
               disabled={isShortStay}
@@ -1094,8 +1293,12 @@ export default function NewReservation() {
                     ? format(addDays(new Date(checkInDate), 1), "yyyy-MM-dd")
                     : todayStr
               }
+              aria-invalid={!!overnightDateError}
               onChange={(e) => setCheckOutDate(e.target.value)}
             />
+            {overnightDateError && (
+              <div className="text-[11px] text-danger mt-1">{overnightDateError}</div>
+            )}
             {/* Time picker (0023). For short_stay the end time follows
                 from duration so we hide it; overnight allows an explicit
                 checkout-time promise. */}
@@ -1552,23 +1755,50 @@ export default function NewReservation() {
       )}
 
       {needsCoGuest && (
-        <SecondOccupantCard
-          mode={coGuestUseNew ? "new" : "existing"}
-          onModeChange={(m) => setCoGuestUseNew(m === "new")}
-          query={coGuestQuery}
-          setQuery={setCoGuestQuery}
-          selected={coGuest}
-          onSelected={setCoGuest}
-          excludeGuestId={selectedGuest?.id ?? null}
-          form={coGuestForm}
-          setForm={setCoGuestForm}
-          kycPhoto={coGuestKycPhoto}
-          setKycPhoto={setCoGuestKycPhoto}
-          kycFront={coGuestKycFront}
-          setKycFront={setCoGuestKycFront}
-          kycBack={coGuestKycBack}
-          setKycBack={setCoGuestKycBack}
-        />
+        <>
+          {coGuests.map((c, i) => {
+            // IDs already used by the booker or another co-guest card, so a
+            // person can't be picked twice across the group.
+            const taken = new Set<string>();
+            if (selectedGuest?.id) taken.add(selectedGuest.id);
+            for (const other of coGuests) {
+              if (other.id !== c.id && other.selected?.id)
+                taken.add(other.selected.id);
+            }
+            return (
+              <CoGuestCard
+                key={c.id}
+                index={i}
+                canRemove={coGuests.length > 1}
+                onRemove={() => removeCoGuest(c.id)}
+                mode={c.useNew ? "new" : "existing"}
+                onModeChange={(m) =>
+                  updateCoGuest(c.id, { useNew: m === "new", selected: null })
+                }
+                query={c.query}
+                setQuery={(q) => updateCoGuest(c.id, { query: q })}
+                selected={c.selected}
+                onSelected={(g) => updateCoGuest(c.id, { selected: g })}
+                takenGuestIds={taken}
+                form={c.form}
+                setForm={(f) => updateCoGuest(c.id, { form: f })}
+                kycPhoto={c.kycPhoto}
+                setKycPhoto={(file) => updateCoGuest(c.id, { kycPhoto: file })}
+                kycFront={c.kycFront}
+                setKycFront={(file) => updateCoGuest(c.id, { kycFront: file })}
+                kycBack={c.kycBack}
+                setKycBack={(file) => updateCoGuest(c.id, { kycBack: file })}
+              />
+            );
+          })}
+          <button
+            type="button"
+            onClick={addCoGuest}
+            className="w-full inline-flex items-center justify-center gap-1.5 h-11 rounded-sm border-2 border-dashed border-borderc text-sm font-medium text-textSecondary hover:border-brand hover:text-brand-dark hover:bg-brand-soft/20 transition"
+          >
+            <Plus className="w-4 h-4" /> Add another guest
+          </button>
+        </>
       )}
 
       <div className="card space-y-3">
@@ -1602,6 +1832,32 @@ export default function NewReservation() {
             </div>
           )}
         </div>
+        {/* Occupancy gate. Once rooms are picked, the selected rooms must
+            sleep at least `adults`. Extra beds added per room count toward
+            capacity. When short, block submit and tell staff to add an
+            extra bed or another room. */}
+        {selectedRooms.length > 0 && (
+          capacityShortfall > 0 ? (
+            <div className="rounded-sm border border-danger/40 bg-danger/5 p-3 flex items-start gap-2">
+              <AlertTriangle className="w-4 h-4 text-danger shrink-0 mt-0.5" />
+              <div className="text-sm leading-snug">
+                <div className="font-semibold text-danger">
+                  {adults} adult{adults === 1 ? "" : "s"} but selected rooms sleep {effectiveCapacity}.
+                </div>
+                <div className="text-textSecondary mt-0.5">
+                  Add an extra bed to a room below, or select another room —{" "}
+                  <strong>{capacityShortfall}</strong> more {capacityShortfall === 1 ? "berth" : "berths"} needed.
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="text-xs text-success flex items-center gap-1.5">
+              <Users className="w-3.5 h-3.5" />
+              Capacity OK — sleeps {effectiveCapacity} for {adults} adult{adults === 1 ? "" : "s"}
+              {extraBedCapacity > 0 ? ` (incl. ${extraBedCapacity} extra bed${extraBedCapacity === 1 ? "" : "s"})` : ""}.
+            </div>
+          )
+        )}
         {!canPriceStay ? (
           <div className="text-textSecondary text-sm">
             {isShortStay
@@ -1671,6 +1927,11 @@ export default function NewReservation() {
                   onClick={() => {
                     if (conflicted) return;
                     if (needsClean && !selected) return;
+                    // Clicking the card toggles selection. The controls
+                    // panel below (Sell as / Rate / Extra beds) stops its
+                    // own click propagation, so editing those never
+                    // deselects — only the room header / empty card area
+                    // does. The chevron stays for collapse-only.
                     toggleRoom(r);
                   }}
                 >
@@ -1710,18 +1971,51 @@ export default function NewReservation() {
                             <Wifi className="w-3 h-3" /> Wi-Fi
                           </span>
                         )}
+                        {r.maxOccupancy > 0 && (
+                          <span
+                            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-sm text-[10px] font-semibold bg-navy/10 text-navy"
+                            title={`Sleeps up to ${r.maxOccupancy} guest${r.maxOccupancy === 1 ? "" : "s"}`}
+                          >
+                            <Users className="w-3 h-3" /> Sleeps {r.maxOccupancy}
+                          </span>
+                        )}
                       </div>
                       <div className="text-xs text-textSecondary capitalize mt-0.5">
                         {r.roomType.replace(/_/g, " ")} · Floor {r.floor}
                       </div>
                     </div>
-                    <div className="text-sm font-mono">
-                      {/* Once a room is selected, show what the guest
-                          will actually be billed (effective rate). Falls
-                          back to the room's native base rate before the
-                          card is selected so the price is still visible
-                          in the picker grid. */}
-                      {selected ? inr(selected.ratePerNight) : inr(r.baseRate)}
+                    <div className="flex items-start gap-2 shrink-0">
+                      <div className="text-sm font-mono">
+                        {/* Once a room is selected, show what the guest
+                            will actually be billed (effective rate). Falls
+                            back to the room's native base rate before the
+                            card is selected so the price is still visible
+                            in the picker grid. */}
+                        {selected ? inr(selected.ratePerNight) : inr(r.baseRate)}
+                      </div>
+                      {/* Collapse / expand the controls panel — behaves
+                          like a dropdown. Selection is unaffected; the
+                          room stays in the booking. Stop propagation so
+                          the click doesn't hit the card's select handler. */}
+                      {selected && (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            toggleRoomCollapsed(r.id);
+                          }}
+                          className="inline-flex items-center justify-center rounded-sm border border-borderc w-6 h-6 text-navy hover:border-brand hover:bg-brand-soft/30"
+                          title={collapsedRooms.has(r.id) ? "Expand" : "Collapse"}
+                          aria-label={collapsedRooms.has(r.id) ? "Expand room options" : "Collapse room options"}
+                          aria-expanded={!collapsedRooms.has(r.id)}
+                        >
+                          <ChevronDown
+                            className={`w-4 h-4 transition-transform ${
+                              collapsedRooms.has(r.id) ? "-rotate-90" : ""
+                            }`}
+                          />
+                        </button>
+                      )}
                     </div>
                   </div>
                   {/* Date conflict: card stays visible but disabled so
@@ -1785,13 +2079,43 @@ export default function NewReservation() {
                       </div>
                     </div>
                   )}
-                  {selected && (
-                    <div className="mt-2 space-y-2" onClick={(e) => e.stopPropagation()}>
+                  {/* Collapsed summary — shown when the room is selected
+                      but its panel is closed. Compact recap of the key
+                      choices so staff don't have to expand to check. */}
+                  {selected && collapsedRooms.has(r.id) && (
+                    <div className="mt-2 text-xs text-textSecondary flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                      <span className="font-mono font-semibold text-brand-dark">
+                        {inr(selected.ratePerNight)}
+                        {isShortStay ? `/${shortStayHours}h` : "/night"}
+                      </span>
+                      {selected.soldAsType && (
+                        <span>
+                          · sold as{" "}
+                          {roomTypesQ.data?.find((t) => t.slug === selected.soldAsType)?.label
+                            ?? selected.soldAsType.replace(/_/g, " ")}
+                        </span>
+                      )}
+                      {selected.extraBeds > 0 && (
+                        <span>
+                          · {selected.extraBeds} extra bed
+                          {selected.extraBeds === 1 ? "" : "s"} (
+                          {inr(selected.extraBeds * selected.extraBedRate * (isShortStay ? 1 : nights))})
+                        </span>
+                      )}
+                    </div>
+                  )}
+                  {selected && !collapsedRooms.has(r.id) && (
+                    // No blanket stopPropagation here — only the actual
+                    // controls (select / inputs / stepper buttons) swallow
+                    // the click, so tapping blank space in this panel still
+                    // bubbles to the card and deselects the room.
+                    <div className="mt-2 space-y-2">
                       <div>
                         <label className="label block mb-1">Sell as</label>
                         <select
                           className="input !h-8 text-sm"
                           value={selected.soldAsType ?? ""}
+                          onClick={(e) => e.stopPropagation()}
                           onChange={(e) => {
                             const slug = e.target.value || null;
                             const t = roomTypesQ.data?.find((x) => x.slug === slug);
@@ -1826,9 +2150,94 @@ export default function NewReservation() {
                           type="number"
                           value={selected.ratePerNight || ""}
                           placeholder="0"
+                          onClick={(e) => e.stopPropagation()}
                           onChange={(e) => updateRate(r.id, Number(e.target.value))}
                         />
                       </div>
+                      {/* Extra beds (additional persons). Shown when the
+                          effective room type offers extra beds (its
+                          configured rate > 0). The fee is seeded from that
+                          rate but editable per-booking. Capped at +3 over
+                          base; each bed raises effective capacity. */}
+                      {extraBedRateForType(selected.soldAsType ?? selected.nativeType) > 0 && (
+                        <div>
+                          <label className="label block mb-1">Extra beds</label>
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <button
+                              type="button"
+                              className="h-8 w-8 grid place-items-center rounded-sm border border-borderc text-navy disabled:opacity-40 hover:border-brand"
+                              disabled={selected.extraBeds <= 0}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                updateExtraBeds(r.id, selected.extraBeds - 1);
+                              }}
+                              aria-label="Remove extra bed"
+                            >
+                              <Minus className="w-3.5 h-3.5" />
+                            </button>
+                            <span className="min-w-8 text-center font-mono font-semibold">
+                              {selected.extraBeds}
+                            </span>
+                            <button
+                              type="button"
+                              className="h-8 w-8 grid place-items-center rounded-sm border border-borderc text-navy disabled:opacity-40 hover:border-brand"
+                              // Only allow adding a bed while guests are
+                              // still uncovered. Once the selected rooms'
+                              // total capacity meets the adult headcount,
+                              // there's no one left to seat — block the +.
+                              disabled={capacityShortfall <= 0}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                updateExtraBeds(r.id, selected.extraBeds + 1);
+                              }}
+                              aria-label="Add extra bed"
+                            >
+                              <Plus className="w-3.5 h-3.5" />
+                            </button>
+                            <span className="text-[11px] text-textSecondary">
+                              sleeps {selected.maxOccupancy + selected.extraBeds}
+                            </span>
+                          </div>
+                          {/* Editable per-bed, per-night fee. Defaults to the
+                              room type's rate; staff can change it for this
+                              booking. */}
+                          <div className="flex items-center gap-1.5 mt-1.5">
+                            <span className="text-[11px] text-textSecondary whitespace-nowrap">
+                              ₹/bed/night
+                            </span>
+                            <input
+                              className="input !h-8 text-sm !w-28"
+                              type="number"
+                              min={0}
+                              value={selected.extraBedRate || ""}
+                              placeholder="0"
+                              onClick={(e) => e.stopPropagation()}
+                              onChange={(e) =>
+                                updateExtraBedRate(r.id, Number(e.target.value))
+                              }
+                            />
+                          </div>
+                          {/* Running extra-bed charge for THIS room so staff
+                              see the total (rate × beds × units) without
+                              scrolling to the summary. 0 beds → no charge. */}
+                          {selected.extraBeds > 0 && selected.extraBedRate > 0 && (
+                            <div className="text-[11px] text-textSecondary mt-1.5">
+                              Extra-bed charge:{" "}
+                              <span className="font-mono font-semibold text-brand-dark">
+                                {inr(
+                                  selected.extraBeds *
+                                    selected.extraBedRate *
+                                    (isShortStay ? 1 : nights),
+                                )}
+                              </span>{" "}
+                              ({selected.extraBeds} × {inr(selected.extraBedRate)}
+                              {isShortStay
+                                ? ""
+                                : ` × ${nights} night${nights === 1 ? "" : "s"}`})
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -2022,6 +2431,18 @@ export default function NewReservation() {
               room{selectedRooms.length === 1 ? "" : "s"}) — GST included
             </span>
             <span className="font-mono">{inr(roomAmount)}</span>
+          </div>
+        )}
+        {/* Extra-bed charge breakdown. roomAmount already includes this;
+            we surface it as its own line so the bill is transparent. */}
+        {extraBedAmount > 0 && (
+          <div className="flex justify-between text-sm text-textSecondary">
+            <span>
+              Extra beds (
+              {selectedRooms.reduce((a, r) => a + r.extraBeds, 0)} ×{" "}
+              {isShortStay ? `${shortStayHours} hrs` : `${nights} night${nights === 1 ? "" : "s"}`})
+            </span>
+            <span className="font-mono">{inr(extraBedAmount)}</span>
           </div>
         )}
         <div className="flex justify-between text-sm">
@@ -2439,33 +2860,23 @@ function KycFilePicker({
   );
 }
 
-// 2nd occupant block. Shown when numAdults >= 2. Either pick an
-// existing guest (search by phone/name) or create a fresh guest +
-// upload their KYC. The submitted reservation links this guest via
-// reservationCoGuests.
-interface SecondOccupantForm {
-  fullName: string;
-  phone: string;
-  email: string;
-  gender: "" | "male" | "female" | "other" | "prefer_not_to_say";
-  idProofType: "aadhaar" | "pan" | "passport" | "driving_license" | "voter_id";
-  idProofNumber: string;
-  address: string;
-  city: string;
-  state: string;
-  nationality: string;
-}
-
-function SecondOccupantCard(props: {
+// Co-guest block. One per additional occupant — shown when numAdults >= 2
+// and replicated as staff add more guests. Either pick an existing guest
+// (search by phone/name) or create a fresh guest + upload their KYC. The
+// submitted reservation links each via reservationCoGuests.
+function CoGuestCard(props: {
+  index: number; // 0-based co-guest index; booker is guest 1
+  canRemove: boolean;
+  onRemove: () => void;
   mode: "existing" | "new";
   onModeChange: (m: "existing" | "new") => void;
   query: string;
   setQuery: (q: string) => void;
   selected: Guest | null;
   onSelected: (g: Guest | null) => void;
-  excludeGuestId: string | null;
-  form: SecondOccupantForm;
-  setForm: (f: SecondOccupantForm) => void;
+  takenGuestIds: Set<string>;
+  form: CoGuestForm;
+  setForm: (f: CoGuestForm) => void;
   kycPhoto: File | null;
   setKycPhoto: (f: File | null) => void;
   kycFront: File | null;
@@ -2475,6 +2886,7 @@ function SecondOccupantCard(props: {
 }) {
   const f = props.form;
   const setF = (patch: Partial<typeof f>) => props.setForm({ ...f, ...patch });
+  const guestNumber = props.index + 2; // booker is guest 1
   const search = useQuery({
     queryKey: ["coGuestSearch", props.query],
     queryFn: () =>
@@ -2482,19 +2894,19 @@ function SecondOccupantCard(props: {
     enabled: props.query.length >= 2 && props.mode === "existing",
   });
   const results = (search.data ?? []).filter(
-    (g) => g.id !== props.excludeGuestId,
+    (g) => !props.takenGuestIds.has(g.id),
   );
 
   return (
     <div className="card space-y-3">
       <div className="flex items-center justify-between flex-wrap gap-2">
         <h2 className="font-semibold text-navy">
-          2.5 Second Guest{" "}
+          Guest {guestNumber}{" "}
           <span className="text-xs text-textSecondary font-normal">
-            (optional — skip to book without 2nd guest KYC)
+            (optional — skip to book without this guest's KYC)
           </span>
         </h2>
-        <div className="text-xs">
+        <div className="flex items-center gap-2 text-xs">
           <button
             type="button"
             className={`px-3 py-1 rounded-sm ${props.mode === "existing" ? "bg-navy text-white" : "bg-gray-100"}`}
@@ -2507,7 +2919,7 @@ function SecondOccupantCard(props: {
           </button>
           <button
             type="button"
-            className={`px-3 py-1 rounded-sm ml-1 ${props.mode === "new" ? "bg-navy text-white" : "bg-gray-100"}`}
+            className={`px-3 py-1 rounded-sm ${props.mode === "new" ? "bg-navy text-white" : "bg-gray-100"}`}
             onClick={() => {
               props.onModeChange("new");
               props.onSelected(null);
@@ -2515,10 +2927,20 @@ function SecondOccupantCard(props: {
           >
             New
           </button>
+          {props.canRemove && (
+            <button
+              type="button"
+              onClick={props.onRemove}
+              className="ml-1 inline-flex items-center gap-1 px-2 py-1 rounded-sm text-danger hover:bg-danger/10"
+              title="Remove this guest"
+            >
+              <Trash2 className="w-3.5 h-3.5" /> Remove
+            </button>
+          )}
         </div>
       </div>
       <div className="text-xs text-textSecondary -mt-1">
-        With 2 or more adults, the second guest's KYC is required by law.
+        With 2 or more adults, each additional guest's KYC is required by law.
       </div>
 
       {props.mode === "existing" ? (
@@ -2679,7 +3101,7 @@ function SecondOccupantCard(props: {
 
           <div className="pt-2 border-t border-borderc">
             <div className="text-[11px] uppercase tracking-wider text-textSecondary font-semibold mb-2">
-              KYC Documents · Second Guest (optional)
+              KYC Documents · Guest {guestNumber} (optional)
             </div>
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
               <KycFilePicker

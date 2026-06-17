@@ -1177,8 +1177,8 @@ function WalletSection({ guestId }: { guestId: string }) {
 
       {showCashout && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={() => setShowCashout(false)}>
-          <div className="bg-surface rounded-md w-full max-w-md p-5" onClick={(e) => e.stopPropagation()}>
-            <h3 className="text-lg font-semibold text-navy mb-3">Cash out wallet credit</h3>
+          <div className="bg-surface rounded-md w-full max-w-md p-6 space-y-1" onClick={(e) => e.stopPropagation()}>
+            <h3 className="text-lg font-semibold text-navy mb-4">Cash out wallet credit</h3>
             <div className="text-sm text-textSecondary mb-3">Available: <strong>{inr(balance)}</strong></div>
             <div className="space-y-3">
               <div>

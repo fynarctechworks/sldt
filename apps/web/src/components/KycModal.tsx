@@ -54,7 +54,7 @@ export function KycModal({
       onClick={onClose}
     >
       <div
-        className="bg-surface rounded-t-2xl sm:rounded-md w-full sm:max-w-lg p-5 pb-safe sm:pb-5 max-h-[92vh] overflow-y-auto"
+        className="bg-surface rounded-t-2xl sm:rounded-md w-full sm:max-w-lg p-6 sm:p-7 pb-safe max-h-[92vh] overflow-y-auto"
         onClick={(e) => e.stopPropagation()}
       >
         <h2 className="text-lg font-semibold text-navy mb-1 flex items-center gap-2">

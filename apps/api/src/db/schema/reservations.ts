@@ -128,6 +128,13 @@ export const reservationRooms = pgTable("reservation_rooms", {
     .references(() => rooms.id),
   ratePerNight: numeric("rate_per_night", { precision: 10, scale: 2 }).notNull(),
   soldAsType: text("sold_as_type"),
+  // Migration 0043 — extra beds (additional persons) on this room.
+  // extraBeds is the count over the room's base max_occupancy; extraBedRate
+  // is the per-night, per-person fee snapshot at booking. Both default 0.
+  extraBeds: integer("extra_beds").notNull().default(0),
+  extraBedRate: numeric("extra_bed_rate", { precision: 10, scale: 2 })
+    .notNull()
+    .default("0"),
   // Migration 0017 — per-room state.
   guestId: uuid("guest_id")
     .notNull()

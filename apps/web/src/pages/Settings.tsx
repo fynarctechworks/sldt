@@ -1101,6 +1101,9 @@ interface RoomTypeRow {
   label: string;
   defaultRate: string;
   maxOccupancy: string;
+  // Per-night charge for each extra person (extra bed) over a room's base
+  // occupancy. "0" means extra beds aren't offered for this type.
+  extraPersonRate: string;
   description: string | null;
   isActive: boolean;
   // Day-use price bands shown on the reservation form when stay_type is
@@ -1141,6 +1144,7 @@ function RoomTypesTab() {
         slug: t.slug,
         defaultRate: Number(t.defaultRate),
         maxOccupancy: t.maxOccupancy,
+        extraPersonRate: Number(t.extraPersonRate),
         description: t.description ?? null,
         isActive: true,
       }),
@@ -1201,12 +1205,13 @@ function RoomTypesTab() {
       <div className="card p-0 overflow-x-auto">
         <table className="table-base table-fixed">
           <colgroup>
-            <col className="w-[28%]" />
-            <col className="w-[22%]" />
-            <col className="w-[14%]" />
-            <col className="w-[10%]" />
+            <col className="w-[24%]" />
+            <col className="w-[18%]" />
+            <col className="w-[13%]" />
+            <col className="w-[9%]" />
+            <col className="w-[13%]" />
+            <col className="w-[11%]" />
             <col className="w-[12%]" />
-            <col className="w-[14%]" />
           </colgroup>
           <thead>
             <tr>
@@ -1214,6 +1219,7 @@ function RoomTypesTab() {
               <th>Slug</th>
               <th className="!text-right">Default Rate</th>
               <th className="!text-right">Max Occ.</th>
+              <th className="!text-right">Extra Bed/Night</th>
               <th>Status</th>
               <th className="!text-right">Actions</th>
             </tr>
@@ -1221,7 +1227,7 @@ function RoomTypesTab() {
           <tbody>
             {types.length === 0 && (
               <tr>
-                <td colSpan={6} className="p-4 text-textSecondary text-center">
+                <td colSpan={7} className="p-4 text-textSecondary text-center">
                   No room types yet. Add one to start creating rooms.
                 </td>
               </tr>
@@ -1232,6 +1238,9 @@ function RoomTypesTab() {
                 <td className="font-mono text-xs text-textSecondary">{t.slug}</td>
                 <td className="text-right font-mono tabular-nums">{inr(t.defaultRate)}</td>
                 <td className="text-right tabular-nums">{t.maxOccupancy}</td>
+                <td className="text-right font-mono tabular-nums">
+                  {Number(t.extraPersonRate) > 0 ? inr(t.extraPersonRate) : "—"}
+                </td>
                 <td>
                   <span
                     className={`inline-block px-2 py-0.5 rounded-sm text-xs font-medium ${
@@ -1305,6 +1314,7 @@ function RoomTypeModal({ row, onClose }: { row: RoomTypeRow | null; onClose: () 
     label: row?.label ?? "",
     defaultRate: row ? Number(row.defaultRate) : 1200,
     maxOccupancy: row ? Number(row.maxOccupancy) : 2,
+    extraPersonRate: row ? Number(row.extraPersonRate) : 0,
     description: row?.description ?? "",
     isActive: row?.isActive ?? true,
     shortStayBands: (row?.shortStayBands ?? []) as ShortStayBand[],
@@ -1319,6 +1329,7 @@ function RoomTypeModal({ row, onClose }: { row: RoomTypeRow | null; onClose: () 
         label: form.label,
         defaultRate: form.defaultRate,
         maxOccupancy: form.maxOccupancy,
+        extraPersonRate: form.extraPersonRate,
         description: form.description || null,
         isActive: form.isActive,
         // Filter out blank/zero rows so an empty trailing input doesn't
@@ -1345,7 +1356,7 @@ function RoomTypeModal({ row, onClose }: { row: RoomTypeRow | null; onClose: () 
       onClick={onClose}
     >
       <div
-        className="bg-surface rounded-md w-full max-w-md p-5 space-y-3"
+        className="bg-surface rounded-md w-full max-w-md p-6 space-y-4"
         onClick={(e) => e.stopPropagation()}
       >
         <h2 className="text-lg font-semibold text-navy">
@@ -1406,6 +1417,23 @@ function RoomTypeModal({ row, onClose }: { row: RoomTypeRow | null; onClose: () 
             />
           </Field>
         </div>
+        <Field label="Extra Person Rate (₹ / person / night)">
+          <input
+            className="input"
+            type="number"
+            min={0}
+            value={form.extraPersonRate === 0 ? "" : form.extraPersonRate}
+            placeholder="0"
+            onChange={(e) => {
+              const v = e.target.value;
+              setForm({ ...form, extraPersonRate: v === "" ? 0 : Math.max(0, Number(v)) });
+            }}
+          />
+          <div className="text-xs text-textSecondary mt-1">
+            Per-night charge for each extra bed beyond Max Occupancy. Leave 0 to
+            disable extra beds for this room type.
+          </div>
+        </Field>
         <Field label="Description (optional)">
           <input
             className="input"
@@ -2003,7 +2031,7 @@ function AddStaffModal({ onClose }: { onClose: () => void }) {
       onClick={onClose}
     >
       <div
-        className="bg-surface rounded-md w-full max-w-md p-5 space-y-3"
+        className="bg-surface rounded-md w-full max-w-md p-6 space-y-4"
         onClick={(e) => e.stopPropagation()}
       >
         <h2 className="text-lg font-semibold text-navy">Add Staff</h2>

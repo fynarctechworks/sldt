@@ -39,6 +39,18 @@
        behaviour doesn't exist. */
     @apply min-h-10 w-full border border-borderc bg-surface rounded-sm px-3 py-2 text-base sm:text-sm text-textPrimary outline-none transition-colors focus:border-brand focus:ring-2 focus:ring-brand/20 placeholder:text-textSecondary/60;
   }
+  /* Hide the native up/down spinner on number inputs so fields like
+     Adults / Children / rates are plain type-only entries (the arrows
+     are easy to mis-click and scroll-to-change is confusing). */
+  .input[type="number"] {
+    -moz-appearance: textfield;
+    appearance: textfield;
+  }
+  .input[type="number"]::-webkit-outer-spin-button,
+  .input[type="number"]::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
   .label {
     @apply text-[11px] font-semibold text-textSecondary uppercase tracking-[0.12em];
   }

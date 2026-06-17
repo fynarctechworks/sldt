@@ -768,6 +768,16 @@ function RevenueTab({ from, to }: { from: string; to: string }) {
         byStayType?: { stayType: string; bookings: number; total: string }[];
       }>("/reports/revenue", { date_from: from, date_to: to }),
   });
+  // Reuse the collections endpoint for the by-payment-method split so the
+  // Revenue tab can show how the money came in (Cash / UPI / Card …) for
+  // the same range — no separate trip to the Collections tab.
+  const { data: collections } = useQuery({
+    queryKey: ["rpt-rev-collections", from, to],
+    queryFn: () =>
+      api.get<{
+        byMethod: { method: string; count: number; total: string }[];
+      }>("/reports/collections", { date_from: from, date_to: to }),
+  });
   if (!data) return <Loader />;
 
   const dailyChart = data.daily.map((d) => ({
@@ -785,6 +795,22 @@ function RevenueTab({ from, to }: { from: string; to: string }) {
   }));
   const overnight = stayTypeRows.find((s) => s.stayType === "overnight");
   const shortStay = stayTypeRows.find((s) => s.stayType === "short_stay");
+
+  // Payment-method split for the selected range, ordered Cash → UPI →
+  // Card → Bank transfer → Cheque (any future method falls to the end).
+  const methodOrder = ["cash", "upi", "card", "bank_transfer", "cheque"];
+  const methodLabels: Record<string, string> = {
+    cash: "Cash",
+    upi: "UPI",
+    card: "Card",
+    bank_transfer: "Bank Transfer",
+    cheque: "Cheque",
+  };
+  const byMethod = (collections?.byMethod ?? [])
+    .filter((m) => Number(m.total) !== 0 || m.count > 0)
+    .map((m) => ({ method: m.method, count: m.count, total: Number(m.total) }))
+    .sort((a, b) => methodOrder.indexOf(a.method) - methodOrder.indexOf(b.method));
+  const methodGrand = byMethod.reduce((s, m) => s + m.total, 0);
 
   return (
     <div className="space-y-4">
@@ -872,6 +898,46 @@ function RevenueTab({ from, to }: { from: string; to: string }) {
           </table>
         </div>
       )}
+
+      {/* Collections by payment method for this range — how the revenue
+          was actually received. Mirrors the Collections tab so the owner
+          sees the money split right here on the Revenue page. */}
+      <div className="card">
+        <div className="text-sm font-semibold text-navy mb-2">
+          Collections by payment method
+        </div>
+        {byMethod.length === 0 ? (
+          <div className="text-sm text-textSecondary py-1">
+            No payments received in this range.
+          </div>
+        ) : (
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-left text-textSecondary border-b border-borderc">
+                <th className="py-2 font-medium">Method</th>
+                <th className="py-2 font-medium text-right">Payments</th>
+                <th className="py-2 font-medium text-right">Amount</th>
+              </tr>
+            </thead>
+            <tbody>
+              {byMethod.map((m) => (
+                <tr key={m.method} className="border-b border-borderc/60">
+                  <td className="py-2">{methodLabels[m.method] ?? m.method}</td>
+                  <td className="py-2 text-right font-mono tabular-nums">{m.count}</td>
+                  <td className="py-2 text-right font-mono tabular-nums">{inr(m.total)}</td>
+                </tr>
+              ))}
+              <tr className="font-semibold text-brand-dark">
+                <td className="py-2">Total</td>
+                <td className="py-2 text-right font-mono tabular-nums">
+                  {byMethod.reduce((s, m) => s + m.count, 0)}
+                </td>
+                <td className="py-2 text-right font-mono tabular-nums">{inr(methodGrand)}</td>
+              </tr>
+            </tbody>
+          </table>
+        )}
+      </div>
 
       <div className="flex justify-end">
         <ExportBtn onClick={() => exportCsv(`revenue-${from}-${to}.csv`, data.daily)} />
