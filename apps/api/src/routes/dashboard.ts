@@ -285,6 +285,11 @@ async function buildDashboard() {
           durationHours: reservations.durationHours,
           checkedInAt: reservations.checkedInAt,
           lateCheckoutHours: reservations.lateCheckoutHours,
+          // Staff-chosen planned exit time. When set it is the source of
+          // truth for the effective check-out moment (the reservation
+          // detail page already honours it); the hotel default + late
+          // grant is only the fallback when this is null.
+          plannedCheckOutAt: reservations.plannedCheckOutAt,
           // Each "slot" on a reservation is either:
           //   - one unsegmented reservation_rooms row → emit roomNumber
           //   - one or more rows sharing a swap_id (mid-stay swap) →
@@ -640,6 +645,12 @@ async function buildDashboard() {
               ).getTime();
             })();
         effectiveMs = startMs + durMs;
+      } else if (u.plannedCheckOutAt) {
+        // Staff set an explicit planned exit time — honour it exactly, the
+        // same as the reservation detail page. The late-checkout grant is
+        // already folded into a planned time when one is chosen, so we do
+        // not add lateCheckoutHours on top here.
+        effectiveMs = new Date(u.plannedCheckOutAt).getTime();
       } else {
         const [hh, mm] = (settings.checkOutTime ?? "11:00").split(":");
         const baseMs = new Date(
