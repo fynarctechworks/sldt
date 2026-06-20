@@ -22,6 +22,47 @@ function formatTime(hhmm: string | null | undefined): string {
   return `${h12}:${m.padStart(2, "0")} ${period}`;
 }
 
+// The hotel runs on IST regardless of where the server is hosted (prod
+// is a UTC VPS). date-fns `format()` renders in the SERVER's local zone,
+// so a checked-in stamp of 05:01Z printed as "5:01 AM" on the invoice
+// while the IST web UI correctly showed "10:31 AM" — a 5:30 skew. These
+// helpers format an instant in Asia/Kolkata so every surface agrees.
+const IST_TZ = "Asia/Kolkata";
+function formatIstDate(d: Date): string {
+  // "20 Jun 2026"
+  return d.toLocaleDateString("en-GB", {
+    timeZone: IST_TZ,
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  });
+}
+function formatIstTime(d: Date): string {
+  // "10:31 AM"
+  return d
+    .toLocaleTimeString("en-US", {
+      timeZone: IST_TZ,
+      hour: "numeric",
+      minute: "2-digit",
+      hour12: true,
+    })
+    .toUpperCase();
+}
+function formatIstDateTime(d: Date): string {
+  // "20 Jun 2026 · 10:31 AM"
+  return `${formatIstDate(d)} · ${formatIstTime(d)}`;
+}
+// 24-hour "20 Jun 2026 · 14:31" style stamp for the generated-at footers.
+function formatIstDateTime24(d: Date): string {
+  const time = d.toLocaleTimeString("en-GB", {
+    timeZone: IST_TZ,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  return `${formatIstDate(d)} · ${time}`;
+}
+
 let browserPromise: Promise<Browser> | null = null;
 
 async function getBrowser() {
@@ -656,7 +697,7 @@ function renderInvoiceHtml(data: {
               : "Advance at check-in";
           return `
     <tr>
-      <td>${format(new Date(p.paymentDate), "dd MMM yyyy")}</td>
+      <td>${formatIstDate(new Date(p.paymentDate))}</td>
       <td class="capitalize">
         ${p.paymentMethod.replace("_", " ")}
         <span style="color:#6B6358;font-size:9.5px;text-transform:none;letter-spacing:0;margin-left:4px;">
@@ -685,7 +726,7 @@ ${L.showLogo && L.logoUrl ? `<div class="watermark"><img src="${esc(L.logoUrl)}"
     <div class="meta">
       <div class="doc-label">${esc(docTitle)}</div>
       <div class="doc-no">${esc(roomBill ? `${roomBill.parentInvoiceNumber} · ${roomBill.roomLabel}` : invoice.invoiceNumber)}</div>
-      <div class="doc-date">Date: ${format(new Date(invoice.createdAt), "dd MMM yyyy")}</div>
+      <div class="doc-date">Date: ${formatIstDate(new Date(invoice.createdAt))}</div>
       ${reversalRef ? `<div class="doc-date">Against: ${esc(reversalRef)}</div>` : ""}
       <div class="status-pill">${esc(roomBill ? "room split" : isCreditNote ? "credit note" : invoice.status)}</div>
     </div>
@@ -746,28 +787,21 @@ ${L.showLogo && L.logoUrl ? `<div class="watermark"><img src="${esc(L.logoUrl)}"
         // Check-in time priority (0023): actual checked-in stamp >
         // staff-chosen planned time > date-only fallback. The "h:mm a"
         // format kicks in whenever we have an actual time value.
-        const inHasTime = !!(stay.checkedInAt || stay.plannedCheckInAt);
-        const inDate = stay.checkedInAt
-          ? new Date(stay.checkedInAt)
+        // Time-bearing values are true instants (UTC in the DB) and must
+        // be formatted in IST — see formatIstDateTime. Date-only fallbacks
+        // ("dd MMM yyyy") carry no instant, so plain date-fns is fine.
+        const checkInRendered = stay.checkedInAt
+          ? formatIstDateTime(new Date(stay.checkedInAt))
           : stay.plannedCheckInAt
-            ? new Date(stay.plannedCheckInAt)
-            : new Date(stay.checkInDate + "T00:00:00");
-        const checkInLine = `<div class="sub">Check-in: <strong>${format(
-          inDate,
-          (isShort && stay.checkedInAt) || inHasTime
-            ? "dd MMM yyyy · h:mm a"
-            : "dd MMM yyyy",
-        )}</strong></div>`;
-        const outHasTime = !!(shortOut || stay.plannedCheckOutAt);
-        const outDate = shortOut
-          ? shortOut
+            ? formatIstDateTime(new Date(stay.plannedCheckInAt))
+            : format(new Date(stay.checkInDate + "T00:00:00"), "dd MMM yyyy");
+        const checkInLine = `<div class="sub">Check-in: <strong>${checkInRendered}</strong></div>`;
+        const checkOutRendered = shortOut
+          ? formatIstDateTime(shortOut)
           : stay.plannedCheckOutAt
-            ? new Date(stay.plannedCheckOutAt)
-            : new Date(stay.checkOutDate + "T00:00:00");
-        const checkOutLine = `<div class="sub">Check-out: <strong>${format(
-          outDate,
-          outHasTime ? "dd MMM yyyy · h:mm a" : "dd MMM yyyy",
-        )}</strong></div>`;
+            ? formatIstDateTime(new Date(stay.plannedCheckOutAt))
+            : format(new Date(stay.checkOutDate + "T00:00:00"), "dd MMM yyyy");
+        const checkOutLine = `<div class="sub">Check-out: <strong>${checkOutRendered}</strong></div>`;
         const durationLine = `<div class="sub" style="color:#6B6358;">${
           isShort
             ? `Day use · ${Number(stay.durationHours ?? 0)} hour${Number(stay.durationHours ?? 0) === 1 ? "" : "s"}`
@@ -775,7 +809,7 @@ ${L.showLogo && L.logoUrl ? `<div class="watermark"><img src="${esc(L.logoUrl)}"
         }</div>`;
         return checkInLine + checkOutLine + durationLine;
       })()}
-      <div class="sub" style="margin-top:4px;">Issued ${format(new Date(invoice.issueDate ?? invoice.createdAt), "dd MMM yyyy")}</div>
+      <div class="sub" style="margin-top:4px;">Issued ${formatIstDate(new Date(invoice.issueDate ?? invoice.createdAt))}</div>
     </div>
   </div>
 
@@ -893,7 +927,7 @@ ${L.showLogo && L.logoUrl ? `<div class="watermark"><img src="${esc(L.logoUrl)}"
     ${L.showSignature ? `<div class="sign"><div class="line">${esc(L.signatoryLabel)}</div></div>` : ""}
   </div>
 
-  <div class="doc-id-strip">${esc(invoice.invoiceNumber)} &middot; ${format(new Date(), "dd MMM yyyy HH:mm")}</div>
+  <div class="doc-id-strip">${esc(invoice.invoiceNumber)} &middot; ${formatIstDateTime24(new Date())}</div>
 </div>
 
 </body></html>`;
@@ -1173,7 +1207,7 @@ ${L.showLogo && L.logoUrl ? `<div class="watermark"><img src="${esc(L.logoUrl)}"
     <div class="meta">
       <div class="pill">${esc(pillLabel)}</div>
       <div class="res-no">${esc(reservation.reservationNumber)}</div>
-      <div class="doc-date-small">${format(new Date(payment.paymentDate), "dd MMM yyyy · HH:mm")}</div>
+      <div class="doc-date-small">${formatIstDateTime24(new Date(payment.paymentDate))}</div>
       ${payment.receiptNumber ? `<div class="doc-date-small" style="font-family:'SF Mono',Menlo,monospace;margin-top:2px;">${esc(payment.receiptNumber)}</div>` : ""}
       <div style="font-size:8px;color:#9AA59E;margin-top:4px;">${esc(titleLabel)}</div>
     </div>
@@ -1216,22 +1250,21 @@ ${L.showLogo && L.logoUrl ? `<div class="watermark"><img src="${esc(L.logoUrl)}"
       <div class="stay-grid">
         <div>
           <div class="stay-tag">Check-in</div>
-          <div class="stay-date">${format(
+          <div class="stay-date">${formatIstDate(
             new Date(
               reservation.checkedInAt ??
                 reservation.plannedCheckInAt ??
                 reservation.checkInDate,
             ),
-            "dd MMM yyyy",
           )}</div>
           <div class="stay-time">${(() => {
             // Priority (0023): actual checked-in stamp > staff-chosen
             // planned time > hotel policy default.
             if (reservation.checkedInAt) {
-              return `at ${format(new Date(reservation.checkedInAt), "h:mm a")}`;
+              return `at ${formatIstTime(new Date(reservation.checkedInAt))}`;
             }
             if (reservation.plannedCheckInAt) {
-              return `at ${format(new Date(reservation.plannedCheckInAt), "h:mm a")}`;
+              return `at ${formatIstTime(new Date(reservation.plannedCheckInAt))}`;
             }
             return settings.checkInTime
               ? `from ${formatTime(settings.checkInTime)}`
@@ -1240,19 +1273,18 @@ ${L.showLogo && L.logoUrl ? `<div class="watermark"><img src="${esc(L.logoUrl)}"
         </div>
         <div>
           <div class="stay-tag">Check-out</div>
-          <div class="stay-date">${format(
+          <div class="stay-date">${formatIstDate(
             shortStayCheckoutDate ??
               (reservation.plannedCheckOutAt
                 ? new Date(reservation.plannedCheckOutAt)
                 : new Date(reservation.checkOutDate)),
-            "dd MMM yyyy",
           )}</div>
           ${(() => {
             if (shortStayCheckoutDate) {
-              return `<div class="stay-time">by ${format(shortStayCheckoutDate, "h:mm a")}</div>`;
+              return `<div class="stay-time">by ${formatIstTime(shortStayCheckoutDate)}</div>`;
             }
             if (reservation.plannedCheckOutAt) {
-              return `<div class="stay-time">by ${format(new Date(reservation.plannedCheckOutAt), "h:mm a")}</div>`;
+              return `<div class="stay-time">by ${formatIstTime(new Date(reservation.plannedCheckOutAt))}</div>`;
             }
             return settings.checkOutTime
               ? `<div class="stay-time">by ${formatTime(settings.checkOutTime)}</div>`
@@ -1356,7 +1388,7 @@ ${L.showLogo && L.logoUrl ? `<div class="watermark"><img src="${esc(L.logoUrl)}"
       isAdvance
         ? `Welcome to ${esc(settings.hotelName)}. Please retain this slip for reference. Final invoice will be issued at check-out${
             shortStayCheckoutDate
-              ? ` (by ${format(shortStayCheckoutDate, "h:mm a")})`
+              ? ` (by ${formatIstTime(shortStayCheckoutDate)})`
               : settings.checkOutTime
                 ? ` (by ${formatTime(settings.checkOutTime)})`
                 : ""
