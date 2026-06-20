@@ -202,7 +202,7 @@ export default function Guests() {
             }}
           />
 
-          {GUEST_TAGS.map((t) => {
+          {GUEST_TAGS.filter((t) => t !== "blacklist").map((t) => {
             const s = tagStyle(t);
             const active = tag === t;
             return (
