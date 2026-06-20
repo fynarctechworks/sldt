@@ -6298,7 +6298,21 @@ router.post(
       // credited advance would never land on the bill it's meant for.
       await attachOrphanPaymentsAndRecompute(tx, id, inv!.id);
 
-      return inv!;
+      // Re-read the invoice AFTER the recompute: attachOrphan… updates
+      // total_paid / balance_due / status in place when it folds the
+      // booking advance onto this bill. The `inv` from the insert above
+      // still carries the pre-recompute balance (= grandTotal, because
+      // no inline payment was supplied). Returning that stale row made
+      // the client think money was still owed and pop the collect-
+      // payment modal — letting staff record a SECOND payment for an
+      // invoice the advance had already settled (the RES-0005 double
+      // -collect). Return the fresh row so the balance is truthful.
+      const [fresh] = await tx
+        .select()
+        .from(invoices)
+        .where(eq(invoices.id, inv!.id))
+        .limit(1);
+      return fresh ?? inv!;
     });
 
     await logActivity({
