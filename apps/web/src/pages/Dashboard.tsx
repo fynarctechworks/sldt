@@ -50,8 +50,10 @@ interface DashboardData {
     by_method?: { method: string; total: number; count: number }[];
   };
   revenue_kpis?: {
-    mtd_collected: number;
-    outstanding_balance: number;
+    // mtd_collected is omitted for view_daily_collections-only users
+    // (front desk) — they see outstanding but not month-to-date revenue.
+    mtd_collected?: number;
+    outstanding_balance?: number;
   };
   // Operations counters — visible to everyone (no money). Drives the
   // "morning work" cards on the dashboard.
@@ -142,7 +144,7 @@ export default function Dashboard() {
             data.today_checkouts.reservations.filter((r) => r.status === "checked_in").length
           } pending`}
         />
-        <Can do="view_revenue">
+        <Can any={["view_revenue", "view_daily_collections"]}>
           <StatCard
             icon={<Wallet className="w-5 h-5" />}
             label="Revenue Today"
@@ -160,7 +162,7 @@ export default function Dashboard() {
             the morning work queue for housekeeping and the front desk. */}
       {(data.revenue_kpis || data.operations_kpis) && (
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          {data.revenue_kpis && (
+          {data.revenue_kpis?.mtd_collected !== undefined && (
             <Can do="view_revenue">
               <StatCard
                 icon={<Receipt className="w-5 h-5" />}
@@ -170,8 +172,8 @@ export default function Dashboard() {
               />
             </Can>
           )}
-          {data.revenue_kpis && (
-            <Can do="view_revenue">
+          {data.revenue_kpis?.outstanding_balance !== undefined && (
+            <Can any={["view_revenue", "view_daily_collections"]}>
               <StatCard
                 icon={<Wallet className="w-5 h-5" />}
                 label="Outstanding Balance"
@@ -200,10 +202,11 @@ export default function Dashboard() {
       )}
 
       {/* Today's money overview — collections split by payment method
-          (Cash / UPI / Card / Bank transfer / Cheque). Gated behind
-          view_revenue like the rupee tiles. Gives the desk a quick
-          end-of-day cash-up to hand the owner. */}
-      <Can do="view_revenue">
+          (Cash / UPI / Card / Bank transfer / Cheque). Visible to anyone
+          who can see the daily cash-up (front desk settles the drawer at
+          shift end); full view_revenue isn't required. MTD + outstanding
+          above stay view_revenue-only. */}
+      <Can any={["view_revenue", "view_daily_collections"]}>
         {data.revenue_today && (
           <TodaysCollections data={data.revenue_today} />
         )}

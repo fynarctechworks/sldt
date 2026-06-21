@@ -68,6 +68,13 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   // collections without seeing aggregate revenue.
   { key: "view_revenue", area: "Reports", label: "View revenue & financial totals" },
 
+  // Daily cash-up visibility — a narrower slice of `view_revenue`. Lets
+  // front-desk staff see TODAY's collections (the "Collections by Method"
+  // cash-up panel + "Revenue Today" tile) so they can settle the drawer
+  // at shift end, WITHOUT exposing month-to-date revenue or the
+  // property-wide outstanding balance (those stay behind view_revenue).
+  { key: "view_daily_collections", area: "Reports", label: "View today's cash-up (daily collections)" },
+
   // Activity & Notifications
   { key: "view_activity", area: "Activity", label: "View activity log" },
   { key: "view_notifications", area: "Notifications", label: "View notifications" },
@@ -145,6 +152,10 @@ export const SYSTEM_ROLES = {
       "send_reminders",
       "view_invoices",
       "preview_invoice",
+      // Daily cash-up: the desk settles the drawer at shift end, so it
+      // sees today's collections + revenue, but not MTD revenue or the
+      // property-wide outstanding balance (those need view_revenue).
+      "view_daily_collections",
       // Frontdesk needs reissue_invoices for the convert-invoices
       // (Consolidate / Split) workflow added late June 2026. Without
       // it the desk hits a 403 the moment they try to fix the bill

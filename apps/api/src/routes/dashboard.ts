@@ -823,16 +823,29 @@ async function buildDashboard() {
 
 router.get("/", requireAuth, requirePermission("view_dashboard"), async (req, res) => {
   // Cache key is always the full payload (with revenue). Per-request we
-  // strip the revenue field if the caller lacks `view_revenue`, so two
-  // staff with different perms hit the same cache entry. Stripping is
-  // cheap; keeping two cache variants would invalidate twice.
+  // strip revenue fields by permission, so staff with different perms
+  // hit the same cache entry. Stripping is cheap; keeping perm-specific
+  // cache variants would multiply invalidations.
+  //
+  // Three tiers:
+  //   • view_revenue            → everything (today + MTD + outstanding).
+  //   • view_daily_collections  → today's cash-up + outstanding balance;
+  //                               MTD revenue (mtd_collected) stripped.
+  //   • neither                 → all revenue stripped.
   const canSeeRevenue = hasPermission(req.user!, "view_revenue");
+  const canSeeDaily = canSeeRevenue || hasPermission(req.user!, "view_daily_collections");
+  const project = <
+    T extends {
+      revenue_today?: unknown;
+      revenue_kpis?: { mtd_collected?: number; outstanding_balance?: number };
+    },
+  >(d: T) => (canSeeRevenue ? d : canSeeDaily ? keepDailyOnly(d) : stripRevenue(d));
 
   try {
     const cached = await redis.get<string>(dashboardKey);
     if (cached) {
       const data = typeof cached === "string" ? JSON.parse(cached) : cached;
-      return ok(res, canSeeRevenue ? data : stripRevenue(data));
+      return ok(res, project(data));
     }
   } catch (err) {
     logger.warn({ err }, "dashboard cache read failed");
@@ -850,7 +863,7 @@ router.get("/", requireAuth, requirePermission("view_dashboard"), async (req, re
   void dispatchDueArrivalReminders(data.upcoming_arrivals).catch((err) => {
     logger.warn({ err: err instanceof Error ? err.message : err }, "arrival reminders dispatch failed");
   });
-  return ok(res, canSeeRevenue ? data : stripRevenue(data));
+  return ok(res, project(data));
 });
 
 // Remove revenue-bearing fields so they never leave the server for users
@@ -864,6 +877,20 @@ function stripRevenue<T extends { revenue_today?: unknown; revenue_kpis?: unknow
   void _r1;
   void _r2;
   return rest;
+}
+
+// For `view_daily_collections` staff: keep revenue_today (the cash-up)
+// and the outstanding_balance KPI (front desk chases unpaid balances at
+// checkout), but DROP mtd_collected — month-to-date revenue stays
+// management-only (view_revenue). We rebuild revenue_kpis with just the
+// outstanding figure so MTD never leaves the server.
+function keepDailyOnly<
+  T extends { revenue_kpis?: { mtd_collected?: number; outstanding_balance?: number } },
+>(data: T): T {
+  if (!data.revenue_kpis) return data;
+  const { mtd_collected: _mtd, ...keep } = data.revenue_kpis;
+  void _mtd;
+  return { ...data, revenue_kpis: keep };
 }
 
 // Pre-arrival reminder dispatcher (migration 0021). Iterates the
