@@ -483,7 +483,7 @@ function EditGuestModal({ guest, onClose }: { guest: Guest; onClose: () => void 
                 onChange={(e) => set("companyName", e.target.value)}
               />
             </Field>
-            <Field label="GSTIN">
+            <Field label="GSTIN (optional)">
               <input
                 className="input font-mono"
                 value={form.gstin}

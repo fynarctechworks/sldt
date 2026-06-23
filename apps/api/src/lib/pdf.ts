@@ -501,7 +501,7 @@ function brandHeader(
         <div class="tagline">Hospitality &amp; Stays</div>
         <div class="addr">${esc(hotelAddress)}</div>
         ${phones.length ? `<div class="addr">${phones.map((p) => esc(p)).join(" &nbsp;·&nbsp; ")}</div>` : ""}
-        ${L.showGstin && hotelGstin ? `<div class="gstin">GSTIN&nbsp;·&nbsp;${esc(hotelGstin)}</div>` : ""}
+        ${hotelGstin ? `<div class="gstin">GSTIN&nbsp;·&nbsp;${esc(hotelGstin)}</div>` : ""}
       </div>
     </div>
   `;
@@ -1201,7 +1201,7 @@ ${L.showLogo && L.logoUrl ? `<div class="watermark"><img src="${esc(L.logoUrl)}"
             ? ` · ${[settings.hotelPhone, settings.ownerPhone].filter(Boolean).map((p) => esc(p as string)).join(" · ")}`
             : ""
         }</div>
-        ${L.showGstin && settings.hotelGstin ? `<div class="hotel-gstin">GSTIN: ${esc(settings.hotelGstin)}</div>` : ""}
+        ${settings.hotelGstin ? `<div class="hotel-gstin">GSTIN: ${esc(settings.hotelGstin)}</div>` : ""}
       </div>
     </div>
     <div class="meta">
@@ -1227,6 +1227,7 @@ ${L.showLogo && L.logoUrl ? `<div class="watermark"><img src="${esc(L.logoUrl)}"
             ? `<div class="card-id">${esc(formatGender(guest.gender))}</div>`
             : ""
       }
+      ${guest.gstin ? `<div class="card-sub" style="margin-top:2px;">GSTIN: ${esc(guest.gstin)}</div>` : ""}
       ${
         coGuests && coGuests.length > 0
           ? `<div style="margin-top:6px;padding-top:6px;border-top:1px dashed #D6D2C4;">

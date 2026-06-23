@@ -99,6 +99,7 @@ interface Detail {
     idProofPhotoFront: string | null;
     idProofType: string | null;
     idProofLast4: string | null;
+    gstin: string | null;
     photoUrl: string | null;
   };
   // Migration 0020 — additional adults whose KYC was captured at booking.
@@ -1470,6 +1471,7 @@ export default function ReservationDetail() {
                 gender: (r.guest as { gender?: string | null }).gender,
                 idProofType: r.guest.idProofType,
                 idProofLast4: r.guest.idProofLast4,
+                gstin: r.guest.gstin,
                 photoUrl: r.guest.photoUrl,
               },
               coGuests: r.coGuests?.map((cg) => ({
@@ -1551,6 +1553,7 @@ export default function ReservationDetail() {
                   gender: (r.guest as { gender?: string | null }).gender,
                   idProofType: r.guest.idProofType,
                   idProofLast4: r.guest.idProofLast4,
+                  gstin: r.guest.gstin,
                   photoUrl: r.guest.photoUrl,
                 },
                 coGuests: r.coGuests?.map((cg) => ({

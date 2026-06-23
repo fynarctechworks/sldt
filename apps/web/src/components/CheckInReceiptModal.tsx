@@ -39,6 +39,7 @@ export interface CheckInReceiptData {
     gender?: string | null;
     idProofType?: string | null;
     idProofLast4?: string | null;
+    gstin?: string | null;
     photoUrl?: string | null;
   };
   // Migration 0020 — additional adults whose KYC was captured at booking.
@@ -401,6 +402,11 @@ export function CheckInReceiptModal({ data, onClose, variant = "checkin" }: Prop
                       )}
                       {data.guest.idProofType && data.guest.gender && " · "}
                       {data.guest.gender && formatGender(data.guest.gender)}
+                    </div>
+                  )}
+                  {data.guest.gstin && (
+                    <div className="text-[10px] text-textSecondary font-mono mt-1">
+                      GSTIN: {data.guest.gstin}
                     </div>
                   )}
                 </div>

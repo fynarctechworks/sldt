@@ -29,6 +29,7 @@ interface Guest {
   email: string | null;
   idProofType: string | null;
   idProofLast4: string | null;
+  gstin?: string | null;
   // Signed URL to the guest's customer photo (KYC). Used by the search
   // dropdown so staff can visually confirm they're picking the right
   // person before continuing. Null when the guest has no photo on file.
@@ -48,6 +49,7 @@ interface CoGuestForm {
   city: string;
   state: string;
   nationality: string;
+  gstin: string;
 }
 
 interface CoGuestEntry {
@@ -82,6 +84,7 @@ function makeCoGuestEntry(): CoGuestEntry {
       city: "",
       state: "",
       nationality: "Indian",
+      gstin: "",
     },
     kycPhoto: null,
     kycFront: null,
@@ -216,6 +219,7 @@ export default function NewReservation() {
     city: "",
     state: "",
     nationality: "Indian",
+    gstin: "",
   });
   const [useNewGuest, setUseNewGuest] = useState(false);
 
@@ -712,6 +716,16 @@ export default function NewReservation() {
       // is certain to proceed to the OTP step.
       if (useNewGuest && !newGuest.gender)
         throw new Error("Gender is required for new guest");
+      if (
+        useNewGuest &&
+        (!newGuest.nationality.trim() ||
+          !newGuest.state.trim() ||
+          !newGuest.city.trim() ||
+          !newGuest.address.trim())
+      )
+        throw new Error(
+          "Nationality, state, city and address are required for a new guest",
+        );
       if (!useNewGuest && !selectedGuest?.id) throw new Error("Guest required");
 
       // Walk-in KYC guard. We bypass it when the selected existing guest
@@ -740,6 +754,15 @@ export default function NewReservation() {
           );
         if (!c.form.gender)
           throw new Error(`Gender is required for guest ${ord}`);
+        if (
+          !c.form.nationality.trim() ||
+          !c.form.state.trim() ||
+          !c.form.city.trim() ||
+          !c.form.address.trim()
+        )
+          throw new Error(
+            `Nationality, state, city and address are required for guest ${ord}`,
+          );
       });
 
       // ── Writes start here. From this point on, any failure must sweep
@@ -751,6 +774,7 @@ export default function NewReservation() {
           ...newGuest,
           phone: normalizeIndianPhone(newGuest.phone),
           email: newGuest.email || undefined,
+          gstin: newGuest.gstin.trim() || undefined,
         });
         guestId = g.id;
         freshGuestIdsRef.current.push(g.id);
@@ -779,6 +803,7 @@ export default function NewReservation() {
             ...c.form,
             phone: normalizeIndianPhone(c.form.phone),
             email: c.form.email || undefined,
+            gstin: c.form.gstin.trim() || undefined,
           });
           coGuestId = g2.id;
           freshGuestIdsRef.current.push(g2.id);
@@ -920,6 +945,7 @@ export default function NewReservation() {
               gender: string | null;
               idProofType: string | null;
               idProofLast4: string | null;
+              gstin: string | null;
               photoUrl: string | null;
             };
             // Migration 0020 — second-occupant block on the receipt.
@@ -998,6 +1024,7 @@ export default function NewReservation() {
             gender: detail.guest.gender,
             idProofType: detail.guest.idProofType,
             idProofLast4: detail.guest.idProofLast4,
+            gstin: detail.guest.gstin,
             photoUrl: detail.guest.photoUrl,
           },
           coGuests: detail.coGuests?.map((cg) => ({
@@ -1165,7 +1192,15 @@ export default function NewReservation() {
     canPriceStay &&
     !overnightDateError &&
     selectedRooms.length > 0 &&
-    (selectedGuest || (useNewGuest && newGuest.fullName && newGuest.phone && newGuest.idProofNumber)) &&
+    (selectedGuest ||
+      (useNewGuest &&
+        newGuest.fullName &&
+        newGuest.phone &&
+        newGuest.idProofNumber &&
+        newGuest.nationality.trim() &&
+        newGuest.state.trim() &&
+        newGuest.city.trim() &&
+        newGuest.address.trim())) &&
     !advanceTooHigh &&
     capacityOk &&
     (reletRooms.length === 0 || reletConfirmed);
@@ -1526,6 +1561,11 @@ export default function NewReservation() {
                 >
                   Clear
                 </button>
+                {selectedGuest.gstin && (
+                  <div className="mt-1 text-xs text-textSecondary font-mono">
+                    GSTIN: {selectedGuest.gstin}
+                  </div>
+                )}
               </div>
             )}
             {selectedGuest && outstandingQ.data && outstandingQ.data.total > 0.009 && (
@@ -1595,14 +1635,19 @@ export default function NewReservation() {
               />
             </div>
             <div>
-              <label className="label block mb-1">Email</label>
+              <label className="label block mb-1">
+                Email{" "}
+                <span className="text-xs text-textSecondary font-normal">(optional)</span>
+              </label>
               <EmailInput
                 value={newGuest.email}
                 onChange={(v) => setNewGuest({ ...newGuest, email: v })}
               />
             </div>
             <div>
-              <label className="label block mb-1">Nationality</label>
+              <label className="label block mb-1">
+                Nationality <span className="text-danger">*</span>
+              </label>
               <input
                 className="input"
                 value={newGuest.nationality}
@@ -1659,7 +1704,9 @@ export default function NewReservation() {
               />
             </div>
             <div>
-              <label className="label block mb-1">State</label>
+              <label className="label block mb-1">
+                State <span className="text-danger">*</span>
+              </label>
               <Combobox
                 value={newGuest.state}
                 onChange={(v) =>
@@ -1680,7 +1727,9 @@ export default function NewReservation() {
               />
             </div>
             <div>
-              <label className="label block mb-1">City</label>
+              <label className="label block mb-1">
+                City <span className="text-danger">*</span>
+              </label>
               <Combobox
                 value={newGuest.city}
                 onChange={(v) => setNewGuest({ ...newGuest, city: v })}
@@ -1693,11 +1742,27 @@ export default function NewReservation() {
               />
             </div>
             <div className="col-span-2">
-              <label className="label block mb-1">Address</label>
+              <label className="label block mb-1">
+                Address <span className="text-danger">*</span>
+              </label>
               <input
                 className="input"
                 value={newGuest.address}
                 onChange={(e) => setNewGuest({ ...newGuest, address: e.target.value })}
+              />
+            </div>
+            <div className="col-span-2">
+              <label className="label block mb-1">
+                GSTIN{" "}
+                <span className="text-xs text-textSecondary font-normal">(optional)</span>
+              </label>
+              <input
+                className="input font-mono uppercase"
+                value={newGuest.gstin}
+                placeholder="22AAAAA0000A1Z5"
+                onChange={(e) =>
+                  setNewGuest({ ...newGuest, gstin: e.target.value.toUpperCase() })
+                }
               />
             </div>
           </div>
@@ -2897,6 +2962,24 @@ function CoGuestCard(props: {
     (g) => !props.takenGuestIds.has(g.id),
   );
 
+  // KYC-on-file lookup for a selected existing co-guest. Mirrors the
+  // booker's walletQ so every guest card shows the same "KYC ON FILE"
+  // summary (photo, verified date, ID last-4, View/Replace) instead of
+  // a bare "Selected: name" line.
+  const kycQ = useQuery({
+    queryKey: ["coGuestKyc", props.selected?.id],
+    queryFn: () =>
+      api.get<{
+        kycVerifiedAt: string | null;
+        idProofType: string | null;
+        idProofLast4: string | null;
+        photoUrl: string | null;
+      }>(`/guests/${props.selected!.id}`),
+    enabled: !!props.selected?.id && props.mode === "existing",
+  });
+  const coKycOnFile =
+    props.mode === "existing" && !!props.selected && !!kycQ.data?.kycVerifiedAt;
+
   return (
     <div className="card space-y-3">
       <div className="flex items-center justify-between flex-wrap gap-2">
@@ -2954,6 +3037,36 @@ function CoGuestCard(props: {
           {props.selected && (
             <div className="text-sm text-success">
               Selected: <strong>{props.selected.fullName}</strong> ({props.selected.phone})
+              <button
+                type="button"
+                className="ml-3 text-xs text-danger hover:underline"
+                onClick={() => props.onSelected(null)}
+              >
+                Clear
+              </button>
+              {props.selected.gstin && (
+                <div className="text-xs text-textSecondary font-mono">
+                  GSTIN: {props.selected.gstin}
+                </div>
+              )}
+            </div>
+          )}
+          {coKycOnFile && props.selected && kycQ.data && (
+            <div className="card">
+              <KycOnFileCard
+                guestId={props.selected.id}
+                guestName={props.selected.fullName}
+                verifiedAt={kycQ.data.kycVerifiedAt!}
+                idProofType={kycQ.data.idProofType}
+                idProofLast4={kycQ.data.idProofLast4}
+                photoUrl={kycQ.data.photoUrl}
+                kycFront={props.kycFront}
+                setKycFront={props.setKycFront}
+                kycBack={props.kycBack}
+                setKycBack={props.setKycBack}
+                kycPhoto={props.kycPhoto}
+                setKycPhoto={props.setKycPhoto}
+              />
             </div>
           )}
           {!props.selected && results.length > 0 && (
@@ -3001,7 +3114,10 @@ function CoGuestCard(props: {
               />
             </div>
             <div>
-              <label className="label block mb-1">Email</label>
+              <label className="label block mb-1">
+                Email{" "}
+                <span className="text-xs text-textSecondary font-normal">(optional)</span>
+              </label>
               <EmailInput value={f.email} onChange={(v) => setF({ email: v })} />
             </div>
             <div>
@@ -3053,7 +3169,9 @@ function CoGuestCard(props: {
               />
             </div>
             <div>
-              <label className="label block mb-1">Nationality</label>
+              <label className="label block mb-1">
+                Nationality <span className="text-danger">*</span>
+              </label>
               <input
                 className="input"
                 value={f.nationality}
@@ -3061,7 +3179,9 @@ function CoGuestCard(props: {
               />
             </div>
             <div>
-              <label className="label block mb-1">State</label>
+              <label className="label block mb-1">
+                State <span className="text-danger">*</span>
+              </label>
               <Combobox
                 value={f.state}
                 onChange={(v) =>
@@ -3077,7 +3197,9 @@ function CoGuestCard(props: {
               />
             </div>
             <div>
-              <label className="label block mb-1">City</label>
+              <label className="label block mb-1">
+                City <span className="text-danger">*</span>
+              </label>
               <Combobox
                 value={f.city}
                 onChange={(v) => setF({ city: v })}
@@ -3090,11 +3212,25 @@ function CoGuestCard(props: {
               />
             </div>
             <div className="sm:col-span-2">
-              <label className="label block mb-1">Address</label>
+              <label className="label block mb-1">
+                Address <span className="text-danger">*</span>
+              </label>
               <input
                 className="input"
                 value={f.address}
                 onChange={(e) => setF({ address: e.target.value })}
+              />
+            </div>
+            <div className="sm:col-span-2">
+              <label className="label block mb-1">
+                GSTIN{" "}
+                <span className="text-xs text-textSecondary font-normal">(optional)</span>
+              </label>
+              <input
+                className="input font-mono uppercase"
+                value={f.gstin}
+                placeholder="22AAAAA0000A1Z5"
+                onChange={(e) => setF({ gstin: e.target.value.toUpperCase() })}
               />
             </div>
           </div>
