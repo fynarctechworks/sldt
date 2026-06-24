@@ -3617,10 +3617,32 @@ router.post(
 
     // Extend the dates only. The room rate is intentionally left as-is so
     // existing nights aren't re-priced.
+    //
+    // plannedCheckOutAt (the staff-chosen checkout *time*) must roll forward
+    // to the new date too, otherwise the reservation header keeps showing the
+    // old "Out" date — it prioritises plannedCheckOutAt over checkOutDate.
+    // Preserve the exact instant-of-day by shifting the timestamp by the
+    // whole-day delta between old and new check-out dates. Doing it as a ms
+    // offset (rather than mutating the calendar fields) is timezone-safe
+    // regardless of the server's TZ.
+    let newPlannedCheckOutAt: Date | undefined;
+    if (current.plannedCheckOutAt) {
+      const dayMs = 24 * 60 * 60 * 1000;
+      const deltaDays = Math.round(
+        (new Date(input.newCheckOutDate).getTime() -
+          new Date(current.checkOutDate).getTime()) /
+          dayMs,
+      );
+      newPlannedCheckOutAt = new Date(
+        new Date(current.plannedCheckOutAt).getTime() + deltaDays * dayMs,
+      );
+    }
+
     await db
       .update(reservations)
       .set({
         checkOutDate: input.newCheckOutDate,
+        ...(newPlannedCheckOutAt ? { plannedCheckOutAt: newPlannedCheckOutAt } : {}),
         updatedAt: new Date(),
       })
       .where(eq(reservations.id, id));
