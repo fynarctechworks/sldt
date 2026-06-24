@@ -83,6 +83,11 @@ export const reservations = pgTable(
     // arrival. NULL falls back to property policy times.
     plannedCheckInAt: timestamp("planned_check_in_at", { withTimezone: true }),
     plannedCheckOutAt: timestamp("planned_check_out_at", { withTimezone: true }),
+    // Migration 0048 — the check-out date the reservation was FIRST booked
+    // with. Stamped once, on the first /extend, from the then-current
+    // checkOutDate. NULL = never extended. Lets the UI show an "Extended"
+    // marker and the original departure date.
+    originalCheckOutDate: date("original_check_out_date"),
     // Migration 0021 — set once we fire the pre-arrival WhatsApp/SMS
     // reminder. Used to dedupe so the dashboard tick doesn't resend.
     arrivalReminderSentAt: timestamp("arrival_reminder_sent_at", { withTimezone: true }),

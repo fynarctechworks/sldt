@@ -74,6 +74,9 @@ interface Detail {
   // display-only; NULL falls back to hotel policy.
   plannedCheckInAt?: string | null;
   plannedCheckOutAt?: string | null;
+  // Set on the first /extend to the then-current checkOutDate. Present =
+  // the stay was extended; drives the "Extended" room-row chip.
+  originalCheckOutDate?: string | null;
   specialRequests: string | null;
   subtotal: string;
   grandTotal: string;
@@ -900,7 +903,7 @@ export default function ReservationDetail() {
             </tr>
           </thead>
           <tbody>
-            {rooms.map((room) => {
+            {rooms.map((room, roomIndex) => {
               // Swap chain context. Rows that share a swap_id are
               // sibling segments of the same swap event. Sort them by
               // effective_from to figure out who's the predecessor
@@ -977,6 +980,24 @@ export default function ReservationDetail() {
                       })
                     }
                   />
+                  {/* Extended-stay breakdown, once, under the first room.
+                      Skipped for day-use and for swap-segmented rows, where
+                      the per-room window already drives the subtotal. */}
+                  {roomIndex === 0 &&
+                    r.originalCheckOutDate &&
+                    r.stayType !== "short_stay" &&
+                    !room.effectiveFrom &&
+                    !room.effectiveTo && (
+                      <ExtensionBreakdownRows
+                        checkInDate={r.checkInDate}
+                        originalCheckOut={r.originalCheckOutDate}
+                        currentCheckOut={r.checkOutDate}
+                        ratePerNight={room.ratePerNight}
+                        displayType={
+                          room.displayType ?? room.roomType.replace(/_/g, " ")
+                        }
+                      />
+                    )}
                 </Fragment>
               );
             })}
@@ -1887,6 +1908,71 @@ function SwapClosedLegRow(props: {
         </span>
       </td>
     </tr>
+  );
+}
+
+// Extended-stay breakdown. When a reservation's check-out was pushed out
+// past its first-booked date, the flat "2n" subtotal hides that it's really
+// two segments. These two indented sub-rows split it into the original
+// booking and the extension, each with its own nights × rate = subtotal —
+// the desk reads the extension as a first-class line, not buried in a total.
+// Rendered once, under the first room row (mirrors SwapClosedLegRow's shape).
+function ExtensionBreakdownRows(props: {
+  checkInDate: string;
+  originalCheckOut: string;
+  currentCheckOut: string;
+  ratePerNight: string;
+  displayType: string;
+}) {
+  const dayMs = 24 * 60 * 60 * 1000;
+  const rate = Number(props.ratePerNight);
+  const nightsBetween = (from: string, to: string) =>
+    Math.max(0, Math.round((new Date(to).getTime() - new Date(from).getTime()) / dayMs));
+
+  const origNights = nightsBetween(props.checkInDate, props.originalCheckOut);
+  const extNights = nightsBetween(props.originalCheckOut, props.currentCheckOut);
+
+  const seg = (
+    label: string,
+    from: string,
+    to: string,
+    n: number,
+    badge: { text: string; cls: string },
+  ) => (
+    <tr className="bg-bg/40">
+      <td className="font-mono">
+        <div className="mt-0.5 flex items-center gap-1.5 flex-wrap pl-3">
+          <span className="text-textSecondary">↳</span>
+          <span
+            className={`text-[9px] uppercase tracking-wide font-semibold px-1.5 py-0.5 rounded border ${badge.cls}`}
+          >
+            {badge.text}
+          </span>
+          <span className="text-[11px] text-textSecondary font-mono">
+            {format(new Date(from), "dd MMM")} → {format(new Date(to), "dd MMM")} · {n}n
+          </span>
+        </div>
+      </td>
+      <td className="capitalize text-textSecondary text-xs">{label}</td>
+      <td className="font-mono tabular-nums text-textSecondary text-xs">{inr(rate)}</td>
+      <td className="font-mono tabular-nums text-textSecondary text-xs">{inr(rate * n)}</td>
+      <td></td>
+    </tr>
+  );
+
+  return (
+    <>
+      {origNights > 0 &&
+        seg("Original booking", props.checkInDate, props.originalCheckOut, origNights, {
+          text: "Original",
+          cls: "bg-textSecondary/10 text-textSecondary border-textSecondary/30",
+        })}
+      {extNights > 0 &&
+        seg("Stay extension", props.originalCheckOut, props.currentCheckOut, extNights, {
+          text: "Extended",
+          cls: "bg-accentBlue/10 text-accentBlue border-accentBlue/30",
+        })}
+    </>
   );
 }
 

@@ -3643,6 +3643,10 @@ router.post(
       .set({
         checkOutDate: input.newCheckOutDate,
         ...(newPlannedCheckOutAt ? { plannedCheckOutAt: newPlannedCheckOutAt } : {}),
+        // Remember the first-booked check-out the first time a reservation is
+        // extended (drives the "Extended" marker). Never overwritten on
+        // subsequent extends, so it always holds the true original.
+        ...(current.originalCheckOutDate ? {} : { originalCheckOutDate: current.checkOutDate }),
         updatedAt: new Date(),
       })
       .where(eq(reservations.id, id));
