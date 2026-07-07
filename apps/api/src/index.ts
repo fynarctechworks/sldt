@@ -91,9 +91,24 @@ app.use((_req, res, next) => {
   next();
 });
 
+// Allowed browser origins: the web front end, plus the Tauri desktop app.
+// Tauri serves the bundled UI from a tauri.localhost origin (scheme differs
+// by OS/webview), so we allow that family alongside FRONTEND_URL. Requests
+// with no Origin header (native fetch, health checks) are allowed through.
+const TAURI_ORIGINS = new Set([
+  "tauri://localhost",
+  "https://tauri.localhost",
+  "http://tauri.localhost",
+]);
 app.use(
   cors({
-    origin: env.FRONTEND_URL,
+    origin(origin, callback) {
+      if (!origin || origin === env.FRONTEND_URL || TAURI_ORIGINS.has(origin)) {
+        callback(null, true);
+      } else {
+        callback(null, false);
+      }
+    },
     credentials: true,
   }),
 );
