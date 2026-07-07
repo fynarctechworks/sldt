@@ -511,9 +511,15 @@ function brandHeader(
 // own note (stripped of the per-room/split qualifiers, matching the
 // Payment History tag), otherwise a chronological Advance/Later tag.
 function paymentTotalsLabel(
-  p: { notes?: string | null; paymentDate: string | Date },
+  p: { notes?: string | null; paymentDate: string | Date; amount?: string | number },
   checkedInAtMs: number | null,
 ): string {
+  // Negative amounts are refunds (money out) — label them as such so the
+  // totals block reads "Refund … −₹700" rather than a plain "Paid".
+  if (p.amount !== undefined && Number(p.amount) < 0) {
+    const note = (p.notes ?? "").trim();
+    return note.length > 0 ? note : "Refund";
+  }
   const cleaned = (p.notes ?? "")
     .trim()
     .replace(/\s*·\s*part \d+\/\d+(?:\s*\(split from [^)]+\))?/g, "")

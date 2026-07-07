@@ -37,6 +37,10 @@ export interface BuilderArgs {
   charges: AdditionalCharge[];
   // Slug → label map for the displayed "Ac Single Bed Rooms" labels.
   labelMap: RoomTypeLabelMap;
+  // room id → room number, so an in-place swap (swappedFromRoomId set, but
+  // no segmented sibling row) can render "swapped from Room X" on the line.
+  // Optional — when absent, in-place swaps just omit the tag.
+  roomNumberById?: Map<string, string>;
 }
 
 export interface BuiltLineItem {
@@ -112,7 +116,7 @@ function parseExtensionDelta(c: AdditionalCharge): ExtensionDelta | null {
 // path, so per-room invoices produce numbers that sum to the
 // combined invoice (give-or-take 1-2 paise rounding per line).
 export function buildInvoice(args: BuilderArgs): BuiltInvoice {
-  const { reservation, rooms, charges, labelMap } = args;
+  const { reservation, rooms, charges, labelMap, roomNumberById } = args;
   const isShort = reservation.stayType === "short_stay";
   const shortStayHours = Number(reservation.durationHours ?? 0);
   // For overnight: priced per night. Short-stay: rate IS the per-room
@@ -316,9 +320,19 @@ export function buildInvoice(args: BuilderArgs): BuiltInvoice {
     // 205 read as if 205 itself were sent to maintenance.
     const reasonSuffix =
       rr.swapReason && sibling?.direction === "to" ? `: ${rr.swapReason}` : "";
+    // In-place swap (0036/0037): the row was moved to a new room without
+    // segmentation (effective_from/to stay NULL), so `isSegmented` is false
+    // and the chain-based swapTag above doesn't fire. Resolve the previous
+    // room number from swappedFromRoomId so the bill still shows the move.
+    const inPlaceFromNumber =
+      !isSegmented && rr.swappedFromRoomId
+        ? roomNumberById?.get(rr.swappedFromRoomId) ?? null
+        : null;
     const overnightSuffix = isSegmented
       ? `(${rowNights} night${rowNights === 1 ? "" : "s"}, ${formatShortDate(rowFrom)} → ${formatShortDate(rowTo)} · ${swapTag}${reasonSuffix})`
-      : `(${rowNights} nights)`;
+      : inPlaceFromNumber
+        ? `(${rowNights} night${rowNights === 1 ? "" : "s"} · swapped from Room ${inPlaceFromNumber})`
+        : `(${rowNights} nights)`;
     lineItems.push({
       description: isShort
         ? `Room ${rr.room.roomNumber} - ${displayType} (Day use · ${shortStayHours} hours)`

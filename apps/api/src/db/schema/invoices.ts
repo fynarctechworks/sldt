@@ -119,11 +119,11 @@ export const payments = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
-    // ₹0 receipts are intentional placeholders for "we issued a
-    // receipt at check-in / booking even though no money was
-    // collected" — see migration 0016. The previous strict > 0
-    // crashed the API on no-advance check-ins.
-    amountNonNeg: check("payment_amount_nonneg", sql`${t.amount} >= 0`),
+    // Sign is meaningful: positive = money in, negative = refund (money
+    // out). ₹0 receipts are intentional placeholders for a booking/check-in
+    // with no advance. Migration 0041 relaxed the old `>= 0` check to
+    // `IS NOT NULL` so refund rows are allowed; keep the schema in sync.
+    amountNotNull: check("payment_amount_not_null", sql`${t.amount} IS NOT NULL`),
   }),
 );
 

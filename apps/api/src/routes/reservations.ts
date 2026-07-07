@@ -34,6 +34,7 @@ import { maintenanceIssues } from "../db/schema/maintenance.js";
 import { combinedRoomTypeLabel, type RoomTypeLabelMap } from "../lib/roomTypeLabel.js";
 import { logActivity } from "../lib/activity.js";
 import { logger } from "../lib/logger.js";
+import { propertyToday } from "../lib/propertyTime.js";
 import {
   findAvailableRooms,
   findRoomConflicts,
@@ -77,6 +78,28 @@ import { guestLedger } from "../db/schema/guestLedger.js";
 import { notifications } from "../db/schema/notifications.js";
 
 const router = Router();
+
+// Build a room-id → room-number map for buildInvoice(), so in-place swaps
+// can render "swapped from Room X" on the bill. Seeds from the reservation's
+// own room rows, then resolves any swapped-from room IDs not already present
+// (the previous room is gone from the row set after an in-place swap).
+async function buildRoomNumberMap(
+  resRoomRows: { room: { id: string; roomNumber: string }; rr: { swappedFromRoomId: string | null } }[],
+): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  for (const x of resRoomRows) map.set(x.room.id, x.room.roomNumber);
+  const missing = resRoomRows
+    .map((x) => x.rr.swappedFromRoomId)
+    .filter((id): id is string => !!id && !map.has(id));
+  if (missing.length > 0) {
+    const extra = await db
+      .select({ id: rooms.id, roomNumber: rooms.roomNumber })
+      .from(rooms)
+      .where(inArray(rooms.id, Array.from(new Set(missing))));
+    for (const r of extra) map.set(r.id, r.roomNumber);
+  }
+  return map;
+}
 
 // Resolve `:id` to a UUID before every handler — lets clients use
 // either the UUID or the human-readable SLDT-RES-NNNN format
@@ -1015,7 +1038,7 @@ router.get(
       );
     }
 
-    const today = format(new Date(), "yyyy-MM-dd");
+    const today = propertyToday();
     if (current.checkInDate <= today) {
       return fail(res, 400, "NOT_EARLY", "Reservation is not in the future.");
     }
@@ -1123,7 +1146,7 @@ router.post(
       );
     }
 
-    const today = format(new Date(), "yyyy-MM-dd");
+    const today = propertyToday();
     if (current.checkInDate <= today) {
       return fail(
         res,
@@ -1266,7 +1289,7 @@ router.post(
 
     // Block early check-in. Use the early-check-in endpoint to shift dates and
     // re-verify room availability for the extra nights.
-    const today = format(new Date(), "yyyy-MM-dd");
+    const today = propertyToday();
     if (r[0]!.checkInDate > today) {
       return fail(
         res,
@@ -1821,9 +1844,10 @@ async function handlePerRoomCheckout(args: {
       issuedInvoices.push({ id: inv!.id, invoiceNumber: invNum });
     }
 
-    // Refund overpayment as wallet credit (one row, against the first
-    // invoice). Cash refunds are handled outside this transaction (front
-    // desk pays out from the drawer manually).
+    // Refund the overpayment. Credit → wallet ledger entry. Cash → a
+    // negative payment row (money out), mirroring the cancel flow, so the
+    // refund is an auditable transaction that nets advance_paid down and
+    // shows on the invoice — not just an activity-log note.
     if (hasOverpaid && input.refundMode === "credit") {
       await tx.insert(guestLedger).values({
         guestId: r.guestId,
@@ -1835,6 +1859,21 @@ async function handlePerRoomCheckout(args: {
           input.refundNote ??
           `Refund issued as wallet credit on early checkout (reservation ${r.reservationNumber})`,
         createdBy: req.user!.id,
+      });
+    } else if (hasOverpaid && input.refundMode === "cash") {
+      const rcpNum = await generateReceiptNumber(tx);
+      await tx.insert(payments).values({
+        receiptNumber: rcpNum,
+        propertyId: r.propertyId,
+        invoiceId: issuedInvoices[0]!.id,
+        reservationId: id,
+        amount: String((-overpaidAmount).toFixed(2)),
+        paymentMethod: "cash",
+        status: "received",
+        receivedBy: req.user!.id,
+        notes:
+          input.refundNote ??
+          `Cash refund of overpayment on check-out (reservation ${r.reservationNumber})`,
       });
     }
 
@@ -4403,7 +4442,7 @@ router.post(
       return fail(res, 400, "DUPLICATE_ROOM", "Room already assigned to this reservation");
     }
 
-    const today = format(new Date(), "yyyy-MM-dd");
+    const today = propertyToday();
     const isShortStay = current.stayType === "short_stay";
     // For day-use (short_stay): check-in == check-out, so "nights"
     // math is meaningless. The room is added at a flat rate equal to
@@ -4865,6 +4904,10 @@ router.get(
     for (const arr of swapChains.values()) {
       arr.sort((a, b) => (a.effectiveFrom < b.effectiveFrom ? -1 : 1));
     }
+    // room id → number, so an in-place swap (swappedFromRoomId set, no
+    // segmented sibling) can show "swapped from Room X" on the preview,
+    // matching the real invoice.
+    const previewRoomNumberById = await buildRoomNumberMap(resRooms);
     function swapSibling(
       reservationRoomId: string,
       swapId: string | null,
@@ -4936,11 +4979,19 @@ router.get(
         rr.rr.swapReason && sibling?.direction === "to"
           ? `: ${rr.rr.swapReason}`
           : "";
+      // In-place swap (no segmentation): resolve the previous room number
+      // so the preview shows the move too.
+      const inPlaceFromNumber =
+        !isSegmented && rr.rr.swappedFromRoomId
+          ? previewRoomNumberById.get(rr.rr.swappedFromRoomId) ?? null
+          : null;
       const description = isShortStayPreview
         ? `Room ${rr.room.roomNumber} - ${displayType} (Day use · ${shortStayHoursPreview} hours)`
         : isSegmented
           ? `Room ${rr.room.roomNumber} - ${displayType} (${rowNights} night${rowNights === 1 ? "" : "s"}, ${rowFrom} → ${rowTo} · ${swapTag}${reasonSuffix})`
-          : `Room ${rr.room.roomNumber} - ${displayType} (${nights} nights)`;
+          : inPlaceFromNumber
+            ? `Room ${rr.room.roomNumber} - ${displayType} (${nights} night${nights === 1 ? "" : "s"} · swapped from Room ${inPlaceFromNumber})`
+            : `Room ${rr.room.roomNumber} - ${displayType} (${nights} nights)`;
       lineItems.push({
         id: `preview-${rr.room.id}-${String(rowFrom)}`,
         invoiceId: "preview",
@@ -5464,6 +5515,7 @@ router.get(
       scopeRoomIds: [roomId],
       remainingUnInvoicedRoomIds,
     });
+    const roomNumberById = await buildRoomNumberMap(scopedRooms);
     const built = buildInvoice({
       reservation: {
         stayType: resv.stayType,
@@ -5477,6 +5529,7 @@ router.get(
       rooms: scopedRooms.map((x) => ({ ...x.rr, room: x.room })) as never,
       charges: scopedCharges,
       labelMap,
+      roomNumberById,
     });
 
     // Advance allocation across the remaining un-invoiced rooms.
@@ -5642,6 +5695,7 @@ async function autoConsolidatePerRoomInvoices(
     .limit(1);
   if (!booker) return null;
 
+  const roomNumberById = await buildRoomNumberMap(scopeRooms);
   const built = buildInvoice({
     reservation: {
       stayType: resv.stayType,
@@ -5655,6 +5709,7 @@ async function autoConsolidatePerRoomInvoices(
     rooms: scopeRooms.map((x) => ({ ...x.rr, room: x.room })) as never,
     charges: allCharges,
     labelMap,
+    roomNumberById,
   });
   const cgstRate = +(built.roomGstRate / 2).toFixed(2);
   const sgstRate = +(built.roomGstRate / 2).toFixed(2);

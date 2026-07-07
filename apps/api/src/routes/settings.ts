@@ -235,6 +235,19 @@ router.put(
       }
     }
 
+    // When the default rate changes, cascade it to the physical rooms of
+    // this type that are STILL sitting at the old default — i.e. rooms the
+    // staff never gave a custom per-room price. Rooms with an override
+    // (base_rate != old default) are left untouched. Existing reservations
+    // and invoices snapshot ratePerNight at booking time (see
+    // reservations.ts / invoiceBuilder.ts), so they are never re-priced —
+    // only future bookings pick up the new rate.
+    const oldDefaultRate = existing[0]!.defaultRate;
+    const newDefaultRate =
+      typeof update.defaultRate === "string" ? update.defaultRate : oldDefaultRate;
+    const rateChanged = Number(newDefaultRate) !== Number(oldDefaultRate);
+
+    let cascadedRooms = 0;
     const row = await db.transaction(async (tx) => {
       const [r] = await tx.update(roomTypes).set(update).where(eq(roomTypes.id, id)).returning();
       if (newSlug !== oldSlug) {
@@ -244,6 +257,14 @@ router.put(
           .set({ soldAsType: newSlug })
           .where(eq(reservationRooms.soldAsType, oldSlug));
       }
+      if (rateChanged) {
+        const bumped = await tx
+          .update(rooms)
+          .set({ baseRate: String(newDefaultRate), updatedAt: new Date() })
+          .where(and(eq(rooms.roomType, newSlug), eq(rooms.baseRate, String(oldDefaultRate))))
+          .returning({ id: rooms.id });
+        cascadedRooms = bumped.length;
+      }
       return r;
     });
 
@@ -251,14 +272,17 @@ router.put(
       action: "room_type_updated",
       entityType: "room_type",
       entityId: id,
-      description:
-        newSlug !== oldSlug
-          ? `Room type updated: ${row!.label} (slug: ${oldSlug} → ${newSlug})`
-          : `Room type updated: ${row!.label}`,
+      description: [
+        `Room type updated: ${row!.label}`,
+        newSlug !== oldSlug ? ` (slug: ${oldSlug} → ${newSlug})` : "",
+        rateChanged
+          ? ` · default rate ₹${Number(oldDefaultRate).toFixed(0)} → ₹${Number(newDefaultRate).toFixed(0)}${cascadedRooms ? ` (${cascadedRooms} room${cascadedRooms === 1 ? "" : "s"} resynced)` : ""}`
+          : "",
+      ].join(""),
       performedBy: req.user!.id,
       ipAddress: req.ip,
     });
-    return ok(res, row);
+    return ok(res, { ...row, cascadedRooms });
   },
 );
 
