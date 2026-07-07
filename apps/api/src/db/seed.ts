@@ -4,6 +4,11 @@ import { db } from "./client.js";
 import { profiles, settings } from "./schema/index.js";
 
 async function main() {
+  // Block accidental seeding of a remote (prod) DB from a dev machine.
+  // @ts-expect-error — plain JS guard helper, no type declaration needed.
+  const { assertLocalDbTarget } = await import("../../scripts/guard-db-target.mjs");
+  assertLocalDbTarget(process.env.DATABASE_URL);
+
   console.log("Seeding HotelDesk (bare minimum: settings row + admin user)...");
 
   const existingSettings = await db.select().from(settings).limit(1);

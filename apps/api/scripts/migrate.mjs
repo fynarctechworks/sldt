@@ -27,6 +27,10 @@ if (!process.env.DATABASE_URL) {
   process.exit(1);
 }
 
+// Block accidental runs against a remote (prod) DB from a dev machine.
+const { assertLocalDbTarget } = await import("./guard-db-target.mjs");
+assertLocalDbTarget(process.env.DATABASE_URL);
+
 const sql = postgres(process.env.DATABASE_URL, { max: 1 });
 
 try {

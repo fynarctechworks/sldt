@@ -153,9 +153,11 @@ curl -s http://127.0.0.1:3010/health                          # {"status":"ok",.
 
 ### 3f. Apply database migrations
 The Supabase DB needs the latest schema. Run the migration script once,
-from inside the container (it has the script + `DATABASE_URL`):
+from inside the container (it has the script + `DATABASE_URL`). The migrate
+script refuses a non-local DB by default; on the VPS this IS the prod DB, so
+pass `ALLOW_REMOTE_DB=1` to confirm the intent:
 ```bash
-docker compose -f deploy/docker-compose.prod.yml exec api \
+docker compose -f deploy/docker-compose.prod.yml exec -e ALLOW_REMOTE_DB=1 api \
   node apps/api/scripts/migrate.mjs
 ```
 It prints which migrations applied. Safe to re-run — already-applied ones skip.
@@ -303,8 +305,9 @@ Without this, sign-in / password-reset links resolve to localhost.
 cd /opt/hoteldesk
 git pull
 docker compose -f deploy/docker-compose.prod.yml up -d --build
-# if the change includes a new migration:
-docker compose -f deploy/docker-compose.prod.yml exec api \
+# if the change includes a new migration (ALLOW_REMOTE_DB=1 confirms the
+# prod DB target — the guard blocks non-local DBs by default):
+docker compose -f deploy/docker-compose.prod.yml exec -e ALLOW_REMOTE_DB=1 api \
   node apps/api/scripts/migrate.mjs
 ```
 `up -d --build` rebuilds the image and replaces the running container with
