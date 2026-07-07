@@ -495,7 +495,7 @@ function EditGuestModal({ guest, onClose }: { guest: Guest; onClose: () => void 
 
           <Field label="Notes">
             <textarea
-              className="w-full border border-borderc bg-surface rounded-sm px-3 py-2 text-textPrimary outline-none transition-colors focus:border-brand focus:ring-2 focus:ring-brand/20 placeholder:text-textSecondary/60 resize-none"
+              className="w-full border border-borderc bg-surface rounded-sm px-3 py-2 text-textPrimary outline-none transition-colors focus:border-brand focus:ring-2 focus:ring-brand/20 placeholder:text-textSecondary resize-none"
               rows={3}
               value={form.notes}
               placeholder="Allergies, preferences, anniversary etc."

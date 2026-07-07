@@ -37,7 +37,7 @@
        row when content reflows. 16px text on mobile (text-base) avoids
        iOS auto-zoom on focus; sm: shrinks to 14px on desktop where the
        behaviour doesn't exist. */
-    @apply min-h-10 w-full border border-borderc bg-surface rounded-sm px-3 py-2 text-base sm:text-sm text-textPrimary outline-none transition-colors focus:border-brand focus:ring-2 focus:ring-brand/20 placeholder:text-textSecondary/60;
+    @apply min-h-10 w-full border border-borderc bg-surface rounded-sm px-3 py-2 text-base sm:text-sm text-textPrimary outline-none transition-colors focus:border-brand focus:ring-2 focus:ring-brand/20 placeholder:text-textSecondary;
   }
   /* Hide the native up/down spinner on number inputs so fields like
      Adults / Children / rates are plain type-only entries (the arrows

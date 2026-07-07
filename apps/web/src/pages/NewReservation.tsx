@@ -82,7 +82,7 @@ function makeCoGuestEntry(): CoGuestEntry {
       idProofNumber: "",
       address: "",
       city: "",
-      state: "",
+      state: "Andhra Pradesh",
       nationality: "Indian",
       gstin: "",
     },
@@ -201,7 +201,11 @@ export default function NewReservation() {
   // ("4 PM arrival, 10 AM next-day departure").
   const [checkInTime, setCheckInTime] = useState("");
   const [checkOutTime, setCheckOutTime] = useState("");
-  const [adults, setAdults] = useState(1);
+  // Starts empty (0 renders as a blank field) so staff must consciously
+  // enter the head count rather than accepting a pre-filled "1". The field's
+  // onBlur and the API's min(1) rule still guarantee a booking can't be
+  // created with 0 adults.
+  const [adults, setAdults] = useState(0);
   const [children, setChildren] = useState(0);
   const [purpose, setPurpose] = useState<"business" | "leisure" | "transit" | "other">("leisure");
   const [specialRequests, setSpecialRequests] = useState("");
@@ -217,7 +221,7 @@ export default function NewReservation() {
     idProofNumber: "",
     address: "",
     city: "",
-    state: "",
+    state: "Andhra Pradesh",
     nationality: "Indian",
     gstin: "",
   });
@@ -1191,6 +1195,7 @@ export default function NewReservation() {
   const canSubmit =
     canPriceStay &&
     !overnightDateError &&
+    adults >= 1 &&
     selectedRooms.length > 0 &&
     (selectedGuest ||
       (useNewGuest &&
@@ -1205,8 +1210,38 @@ export default function NewReservation() {
     capacityOk &&
     (reletRooms.length === 0 || reletConfirmed);
 
+  // Enter advances to the next field instead of doing nothing / submitting —
+  // faster keyboard-only data entry for the front desk. Textareas keep native
+  // Enter (newlines); buttons and the submit action are left alone.
+  function handleFormKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
+    if (e.key !== "Enter") return;
+    const el = e.target as HTMLElement;
+    const tag = el.tagName;
+    // Let textareas insert newlines; let buttons/links do their own thing.
+    if (tag === "TEXTAREA" || tag === "BUTTON" || tag === "A") return;
+    // Native <select> uses Enter to confirm a highlighted option — don't steal it.
+    if (tag === "SELECT") return;
+    if (tag !== "INPUT") return;
+    e.preventDefault();
+
+    // Collect the visible, enabled focusable controls in DOM order and jump
+    // to the one after the current field.
+    const root = e.currentTarget;
+    const focusables = Array.from(
+      root.querySelectorAll<HTMLElement>(
+        'input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled])',
+      ),
+    ).filter((n) => n.offsetParent !== null); // skip hidden
+    const idx = focusables.indexOf(el);
+    if (idx >= 0 && idx < focusables.length - 1) {
+      focusables[idx + 1]!.focus();
+    } else if (idx === focusables.length - 1) {
+      el.blur();
+    }
+  }
+
   return (
-    <div className="space-y-4">
+    <div className="space-y-4" onKeyDown={handleFormKeyDown}>
       <div className="flex items-center gap-3 flex-wrap">
         <button onClick={() => navigate(-1)} className="btn-secondary !h-9 !px-2">
           <ChevronLeft className="w-4 h-4" />
@@ -1249,7 +1284,7 @@ export default function NewReservation() {
           <span className="label">Stay type</span>
           <div className="inline-flex rounded-sm border border-borderc overflow-hidden text-xs">
             {([
-              { v: "overnight", label: "Overnight" },
+              { v: "overnight", label: "Full Day" },
               { v: "short_stay", label: "Day use (hours)" },
             ] as const).map((opt) => (
               <button

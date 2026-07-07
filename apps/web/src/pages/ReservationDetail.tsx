@@ -481,7 +481,15 @@ export default function ReservationDetail() {
         })();
     return new Date(startMs + Math.round(durationHours * 3600 * 1000));
   })();
-  const totalPaid = (Number(r.grandTotal) - Number(r.balanceDue)).toFixed(2);
+  // "Paid so far" is the money actually received (advancePaid), NOT
+  // grandTotal − balanceDue: balanceDue is clamped at 0, so on an
+  // overpayment (e.g. paid for a pricier room, then swapped to a cheaper
+  // one) the old formula understated what the guest paid and hid the
+  // surplus. When advancePaid > grandTotal the difference is an
+  // overpayment owed back to the guest.
+  const paidSoFar = Number(r.advancePaid ?? 0);
+  const totalPaid = paidSoFar.toFixed(2);
+  const overpaid = +(paidSoFar - Number(r.grandTotal)).toFixed(2);
   const kycVerified = !!guest?.kycVerifiedAt && !!guest?.idProofPhotoFront;
   const canCheckIn = r.status === "confirmed" && kycVerified;
   const canCheckOut = r.status === "checked_in";
@@ -702,11 +710,20 @@ export default function ReservationDetail() {
           </div>
         </div>
         <div className="card">
-          <div className="label">Balance</div>
-          <div className="text-2xl font-bold font-mono text-navy">{inr(r.balanceDue)}</div>
+          <div className="label">{overpaid > 0.009 ? "Overpaid" : "Balance"}</div>
+          <div
+            className={`text-2xl font-bold font-mono ${overpaid > 0.009 ? "text-warning" : "text-navy"}`}
+          >
+            {overpaid > 0.009 ? inr(overpaid) : inr(r.balanceDue)}
+          </div>
           <div className="text-xs text-textSecondary">
             of {inr(r.grandTotal)} · paid {inr(totalPaid)}
           </div>
+          {overpaid > 0.009 && (
+            <div className="text-xs text-warning font-medium mt-1">
+              Guest overpaid — refund or credit due
+            </div>
+          )}
         </div>
       </div>
 
@@ -758,41 +775,10 @@ export default function ReservationDetail() {
         {canCheckOut && (
           <button
             className="btn-primary"
-            onClick={async () => {
-              // Overdue intercept: if the guest stayed past their
-              // scheduled checkout (either multi-day or past today's
-              // hotel checkout time), give staff a chance to add a
-              // late fee BEFORE generating the invoice. Skipping is
-              // explicit — no fee means the checkout proceeds as is.
-              const isLate = overdueDays > 0 || minutesOverdue > 0;
-              if (isLate) {
-                const headline =
-                  overdueDays > 0
-                    ? `Guest stayed ${overdueDays} day${overdueDays === 1 ? "" : "s"} past the scheduled check-out.`
-                    : `Guest is ${minutesOverdue} min past today's check-out time.`;
-                const wantsFee = await dialog.confirm({
-                  title: "Add a late fee?",
-                  message: `${headline} Do you want to add a late-checkout charge to the bill before generating the invoice?`,
-                  okLabel: "Yes, add fee",
-                  cancelLabel: "No, skip",
-                });
-                if (wantsFee) {
-                  setLateFeeFlow({
-                    description: `Late checkout fee (${
-                      overdueDays > 0
-                        ? `${overdueDays} day${overdueDays === 1 ? "" : "s"}`
-                        : `${minutesOverdue} min`
-                    } past scheduled out)`,
-                    // Late fee defaults to 0% — same as other one-off
-                    // charges. Staff explicitly picks 5%/18% from the
-                    // dropdown when it's actually tax-applicable.
-                    gstRate: 0,
-                    titleOverride: "Add Late-Checkout Fee",
-                  });
-                  setShowCharge(true);
-                  return;
-                }
-              }
+            onClick={() => {
+              // Go straight to checkout. If the stay is overdue, the checkout
+              // modal surfaces an optional late-fee field there — the fee is
+              // applied only on Complete Check-out, never saved separately.
               setShowCheckout(true);
             }}
           >
@@ -1405,6 +1391,17 @@ export default function ReservationDetail() {
                 invoiceNumber: inv?.invoiceNumber ?? "—",
               };
             })}
+          additionalCharges={charges.map((c) => ({
+            description: c.description,
+            amount: Number(c.amount),
+          }))}
+          overdueLabel={
+            overdueDays > 0
+              ? `${overdueDays} day${overdueDays === 1 ? "" : "s"} past scheduled out`
+              : minutesOverdue > 0
+                ? `${minutesOverdue} min past check-out time`
+                : null
+          }
           onClose={() => setShowCheckout(false)}
           onDone={() => {
             setShowCheckout(false);
@@ -4398,6 +4395,12 @@ function ChargeModal(props: {
   const perRoomAmount =
     selectedCount > 0 ? +(amount / selectedCount).toFixed(2) : amount;
   const idempotencyKey = useMemo(() => newIdempotencyKey(), []);
+  // Late-checkout fees must be entered on the Check Out screen (applied at
+  // Complete Check-out), NOT saved immediately here. Detect the wording and
+  // block the save so this form is only used for genuine extras.
+  const looksLikeLateFee = /\blate[- ]?check\s*-?\s*out\b|\blate\s*fee\b/i.test(
+    description,
+  );
 
   const save = useMutation({
     mutationFn: async () => {
@@ -4464,6 +4467,16 @@ function ChargeModal(props: {
             onChange={(e) => setDescription(e.target.value)}
             placeholder="Laundry, restaurant, extra bed…"
           />
+          {looksLikeLateFee && (
+            <div className="text-xs text-warning mt-1 flex items-start gap-1.5">
+              <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+              <span>
+                Late-checkout fees aren&apos;t added here — enter the fee on the
+                <strong> Check Out</strong> screen, where it&apos;s applied when
+                you complete check-out. This form is for other extras.
+              </span>
+            </div>
+          )}
         </div>
         {props.rooms.length > 1 && (
           <div>
@@ -4550,6 +4563,7 @@ function ChargeModal(props: {
               !description ||
               amount <= 0 ||
               save.isPending ||
+              looksLikeLateFee ||
               // Block submit if every billable room is already invoiced
               // AND no reservation-wide fallback is meaningful (i.e. the
               // user explicitly picked rooms — but their picks are all
@@ -5359,6 +5373,13 @@ function CheckoutModal(props: {
   // Rooms that already have their own invoice (and won't be re-billed).
   // Listed in the confirm step so staff isn't surprised by their absence.
   alreadyInvoicedRooms: { roomNumber: string; invoiceNumber: string }[];
+  // Additional charges (late fees, extras) on this reservation, so the
+  // checkout summary itemises them instead of burying them in "Subtotal".
+  additionalCharges: { description: string; amount: number }[];
+  // When the stay is overdue, surface a late-fee field in this modal so the
+  // fee is applied AT checkout (not saved via a separate Add Charge press).
+  overdueLabel?: string | null;
+  suggestedLateFee?: number;
   onClose: () => void;
   onDone: () => void;
 }) {
@@ -5446,7 +5467,13 @@ function CheckoutModal(props: {
 
   const [collectPrevious, setCollectPrevious] = useState(false);
   const previousToCollect = hasPrevious && collectPrevious ? previousTotal : 0;
-  const suggestedTotal = +(Math.max(0, props.balance) + previousToCollect).toFixed(2);
+  // Optional late-checkout fee, entered HERE and applied only when the staff
+  // completes check-out — not saved on a separate button press.
+  const [lateFee, setLateFee] = useState<number>(props.suggestedLateFee ?? 0);
+  const lateFeeAmount = +Math.max(0, lateFee || 0).toFixed(2);
+  const suggestedTotal = +(
+    Math.max(0, props.balance) + previousToCollect + lateFeeAmount
+  ).toFixed(2);
 
   // Guest wallet balance — drives the "Wallet credit" Method option. Loaded
   // once when the modal mounts; the parent reservation's apply-wallet-credit
@@ -5487,7 +5514,17 @@ function CheckoutModal(props: {
   const isWallet = method === "wallet";
   const balanceRemaining = props.balance > 0.009;
   const mightOverpay = props.balance <= 0.009 && !hasPrevious;
-  const currentBillTarget = Math.max(0, props.balance);
+  // Guest already paid more than the (possibly recomputed-downward) bill —
+  // e.g. paid for a pricier room, then swapped to a cheaper one. balanceDue
+  // is clamped at 0 so it hides this; detect it from paid vs. grand total.
+  const alreadyOverpaid = +(props.totalPaid - props.grandTotal).toFixed(2);
+  const hasOverpayment = alreadyOverpaid > 0.009;
+  // The current bill's collectable target INCLUDES the pending late fee —
+  // that fee is added to this reservation just before checkout, so the final
+  // payment must be allowed to cover it. Without this, appliedToCurrent
+  // clamps to the pre-fee balance and the late fee is billed but never
+  // collected (invoice left PARTIAL).
+  const currentBillTarget = Math.max(0, props.balance + lateFeeAmount);
   // Wallet redemption is capped at the current bill's remaining balance —
   // the API enforces the same rule, but reflecting it in the UI keeps the
   // amount field truthful. Wallet does NOT cover previous-balance items.
@@ -5521,6 +5558,27 @@ function CheckoutModal(props: {
 
   const act = useMutation({
     mutationFn: async () => {
+      // If the staff entered a late-checkout fee, add it as a charge FIRST
+      // (so it lands on the invoice), then proceed with checkout. This is
+      // why the fee applies "at check-out", not on a separate button press.
+      if (lateFeeAmount > 0.009) {
+        await api.post(
+          `/reservations/${props.reservationId}/charges`,
+          {
+            description: props.overdueLabel
+              ? `Late checkout fee (${props.overdueLabel})`
+              : "Late checkout fee",
+            // The charges endpoint bills quantity × rate — send them, not
+            // `amount` (which the schema doesn't accept → "Rate must be a
+            // number").
+            quantity: 1,
+            rate: lateFeeAmount,
+            gstRate: 0,
+          },
+          { idempotencyKey: newIdempotencyKey() },
+        );
+      }
+
       // Wallet method: redeem first via the dedicated endpoint, then close
       // the stay with a zero-cash payment. The server reduces the
       // reservation balance inside apply-wallet-credit so the subsequent
@@ -5600,20 +5658,74 @@ function CheckoutModal(props: {
     return (
       <ModalShell title="Check Out & Generate Invoice" onClose={props.onClose}>
         <div className="space-y-4">
-          <div className="rounded-sm border-2 border-success/40 bg-success/5 p-4 flex items-start gap-3">
-            <CheckCircle2 className="w-5 h-5 text-success mt-0.5 shrink-0" />
-            <div>
-              <div className="font-semibold text-success">Bill fully paid</div>
-              <div className="text-sm text-textPrimary mt-1">
-                Nothing to collect. Closing the stay will{" "}
-                {props.remainingRoomCount > 1 && !combineIntoOne
-                  ? `issue ${props.remainingRoomCount} per-room invoices`
-                  : "generate the final invoice"}
-                , release the room
-                {props.remainingRoomCount > 1 ? "s" : ""}, and complete check-out.
+          {hasOverpayment ? (
+            <div className="rounded-sm border-2 border-warning/40 bg-warning/5 p-4 flex items-start gap-3">
+              <AlertTriangle className="w-5 h-5 text-warning mt-0.5 shrink-0" />
+              <div>
+                <div className="font-semibold text-warning">
+                  Guest overpaid ₹{alreadyOverpaid.toFixed(2)}
+                </div>
+                <div className="text-sm text-textPrimary mt-1">
+                  Paid ₹{props.totalPaid.toFixed(2)} against a ₹{props.grandTotal.toFixed(2)}{" "}
+                  bill. Choose how to return the difference before completing check-out.
+                </div>
               </div>
             </div>
-          </div>
+          ) : (
+            <div className="rounded-sm border-2 border-success/40 bg-success/5 p-4 flex items-start gap-3">
+              <CheckCircle2 className="w-5 h-5 text-success mt-0.5 shrink-0" />
+              <div>
+                <div className="font-semibold text-success">Bill fully paid</div>
+                <div className="text-sm text-textPrimary mt-1">
+                  Nothing to collect. Closing the stay will{" "}
+                  {props.remainingRoomCount > 1 && !combineIntoOne
+                    ? `issue ${props.remainingRoomCount} per-room invoices`
+                    : "generate the final invoice"}
+                  , release the room
+                  {props.remainingRoomCount > 1 ? "s" : ""}, and complete check-out.
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Refund method — explicit choice, never pre-selected. */}
+          {hasOverpayment && (
+            <div>
+              <div className="label mb-1">Refund ₹{alreadyOverpaid.toFixed(2)} via</div>
+              <div className="grid grid-cols-2 gap-2">
+                {([
+                  { v: "cash", label: "Cash" },
+                  { v: "credit", label: "Wallet credit" },
+                ] as const).map((opt) => (
+                  <button
+                    key={opt.v}
+                    type="button"
+                    onClick={() => setRefundMode(opt.v)}
+                    className={`border rounded-sm px-3 py-2 text-sm transition-colors ${
+                      refundMode === opt.v
+                        ? "border-brand bg-brand-soft text-brand-dark font-semibold"
+                        : "border-borderc hover:border-brand/40"
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+              {refundMode && (
+                <div className="text-xs text-textSecondary mt-1">
+                  {refundMode === "credit"
+                    ? `₹${alreadyOverpaid.toFixed(2)} will be added to the guest's wallet.`
+                    : `₹${alreadyOverpaid.toFixed(2)} will be handed back in cash.`}
+                </div>
+              )}
+              <input
+                className="input mt-2"
+                placeholder="Refund note (optional)"
+                value={refundNote}
+                onChange={(e) => setRefundNote(e.target.value)}
+              />
+            </div>
+          )}
 
           {props.remainingRoomCount > 1 && <InvoiceModeToggle value={combineIntoOne} onChange={setCombineIntoOne} count={props.remainingRoomCount} />}
 
@@ -5625,9 +5737,13 @@ function CheckoutModal(props: {
             <button
               className="btn-primary"
               onClick={() => act.mutate()}
-              disabled={act.isPending}
+              disabled={act.isPending || (hasOverpayment && !refundMode)}
             >
-              {act.isPending ? "Processing…" : "Complete Check-out"}
+              {act.isPending
+                ? "Processing…"
+                : hasOverpayment
+                  ? `Refund & Complete Check-out`
+                  : "Complete Check-out"}
             </button>
           </div>
         </div>
@@ -5643,11 +5759,73 @@ function CheckoutModal(props: {
           release every room on this reservation.
         </div>
 
-        <div className="border border-borderc rounded p-3 space-y-1 bg-bg/40">
-          <div className="flex justify-between text-sm">
-            <span className="text-textSecondary">Subtotal (room charges + extras, pre-GST)</span>
-            <span className="font-mono">{inr(props.subtotal)}</span>
+        {/* Late-checkout fee — entered HERE and applied ONLY when Complete
+            Check-out is pressed. Nothing is saved while you type. */}
+        {(props.overdueLabel || lateFeeAmount > 0) && (
+          <div className="rounded-sm border border-warning/40 bg-warning/5 p-3 space-y-1.5">
+            <div className="text-xs font-semibold uppercase tracking-wide text-warning">
+              Late-checkout fee (optional)
+            </div>
+            {props.overdueLabel && (
+              <div className="text-xs text-textSecondary">
+                Stay is overdue ({props.overdueLabel}). Enter a late fee to add
+                to this bill, or leave blank to skip. It is applied only when
+                you press Complete Check-out.
+              </div>
+            )}
+            <input
+              className="input"
+              type="number"
+              min={0}
+              placeholder="0"
+              value={lateFee === 0 ? "" : lateFee}
+              onChange={(e) => {
+                const v = e.target.value;
+                setLateFee(v === "" ? 0 : Math.max(0, Number(v)));
+                setUserEdited(false);
+              }}
+            />
           </div>
+        )}
+
+        <div className="border border-borderc rounded p-3 space-y-1 bg-bg/40">
+          {(() => {
+            const chargesTotal = props.additionalCharges.reduce(
+              (s, c) => s + c.amount,
+              0,
+            );
+            const roomPortion = +(props.subtotal - chargesTotal).toFixed(2);
+            // Only itemise when there ARE additional charges; otherwise keep
+            // the single combined subtotal line as before.
+            if (props.additionalCharges.length === 0) {
+              return (
+                <div className="flex justify-between text-sm">
+                  <span className="text-textSecondary">
+                    Subtotal (room charges, pre-GST)
+                  </span>
+                  <span className="font-mono">{inr(props.subtotal)}</span>
+                </div>
+              );
+            }
+            return (
+              <>
+                <div className="flex justify-between text-sm">
+                  <span className="text-textSecondary">Room charges (pre-GST)</span>
+                  <span className="font-mono">{inr(roomPortion)}</span>
+                </div>
+                {props.additionalCharges.map((c, i) => (
+                  <div key={i} className="flex justify-between text-sm">
+                    <span className="text-textSecondary pl-3">· {c.description}</span>
+                    <span className="font-mono">{inr(c.amount)}</span>
+                  </div>
+                ))}
+                <div className="flex justify-between text-sm border-t border-borderc/60 pt-1 mt-1">
+                  <span className="text-textSecondary">Subtotal (pre-GST)</span>
+                  <span className="font-mono">{inr(props.subtotal)}</span>
+                </div>
+              </>
+            );
+          })()}
           <div className="flex justify-between text-sm">
             <span className="text-textSecondary">CGST (Central GST, half of total tax)</span>
             <span className="font-mono">{inr(cgst)}</span>
@@ -5660,9 +5838,15 @@ function CheckoutModal(props: {
             <span className="text-textSecondary">Total GST</span>
             <span className="font-mono">{inr(props.totalGst)}</span>
           </div>
+          {lateFeeAmount > 0.009 && (
+            <div className="flex justify-between text-sm text-warning">
+              <span>+ Late checkout fee (this checkout)</span>
+              <span className="font-mono">{inr(lateFeeAmount)}</span>
+            </div>
+          )}
           <div className="flex justify-between text-sm border-t border-borderc pt-2 mt-2">
             <span className="text-textSecondary">Grand Total (bill for this stay)</span>
-            <span className="font-mono">{inr(props.grandTotal)}</span>
+            <span className="font-mono">{inr(props.grandTotal + lateFeeAmount)}</span>
           </div>
           <div className="flex justify-between text-sm">
             <span className="text-textSecondary">Already paid</span>
@@ -5670,7 +5854,7 @@ function CheckoutModal(props: {
           </div>
           <div className="flex justify-between border-t border-borderc pt-2 mt-2">
             <strong>Balance before final payment</strong>
-            <strong className="font-mono">{inr(props.balance)}</strong>
+            <strong className="font-mono">{inr(props.balance + lateFeeAmount)}</strong>
           </div>
         </div>
 
@@ -5979,9 +6163,10 @@ function OverdueWarning({ minutesOverdue }: { minutesOverdue: number }) {
     <div className="rounded-sm border border-warning/40 bg-warning/10 text-warning text-xs px-3 py-2 flex items-start gap-2">
       <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
       <div>
-        <strong>{lateText} past check-out time.</strong> Consider using{" "}
-        <strong>Late Checkout</strong> to formally extend (and bill the late
-        fee if applicable) instead of treating this booking as still open.
+        <strong>{lateText} past check-out time.</strong> For a{" "}
+        <strong>late-checkout fee</strong>, enter it on the Check Out screen
+        (it's applied when you complete check-out) — this form is for other
+        extras like restaurant or laundry.
       </div>
     </div>
   );

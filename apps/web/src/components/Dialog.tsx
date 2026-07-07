@@ -253,7 +253,7 @@ function DialogShell({ state, onClose }: { state: DialogState; onClose: (v: unkn
                 }}
                 placeholder={promptOpts.placeholder}
                 rows={3}
-                className="w-full border border-borderc bg-surface rounded-sm px-3 py-2 text-textPrimary outline-none transition-colors focus:border-brand focus:ring-2 focus:ring-brand/20 placeholder:text-textSecondary/60 resize-none leading-relaxed"
+                className="w-full border border-borderc bg-surface rounded-sm px-3 py-2 text-textPrimary outline-none transition-colors focus:border-brand focus:ring-2 focus:ring-brand/20 placeholder:text-textSecondary resize-none leading-relaxed"
               />
             ) : (
               <input

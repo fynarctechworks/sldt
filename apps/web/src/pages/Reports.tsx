@@ -877,7 +877,7 @@ function RevenueTab({ from, to }: { from: string; to: string }) {
             </thead>
             <tbody>
               <tr className="border-b border-borderc/60">
-                <td className="py-2">Overnight</td>
+                <td className="py-2">Full Day</td>
                 <td className="py-2 text-right font-mono tabular-nums">
                   {overnight?.bookings ?? 0}
                 </td>

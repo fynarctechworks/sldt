@@ -234,6 +234,9 @@ export function Combobox({
     } else if (e.key === "Enter") {
       if (open && selectable[highlight]) {
         e.preventDefault();
+        // Keep the Enter here — a parent "Enter jumps to next field" handler
+        // must not also fire when the user is just picking a suggestion.
+        e.stopPropagation();
         const row = selectable[highlight];
         pick(row.value);
       }

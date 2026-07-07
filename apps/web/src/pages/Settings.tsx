@@ -18,6 +18,7 @@ import { useDialog } from "@/components/Dialog";
 import { Loader } from "@/components/Loader";
 import { useToast } from "@/components/Toast";
 import { api } from "@/lib/api";
+import { invalidateRoomData } from "@/lib/invalidate";
 import { supabase } from "@/lib/supabase";
 import { inr } from "@/lib/utils";
 
@@ -1148,7 +1149,11 @@ function RoomTypesTab() {
         description: t.description ?? null,
         isActive: true,
       }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["room-types"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["room-types"] });
+      qc.invalidateQueries({ queryKey: ["room-types-active"] });
+      invalidateRoomData(qc);
+    },
   });
 
   async function handleDelete(t: RoomTypeRow) {
@@ -1344,7 +1349,11 @@ function RoomTypeModal({ row, onClose }: { row: RoomTypeRow | null; onClose: () 
         : api.post("/settings/room-types", body);
     },
     onSuccess: () => {
+      // A default-rate change cascades to rooms of this type on the server,
+      // so refresh every reader of a room rate — not just the type list.
       qc.invalidateQueries({ queryKey: ["room-types"] });
+      qc.invalidateQueries({ queryKey: ["room-types-active"] });
+      invalidateRoomData(qc);
       onClose();
     },
     onError: (e: Error) => setErr(e.message),
@@ -1699,6 +1708,10 @@ function EditStaffModal({ staff, onClose }: { staff: Staff; onClose: () => void 
   const [showPw, setShowPw] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
+  // Reveal-once: after a reset, show the new password one time so it can be
+  // handed to the staff member. Never retrievable afterwards (hashed).
+  const [resetShown, setResetShown] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
 
   const { data: rbacRoles } = useQuery({
     queryKey: ["rbac-roles"],
@@ -1771,8 +1784,13 @@ function EditStaffModal({ staff, onClose }: { staff: Staff; onClose: () => void 
       qc.invalidateQueries({ queryKey: ["staff"] });
       qc.invalidateQueries({ queryKey: ["rbac-effective", staff.id] });
       qc.invalidateQueries({ queryKey: ["rbac-overrides", staff.id] });
-      setMsg("Saved");
-      setTimeout(onClose, 700);
+      // If the password was reset, surface it once instead of auto-closing.
+      if (newPassword) {
+        setResetShown(newPassword);
+      } else {
+        setMsg("Saved");
+        setTimeout(onClose, 700);
+      }
     },
     onError: (e: Error) => setErr(e.message),
   });
@@ -1801,6 +1819,44 @@ function EditStaffModal({ staff, onClose }: { staff: Staff; onClose: () => void 
     }
     return set;
   })();
+
+  // Reveal-once screen after a password reset.
+  if (resetShown) {
+    return (
+      <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={onClose}>
+        <div
+          className="bg-surface rounded-md w-full max-w-md p-6 space-y-4"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <h2 className="text-lg font-semibold text-brand-dark">Password reset</h2>
+          <p className="text-sm text-textSecondary">
+            New password for <strong className="text-brand-dark">{staff.fullName}</strong>. Copy it
+            and share securely — it <strong>won&apos;t be shown again</strong> (stored encrypted, can
+            only be reset).
+          </p>
+          <div className="relative">
+            <input readOnly className="input pr-20 font-mono select-all" value={resetShown} />
+            <button
+              type="button"
+              onClick={() => {
+                navigator.clipboard?.writeText(resetShown).then(() => {
+                  setCopied(true);
+                  setTimeout(() => setCopied(false), 2000);
+                });
+              }}
+              className="absolute right-2 top-1/2 -translate-y-1/2 inline-flex items-center gap-1 text-xs text-brand hover:underline"
+            >
+              {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+              {copied ? "Copied" : "Copy"}
+            </button>
+          </div>
+          <div className="flex justify-end pt-2">
+            <button className="btn-primary" onClick={onClose}>Done</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={onClose}>
@@ -2007,6 +2063,7 @@ function EditStaffModal({ staff, onClose }: { staff: Staff; onClose: () => void 
 
 function AddStaffModal({ onClose }: { onClose: () => void }) {
   const qc = useQueryClient();
+  const { toast } = useToast();
   const [form, setForm] = useState({
     email: "",
     password: "",
@@ -2015,15 +2072,83 @@ function AddStaffModal({ onClose }: { onClose: () => void }) {
     phone: "",
   });
   const [err, setErr] = useState<string | null>(null);
+  const [showPw, setShowPw] = useState(false);
+  // Reveal-once: after a successful create we show the plaintext password
+  // one time so staff can hand it over. It's never retrievable afterwards
+  // (stored only as an irreversible hash), so this is the single chance
+  // to copy it.
+  const [created, setCreated] = useState<{ name: string; password: string } | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  function genStrong() {
+    const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
+    let out = "";
+    const arr = new Uint32Array(14);
+    crypto.getRandomValues(arr);
+    for (const n of arr) out += chars[n % chars.length];
+    setForm((f) => ({ ...f, password: out + "!" }));
+    setShowPw(true);
+  }
 
   const save = useMutation({
     mutationFn: () => api.post("/staff", { ...form, phone: form.phone || undefined }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["staff"] });
-      onClose();
+      // Don't close yet — surface the password once.
+      setCreated({ name: form.fullName, password: form.password });
     },
     onError: (e: Error) => setErr(e.message),
   });
+
+  // Post-create reveal-once screen.
+  if (created) {
+    return (
+      <div
+        className="fixed inset-0 bg-black/50 flex items-center justify-center z-50"
+        onClick={onClose}
+      >
+        <div
+          className="bg-surface rounded-md w-full max-w-md p-6 space-y-4"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <h2 className="text-lg font-semibold text-navy">Staff created</h2>
+          <p className="text-sm text-textSecondary">
+            <strong className="text-navy">{created.name}</strong> can now sign in. Copy the
+            password below and share it securely — it{" "}
+            <strong>won&apos;t be shown again</strong> (it&apos;s stored encrypted and can only be
+            reset, never viewed).
+          </p>
+          <div>
+            <label className="label block mb-1">Password</label>
+            <div className="relative">
+              <input
+                readOnly
+                className="input pr-20 font-mono select-all"
+                value={created.password}
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  navigator.clipboard?.writeText(created.password).then(() => {
+                    setCopied(true);
+                    toast("Password copied", "success");
+                    setTimeout(() => setCopied(false), 2000);
+                  });
+                }}
+                className="absolute right-2 top-1/2 -translate-y-1/2 inline-flex items-center gap-1 text-xs text-brand hover:underline"
+              >
+                {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                {copied ? "Copied" : "Copy"}
+              </button>
+            </div>
+          </div>
+          <div className="flex justify-end pt-2">
+            <button className="btn-primary" onClick={onClose}>Done</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div
@@ -2051,12 +2176,33 @@ function AddStaffModal({ onClose }: { onClose: () => void }) {
           />
         </Field>
         <Field label="Password">
-          <input
-            className="input"
-            type="password"
-            value={form.password}
-            onChange={(e) => setForm({ ...form, password: e.target.value })}
-          />
+          <div className="relative">
+            <input
+              className="input pr-20 font-mono"
+              type={showPw ? "text" : "password"}
+              value={form.password}
+              onChange={(e) => setForm({ ...form, password: e.target.value })}
+              minLength={8}
+              autoComplete="new-password"
+            />
+            <button
+              type="button"
+              onClick={() => setShowPw((v) => !v)}
+              className="absolute right-2 top-1/2 -translate-y-1/2 inline-flex items-center gap-1 text-xs text-textSecondary hover:text-brand"
+              aria-label={showPw ? "Hide password" : "Show password"}
+            >
+              {showPw ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+              {showPw ? "Hide" : "Show"}
+            </button>
+          </div>
+          <div className="flex justify-between items-center mt-1">
+            <button type="button" onClick={genStrong} className="text-xs text-brand hover:underline">
+              Generate strong password
+            </button>
+            {form.password && form.password.length < 8 && (
+              <span className="text-xs text-danger">Min 8 characters</span>
+            )}
+          </div>
         </Field>
         <Field label="Role">
           <select
@@ -2086,7 +2232,12 @@ function AddStaffModal({ onClose }: { onClose: () => void }) {
           <button
             className="btn-primary"
             onClick={() => save.mutate()}
-            disabled={save.isPending || !form.email || !form.password || !form.fullName}
+            disabled={
+              save.isPending ||
+              !form.email ||
+              form.password.length < 8 ||
+              !form.fullName
+            }
           >
             {save.isPending ? "Creating…" : "Create"}
           </button>
