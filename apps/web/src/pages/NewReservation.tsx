@@ -3,6 +3,7 @@ import { addDays, differenceInCalendarDays, format } from "date-fns";
 import { AlertTriangle, ChevronDown, ChevronLeft, FileText, Minus, Plus, ShieldCheck, Snowflake, Sparkles, Trash2, Tv, Upload, Users, Wifi, X } from "lucide-react";
 import { CheckInReceiptModal, type CheckInReceiptData } from "@/components/CheckInReceiptModal";
 import { OtpModal } from "@/components/OtpModal";
+import { TimePicker12h } from "@/components/TimePicker12h";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { Loader } from "@/components/Loader";
@@ -144,6 +145,9 @@ interface AvailableRoom {
 
 const todayStr = format(new Date(), "yyyy-MM-dd");
 const tomorrowStr = format(addDays(new Date(), 1), "yyyy-MM-dd");
+// One day back is allowed so the front desk can log a booking they forgot
+// to enter earlier in the day (end-of-day catch-up). Anything older is not.
+const yesterdayStr = format(addDays(new Date(), -1), "yyyy-MM-dd");
 
 // Combine yyyy-MM-dd + HH:mm into an ISO timestamp with the IST
 // offset baked in. The server stores these in plannedCheckInAt /
@@ -324,7 +328,12 @@ export default function NewReservation() {
   const [receiptVariant, setReceiptVariant] = useState<"checkin" | "booking_advance">("checkin");
 
   useEffect(() => {
-    if (mode === "walkin" && checkInDate !== todayStr) setCheckInDate(todayStr);
+    // Walk-in check-in is today by default, but the desk may backdate by one
+    // day to log a forgotten booking. Only snap back to today if the date is
+    // in the future or older than yesterday (out of the allowed range).
+    if (mode === "walkin" && (checkInDate > todayStr || checkInDate < yesterdayStr)) {
+      setCheckInDate(todayStr);
+    }
   }, [mode, checkInDate]);
 
   // Short-stay is by definition same-day: keep check-out pinned to
@@ -1312,8 +1321,11 @@ export default function NewReservation() {
               className="input"
               type="date"
               value={checkInDate}
-              disabled={mode === "walkin"}
-              min={todayStr}
+              // Editable in both modes now. Allow yesterday (backdated
+              // catch-up) through today for walk-in; pre-booking allows
+              // yesterday and future.
+              min={yesterdayStr}
+              max={mode === "walkin" ? todayStr : undefined}
               onChange={(e) => {
                 const next = e.target.value;
                 setCheckInDate(next);
@@ -1326,14 +1338,19 @@ export default function NewReservation() {
                 }
               }}
             />
+            {checkInDate < todayStr && (
+              <div className="text-[11px] text-warning mt-1 flex items-start gap-1">
+                <span>⚠</span>
+                <span>Backdated check-in — only log this if it's a booking you forgot to enter earlier.</span>
+              </div>
+            )}
             {/* Time picker (0023). Optional — blank means "use hotel
                 policy". When filled, the chosen time flows through to
                 the receipt, invoice and reservation detail page. */}
-            <input
-              className="input mt-1"
-              type="time"
+            <TimePicker12h
+              className="mt-1"
               value={checkInTime}
-              onChange={(e) => setCheckInTime(e.target.value)}
+              onChange={setCheckInTime}
             />
             <div className="text-[11px] text-textSecondary mt-1">
               {checkInTime
@@ -1373,11 +1390,10 @@ export default function NewReservation() {
                 from duration so we hide it; overnight allows an explicit
                 checkout-time promise. */}
             {!isShortStay && (
-              <input
-                className="input mt-1"
-                type="time"
+              <TimePicker12h
+                className="mt-1"
                 value={checkOutTime}
-                onChange={(e) => setCheckOutTime(e.target.value)}
+                onChange={setCheckOutTime}
               />
             )}
             {publicSettings.data?.checkOutTime && !isShortStay && (

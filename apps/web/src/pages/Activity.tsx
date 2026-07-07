@@ -4,6 +4,7 @@ import { Activity as ActivityIcon, Calendar } from "lucide-react";
 import { useMemo, useState } from "react";
 import { Loader } from "@/components/Loader";
 import { StickyBar } from "@/components/StickyBar";
+import { TimePicker12h } from "@/components/TimePicker12h";
 import { api } from "@/lib/api";
 
 interface ActivityRow {
@@ -171,23 +172,13 @@ export default function Activity() {
             <label className="block text-[10px] uppercase tracking-wide text-textSecondary mb-1">
               Time from
             </label>
-            <input
-              type="time"
-              className="input !h-8 text-sm w-28"
-              value={timeFrom}
-              onChange={(e) => setTimeFrom(e.target.value)}
-            />
+            <TimePicker12h value={timeFrom} onChange={setTimeFrom} />
           </div>
           <div>
             <label className="block text-[10px] uppercase tracking-wide text-textSecondary mb-1">
               Time to
             </label>
-            <input
-              type="time"
-              className="input !h-8 text-sm w-28"
-              value={timeTo}
-              onChange={(e) => setTimeTo(e.target.value)}
-            />
+            <TimePicker12h value={timeTo} onChange={setTimeTo} />
           </div>
           {(timeFrom || timeTo) && (
             <button

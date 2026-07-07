@@ -648,24 +648,27 @@ export default function ReservationDetail() {
             <div>
               <strong>In:</strong>{" "}
               {format(
-                r.checkedInAt
-                  ? new Date(r.checkedInAt)
-                  : r.plannedCheckInAt
-                    ? new Date(r.plannedCheckInAt)
+                r.plannedCheckInAt
+                  ? new Date(r.plannedCheckInAt)
+                  : r.checkedInAt
+                    ? new Date(r.checkedInAt)
                     : new Date(r.checkInDate),
                 "dd MMM yyyy",
               )}{" "}
               <span className="text-textSecondary">
                 ·{" "}
-                {/* Priority: actual checked-in stamp > staff-chosen
-                    planned time (0023) > hotel policy default. */}
-                {r.checkedInAt
-                  ? format(new Date(r.checkedInAt), "h:mm a")
-                  : r.plannedCheckInAt
-                    ? format(new Date(r.plannedCheckInAt), "h:mm a")
+                {/* Priority: the staff-entered check-in time (0023) wins so
+                    the header reflects what was set. Falls back to the actual
+                    checked-in stamp, then hotel policy. */}
+                {r.plannedCheckInAt
+                  ? format(new Date(r.plannedCheckInAt), "h:mm a")
+                  : r.checkedInAt
+                    ? format(new Date(r.checkedInAt), "h:mm a")
                     : formatTime(r.hotelCheckInTime)}
               </span>
-              {r.checkedInAt && (
+              {/* "actual" badge only when there's no staff-entered time and
+                  we're showing the real arrival stamp. */}
+              {r.checkedInAt && !r.plannedCheckInAt && (
                 <span className="ml-1.5 inline-flex items-center gap-1 text-[10px] uppercase tracking-wider text-success font-semibold">
                   · actual
                 </span>
@@ -674,29 +677,28 @@ export default function ReservationDetail() {
             <div>
               <strong>Out:</strong>{" "}
               {format(
-                // Priority: actual checked-out stamp (post-checkout) >
-                // short-stay computed exit > staff-chosen planned time >
-                // hotel policy default. Once a real checkout exists,
-                // we show that exact moment instead of the schedule.
-                r.checkedOutAt
-                  ? new Date(r.checkedOutAt)
+                // Priority: staff-entered checkout time (0023) wins so the
+                // header reflects what was set > short-stay computed exit >
+                // actual checked-out stamp > hotel policy default.
+                r.plannedCheckOutAt
+                  ? new Date(r.plannedCheckOutAt)
                   : shortStayCheckoutAt ??
-                      (r.plannedCheckOutAt
-                        ? new Date(r.plannedCheckOutAt)
+                      (r.checkedOutAt
+                        ? new Date(r.checkedOutAt)
                         : new Date(r.checkOutDate)),
                 "dd MMM yyyy",
               )}{" "}
               <span className="text-textSecondary">
                 ·{" "}
-                {r.checkedOutAt
-                  ? format(new Date(r.checkedOutAt), "h:mm a")
+                {r.plannedCheckOutAt
+                  ? format(new Date(r.plannedCheckOutAt), "h:mm a")
                   : shortStayCheckoutAt
                     ? format(shortStayCheckoutAt, "h:mm a")
-                    : r.plannedCheckOutAt
-                      ? format(new Date(r.plannedCheckOutAt), "h:mm a")
+                    : r.checkedOutAt
+                      ? format(new Date(r.checkedOutAt), "h:mm a")
                       : formatTime(r.hotelCheckOutTime)}
               </span>
-              {r.checkedOutAt && (
+              {r.checkedOutAt && !r.plannedCheckOutAt && (
                 <span className="ml-1.5 inline-flex items-center gap-1 text-[10px] uppercase tracking-wider text-success font-semibold">
                   · actual
                 </span>

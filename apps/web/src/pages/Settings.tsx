@@ -15,6 +15,7 @@ import {
 import { useEffect, useMemo, useState } from "react";
 import { useAuth } from "@/auth/AuthContext";
 import { useDialog } from "@/components/Dialog";
+import { TimePicker12h } from "@/components/TimePicker12h";
 import { Loader } from "@/components/Loader";
 import { useToast } from "@/components/Toast";
 import { api } from "@/lib/api";
@@ -905,19 +906,15 @@ function HotelTab() {
           </div>
         </Field>
         <Field label="Default Check-in">
-          <input
-            className="input"
-            type="time"
+          <TimePicker12h
             value={form.checkInTime ?? "12:00"}
-            onChange={(e) => set("checkInTime", e.target.value)}
+            onChange={(v) => set("checkInTime", v)}
           />
         </Field>
         <Field label="Default Check-out">
-          <input
-            className="input"
-            type="time"
+          <TimePicker12h
             value={form.checkOutTime ?? "11:00"}
-            onChange={(e) => set("checkOutTime", e.target.value)}
+            onChange={(v) => set("checkOutTime", v)}
           />
         </Field>
       </div>
