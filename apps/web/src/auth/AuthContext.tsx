@@ -117,15 +117,45 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // Password accepted → check whether a second factor is owed. If the
     // user has a verified TOTP factor, AAL jumps to nextLevel 'aal2'
     // while currentLevel is still 'aal1' until they complete a challenge.
+    let needs = false;
     try {
       const { data: aal } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel();
-      const needs = !!aal && aal.nextLevel === "aal2" && aal.currentLevel === "aal1";
-      setMfaPending(needs);
-      return { mfaRequired: needs };
+      needs = !!aal && aal.nextLevel === "aal2" && aal.currentLevel === "aal1";
     } catch {
       // MFA not available — treat as a normal AAL1 login.
-      setMfaPending(false);
-      return { mfaRequired: false };
+      needs = false;
+    }
+
+    // When no second factor is owed, the session is fully authenticated —
+    // verify the account is still ACTIVE before letting them proceed. The
+    // browser authenticates directly against Supabase, which happily signs
+    // in a deactivated/deleted staff member (their auth user still exists),
+    // so without this they'd land on the dashboard and only then hit a 403.
+    // Checking here surfaces the error on the login page instead. (For MFA
+    // users the same check runs after verifyMfa completes.)
+    if (!needs) {
+      await assertActiveAccount();
+    }
+
+    setMfaPending(needs);
+    return { mfaRequired: needs };
+  }
+
+  // Confirm the signed-in user has an active profile. /auth/me runs through
+  // requireAuth, which returns 403 for a deactivated user or one with no
+  // profile (deleted staff). On failure we sign out so no usable session
+  // lingers, and throw a clear message for the login page.
+  async function assertActiveAccount(): Promise<void> {
+    try {
+      await api.get("/auth/me");
+    } catch (err) {
+      await supabase.auth.signOut();
+      setSession(null);
+      const msg =
+        err instanceof Error && /deactivat|inactive|no.?profile|403/i.test(err.message)
+          ? "This account has been deactivated. Contact your administrator."
+          : "Unable to sign in. Please try again.";
+      throw new Error(msg);
     }
   }
 
@@ -151,7 +181,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       code,
     });
     if (verErr) throw verErr;
-    // Verified → now AAL2. Clear the gate; the profile-load effect fires.
+    // Verified → now AAL2 (fully authenticated). Same active-account gate as
+    // the non-MFA path: a deactivated user must be stopped here, not on the
+    // dashboard. Throws (and signs out) if the account is disabled.
+    await assertActiveAccount();
+    // Clear the gate; the profile-load effect fires.
     setMfaPending(false);
   }
 

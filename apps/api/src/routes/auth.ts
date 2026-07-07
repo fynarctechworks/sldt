@@ -93,6 +93,35 @@ router.post("/login", validate(loginSchema), async (req, res) => {
     );
     return fail(res, 401, "INVALID_CREDENTIALS", "Email or password is incorrect");
   }
+  // Password was correct, but the account may be deactivated or have no
+  // profile (deleted staff). Reject HERE — before handing back a token — so
+  // the error surfaces on the login page instead of letting them reach the
+  // dashboard and hit a 403 on the first API call. requireAuth enforces the
+  // same rule on every request; this just makes login the first gate.
+  const [profile] = await db
+    .select({ isActive: profiles.isActive })
+    .from(profiles)
+    .where(eq(profiles.id, data.user.id))
+    .limit(1);
+  if (!profile || !profile.isActive) {
+    // Sign the just-created session out so no usable token lingers.
+    try {
+      await supabaseAdmin.auth.admin.signOut(data.session.access_token, "global");
+    } catch {
+      /* best-effort */
+    }
+    logger.warn(
+      { userId: data.user.id, email, ip: clientIp, reason: !profile ? "no_profile" : "inactive" },
+      "login rejected: account deactivated or removed",
+    );
+    return fail(
+      res,
+      403,
+      "ACCOUNT_DISABLED",
+      "This account has been deactivated. Contact your administrator.",
+    );
+  }
+
   recordSuccess(email);
   logger.info({ userId: data.user.id, email, ip: clientIp }, "login succeeded");
   return ok(res, {
