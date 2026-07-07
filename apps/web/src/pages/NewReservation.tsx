@@ -186,17 +186,20 @@ export default function NewReservation() {
   const initialMode = searchParams.get("mode") === "walkin" ? "walkin" : "reservation";
 
   const [mode, setMode] = useState<"reservation" | "walkin">(initialMode);
-  const [stayType, setStayType] = useState<"overnight" | "short_stay">("overnight");
-  // Selected duration for a short-stay booking. The room rate is derived
-  // from this: closest matching band on the room type, falling back to a
-  // pro-rated slice of the overnight default rate (rate/24 × hours).
-  const [shortStayHours, setShortStayHours] = useState<number>(6);
-  // The human label shown on the receipt / invoice. Set to the band's label
-  // when a band is picked; defaults to "Day use · N hours" otherwise.
-  const [shortStayLabel, setShortStayLabel] = useState<string | null>(null);
-  const isShortStay = stayType === "short_stay";
+  // No stay-type toggle anymore. A booking is a same-day (hourly) stay when
+  // check-out date == check-in date, and a multi-day (full-day) stay
+  // otherwise — derived from the dates below. The backend models same-day as
+  // stayType "short_stay" (flat rate, checkout == checkin) and multi-day as
+  // "overnight" (rate × nights, checkout > checkin).
   const [checkInDate, setCheckInDate] = useState(todayStr);
   const [checkOutDate, setCheckOutDate] = useState(tomorrowStr);
+  // Same-day booking => hourly/day-use pricing (flat rate). Derived, not a
+  // toggle: if check-out is the same calendar day as check-in it's a
+  // short_stay; otherwise a multi-day overnight stay.
+  const isShortStay = !!checkInDate && checkOutDate === checkInDate;
+  const stayType: "overnight" | "short_stay" = isShortStay
+    ? "short_stay"
+    : "overnight";
   // 0023 — staff-chosen clock times. Empty string means "use property
   // policy default" (rendered on the booking summary, receipt, and
   // invoice). When set, these are sent to the server as ISO timestamps
@@ -343,30 +346,18 @@ export default function NewReservation() {
   // staff to fix it, and submit is blocked. We only auto-fix check-out
   // on the mode switch INTO overnight, so the form starts in a valid
   // state rather than carrying the day-use same-date value.
+  // Keep check-out from going BEFORE check-in — same-day (hourly) is now
+  // allowed, but an earlier date is always invalid.
   useEffect(() => {
-    if (isShortStay) {
-      if (checkOutDate !== checkInDate) setCheckOutDate(checkInDate);
-    }
+    if (checkOutDate < checkInDate) setCheckOutDate(checkInDate);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isShortStay, checkInDate]);
+  }, [checkInDate]);
 
-  // When the user switches the stay type to overnight, ensure check-out is
-  // at least one night out (the day-use value would have been same-date).
-  useEffect(() => {
-    if (!isShortStay && checkOutDate <= checkInDate) {
-      setCheckOutDate(format(addDays(new Date(checkInDate), 1), "yyyy-MM-dd"));
-    }
-    // Only run on the stay-type transition, not on every date keystroke,
-    // so a manual same-date entry surfaces the error instead of snapping.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stayType]);
-
-  // Overnight bookings need at least one night — check-out strictly after
-  // check-in. Drives the inline error and blocks submit. Day-use is exempt
-  // (same calendar day by definition).
+  // The only invalid date state now is check-out BEFORE check-in. Same-day
+  // (== hourly stay) and later dates are both valid.
   const overnightDateError =
-    !isShortStay && checkOutDate <= checkInDate
-      ? "Check-out must be at least 1 night after check-in (overnight stays can't end the same day)."
+    checkOutDate < checkInDate
+      ? "Check-out can't be before check-in."
       : null;
 
   // OTP verification is mandatory for every booking. The reservation row
@@ -389,10 +380,20 @@ export default function NewReservation() {
     return Math.max(0, d);
   }, [checkInDate, checkOutDate]);
 
-  // For short-stay we use durationHours as the pricing unit (FLAT room rate
-  // for that block). For overnight we use nights. canPriceStay gates
-  // availability + summary rendering.
-  const canPriceStay = isShortStay ? shortStayHours > 0 : nights > 0;
+  // Same-day (hourly) stays: the duration comes from the entered check-in /
+  // check-out TIMES (both required). Used as durationHours on the payload so
+  // the receipt/invoice can say e.g. "Day use · 5 hours". The price itself is
+  // the flat rate staff set per room — not derived from hours.
+  const shortStayDurationHours = useMemo(() => {
+    if (!isShortStay || !checkInTime || !checkOutTime) return 0;
+    const [ih, im] = checkInTime.split(":").map(Number);
+    const [oh, om] = checkOutTime.split(":").map(Number);
+    const diff = (oh * 60 + om - (ih * 60 + im)) / 60;
+    return diff > 0 ? +diff.toFixed(2) : 0;
+  }, [isShortStay, checkInTime, checkOutTime]);
+
+  // Pricing unit: same-day is a single flat block; multi-day uses nights.
+  const canPriceStay = isShortStay ? shortStayDurationHours > 0 : nights > 0;
 
   // Compute the FLAT short-stay rate for a room type. Pick the band whose
   // hours ≥ the requested hours (smallest such band — "round up" to the
@@ -404,18 +405,6 @@ export default function NewReservation() {
   function extraBedRateForType(slug: string): number {
     const rt = roomTypesQ.data?.find((t) => t.slug === slug);
     return rt ? Number(rt.extraPersonRate) : 0;
-  }
-
-  function shortStayRateForType(slug: string): { rate: number; bandLabel: string | null } {
-    const rt = roomTypesQ.data?.find((t) => t.slug === slug);
-    if (!rt) return { rate: 0, bandLabel: null };
-    const bands = (rt.shortStayBands ?? []).slice().sort((a, b) => a.hours - b.hours);
-    const exact = bands.find((b) => Math.abs(b.hours - shortStayHours) < 0.01);
-    if (exact) return { rate: +Number(exact.rate).toFixed(2), bandLabel: exact.label };
-    const upper = bands.find((b) => b.hours >= shortStayHours);
-    if (upper) return { rate: +Number(upper.rate).toFixed(2), bandLabel: upper.label };
-    const fallback = +((Number(rt.defaultRate) / 24) * shortStayHours).toFixed(2);
-    return { rate: fallback, bandLabel: null };
   }
 
   const guestsSearch = useQuery({
@@ -534,26 +523,9 @@ export default function NewReservation() {
     enabled: canPriceStay,
   });
 
-  // Re-price already-selected rooms whenever the short-stay parameters
-  // change. This keeps the per-room rate, the subtotal, and the summary
-  // band label all in sync without the user having to deselect/reselect.
-  useEffect(() => {
-    if (!isShortStay) return;
-    let derivedLabel: string | null = null;
-    setSelectedRooms((prev) => {
-      let changed = false;
-      const next = prev.map((r) => {
-        const { rate, bandLabel } = shortStayRateForType(r.soldAsType ?? r.nativeType);
-        if (bandLabel && !derivedLabel) derivedLabel = bandLabel;
-        if (Math.abs(r.ratePerNight - rate) < 0.01) return r;
-        changed = true;
-        return { ...r, ratePerNight: rate };
-      });
-      return changed ? next : prev;
-    });
-    setShortStayLabel(derivedLabel ?? `Day use · ${shortStayHours} hours`);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isShortStay, shortStayHours, roomTypesQ.data]);
+  // NOTE: no automatic short-stay re-pricing. The room rate is whatever the
+  // room's base rate was on selection, and the front desk edits it manually
+  // (Rate/night field) for a same-day/hourly stay. Hourly bands were removed.
 
   useEffect(() => {
     if (!preselectRoomId || !availRooms.data) return;
@@ -876,15 +848,20 @@ export default function NewReservation() {
         // Staff-chosen clock times (0023). Sent only when staff filled
         // them in; omitted otherwise so the server stores NULL and
         // every surface falls back to hotel policy defaults.
+        // Check-in/out times are required now — always sent.
         plannedCheckInAt:
           combineDateAndTimeISO(checkInDate, checkInTime) ?? undefined,
-        plannedCheckOutAt: isShortStay
-          ? undefined
-          : (combineDateAndTimeISO(checkOutDate, checkOutTime) ?? undefined),
+        plannedCheckOutAt:
+          combineDateAndTimeISO(checkOutDate, checkOutTime) ?? undefined,
+        // stayType is derived from the dates: same-day => short_stay (flat
+        // rate, hourly), otherwise overnight. The backend requires
+        // durationHours for short_stay.
         stayType,
-        durationHours: isShortStay ? shortStayHours : undefined,
+        durationHours: isShortStay
+          ? Math.max(1, Math.min(23.5, shortStayDurationHours))
+          : undefined,
         shortStayLabel: isShortStay
-          ? shortStayLabel ?? `Day use · ${shortStayHours} hours`
+          ? `Day use · ${shortStayDurationHours} hour${shortStayDurationHours === 1 ? "" : "s"}`
           : undefined,
         numAdults: adults,
         numChildren: children,
@@ -1107,12 +1084,10 @@ export default function NewReservation() {
         });
         return prev.filter((r) => r.roomId !== room.id);
       }
-      // For short-stay, the initial rate is the FLAT short-stay price for
-      // the selected hours (derived from this room type's bands). The
-      // user can still override per-room.
-      const initialRate = isShortStay
-        ? shortStayRateForType(room.roomType).rate || Number(room.baseRate)
-        : Number(room.baseRate);
+      // Initial rate is the room's base rate for BOTH stay types. For a
+      // same-day (hourly) stay the front desk edits it down manually — no
+      // automatic band pricing.
+      const initialRate = Number(room.baseRate);
       return [
         ...prev,
         {
@@ -1166,9 +1141,8 @@ export default function NewReservation() {
         if (rate !== null) {
           nextRate = rate;
         } else if (slug === null) {
-          nextRate = isShortStay
-            ? shortStayRateForType(r.nativeType).rate || r.nativeBaseRate
-            : r.nativeBaseRate;
+          // Revert to the room's native base rate (no band pricing).
+          nextRate = r.nativeBaseRate;
         }
         // Extra-bed fee follows the effective (sold-as, else native) type.
         const effectiveType = slug ?? r.nativeType;
@@ -1205,6 +1179,9 @@ export default function NewReservation() {
     canPriceStay &&
     !overnightDateError &&
     adults >= 1 &&
+    // Check-in and check-out times are now mandatory on every booking.
+    !!checkInTime &&
+    !!checkOutTime &&
     selectedRooms.length > 0 &&
     (selectedGuest ||
       (useNewGuest &&
@@ -1289,34 +1266,11 @@ export default function NewReservation() {
 
       <div className="card space-y-3">
         <h2 className="font-semibold text-navy">1. Stay Details</h2>
-        <div className="flex items-center gap-3 flex-wrap">
-          <span className="label">Stay type</span>
-          <div className="inline-flex rounded-sm border border-borderc overflow-hidden text-xs">
-            {([
-              { v: "overnight", label: "Full Day" },
-              { v: "short_stay", label: "Day use (hours)" },
-            ] as const).map((opt) => (
-              <button
-                key={opt.v}
-                type="button"
-                onClick={() => {
-                  setStayType(opt.v);
-                  if (opt.v === "short_stay") setCheckOutDate(checkInDate);
-                }}
-                className={`px-3 py-1.5 transition ${
-                  stayType === opt.v
-                    ? "bg-brand text-cream"
-                    : "bg-bg text-textSecondary hover:bg-borderc/40"
-                }`}
-              >
-                {opt.label}
-              </button>
-            ))}
-          </div>
-        </div>
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
           <div>
-            <label className="label block mb-1">Check-in</label>
+            <label className="label block mb-1">
+              Check-in <span className="text-danger">*</span>
+            </label>
             <input
               className="input"
               type="date"
@@ -1344,14 +1298,16 @@ export default function NewReservation() {
                 <span>Backdated check-in — only log this if it's a booking you forgot to enter earlier.</span>
               </div>
             )}
-            {/* Time picker (0023). Optional — blank means "use hotel
-                policy". When filled, the chosen time flows through to
-                the receipt, invoice and reservation detail page. */}
+            {/* Check-in time is required (0023). It flows through to the
+                receipt, invoice and reservation detail page. */}
             <TimePicker12h
               className="mt-1"
               value={checkInTime}
               onChange={setCheckInTime}
             />
+            {!checkInTime && (
+              <div className="text-[11px] text-danger mt-1">Check-in time is required</div>
+            )}
             <div className="text-[11px] text-textSecondary mt-1">
               {checkInTime
                 ? `Custom: ${formatTime(checkInTime)}`
@@ -1362,7 +1318,7 @@ export default function NewReservation() {
           </div>
           <div>
             <label className="label block mb-1">
-              {isShortStay ? "Check-out (same day)" : "Check-out"}
+              Check-out <span className="text-danger">*</span>
             </label>
             <input
               className={`input ${
@@ -1372,41 +1328,23 @@ export default function NewReservation() {
               }`}
               type="date"
               value={checkOutDate}
-              disabled={isShortStay}
-              min={
-                isShortStay
-                  ? checkInDate
-                  : checkInDate
-                    ? format(addDays(new Date(checkInDate), 1), "yyyy-MM-dd")
-                    : todayStr
-              }
+              // Same-day allowed (hourly stay) → min is the check-in date
+              // itself, not the next day.
+              min={checkInDate || todayStr}
               aria-invalid={!!overnightDateError}
               onChange={(e) => setCheckOutDate(e.target.value)}
             />
             {overnightDateError && (
               <div className="text-[11px] text-danger mt-1">{overnightDateError}</div>
             )}
-            {/* Time picker (0023). For short_stay the end time follows
-                from duration so we hide it; overnight allows an explicit
-                checkout-time promise. */}
-            {!isShortStay && (
-              <TimePicker12h
-                className="mt-1"
-                value={checkOutTime}
-                onChange={setCheckOutTime}
-              />
-            )}
-            {publicSettings.data?.checkOutTime && !isShortStay && (
-              <div className="text-[11px] text-textSecondary mt-1">
-                {checkOutTime
-                  ? `Custom: ${formatTime(checkOutTime)}`
-                  : `by ${formatTime(publicSettings.data.checkOutTime)} (hotel policy)`}
-              </div>
-            )}
-            {isShortStay && (
-              <div className="text-[11px] text-textSecondary mt-1">
-                day-use bookings end the same day
-              </div>
+            {/* Check-out time is required (0023). */}
+            <TimePicker12h
+              className="mt-1"
+              value={checkOutTime}
+              onChange={setCheckOutTime}
+            />
+            {!checkOutTime && (
+              <div className="text-[11px] text-danger mt-1">Check-out time is required</div>
             )}
           </div>
           <div>
@@ -1442,85 +1380,6 @@ export default function NewReservation() {
             />
           </div>
         </div>
-        {isShortStay && (() => {
-          // Build a deduped band picker from all active room types. Each
-          // hours value gets a single pill — the per-room rate is derived
-          // from that room type's specific band when the user selects rooms
-          // below.
-          const seen = new Set<number>();
-          const allBands: { label: string; hours: number }[] = [];
-          for (const t of roomTypesQ.data ?? []) {
-            for (const b of t.shortStayBands ?? []) {
-              if (seen.has(b.hours)) continue;
-              seen.add(b.hours);
-              allBands.push({ label: b.label, hours: b.hours });
-            }
-          }
-          allBands.sort((a, b) => a.hours - b.hours);
-          // Fallback when no bands are configured — keep three sensible
-          // defaults so day-use still works out-of-the-box. Rates are
-          // pro-rated from the overnight default in shortStayRateForType.
-          const fallback = [
-            { label: "3 hrs", hours: 3 },
-            { label: "6 hrs", hours: 6 },
-            { label: "12 hrs", hours: 12 },
-          ];
-          const bands = allBands.length ? allBands : fallback;
-          return (
-            <div className="space-y-2">
-              <label className="label block">Duration</label>
-              <div className="flex flex-wrap gap-2">
-                {bands.map((b) => {
-                  const active = Math.abs(b.hours - shortStayHours) < 0.01;
-                  return (
-                    <button
-                      key={b.hours}
-                      type="button"
-                      onClick={() => setShortStayHours(b.hours)}
-                      className={`px-3 py-1.5 rounded-sm border text-sm transition ${
-                        active
-                          ? "bg-brand text-cream border-brand"
-                          : "bg-bg text-textSecondary border-borderc hover:border-brand/60"
-                      }`}
-                    >
-                      {b.label}
-                    </button>
-                  );
-                })}
-                <div className="flex items-center gap-2">
-                  <input
-                    className="input !h-9 !w-24"
-                    type="number"
-                    min={1}
-                    max={23.5}
-                    step={0.5}
-                    value={shortStayHours === 0 ? "" : shortStayHours}
-                    onChange={(e) => {
-                      const v = e.target.value;
-                      if (v === "") {
-                        setShortStayHours(0);
-                        return;
-                      }
-                      const n = Math.min(23.5, Number(v));
-                      setShortStayHours(n);
-                    }}
-                    onBlur={() => {
-                      if (shortStayHours < 1) setShortStayHours(1);
-                    }}
-                  />
-                  <span className="text-xs text-textSecondary">hours (custom)</span>
-                </div>
-              </div>
-              {allBands.length === 0 && (
-                <div className="text-[11px] text-textSecondary">
-                  No day-use bands configured. Rates are pro-rated from each
-                  room type's nightly default (24 h baseline) — set proper
-                  bands in Settings → Room Types.
-                </div>
-              )}
-            </div>
-          );
-        })()}
         <div className="grid grid-cols-2 gap-3">
           <div>
             <label className="label block mb-1">Purpose</label>
@@ -1548,7 +1407,12 @@ export default function NewReservation() {
         <div className="text-sm text-textSecondary">
           {isShortStay ? (
             <>
-              Duration: <span className="font-semibold text-navy">{shortStayHours} hours</span>
+              Same-day (hourly) stay ·{" "}
+              <span className="font-semibold text-navy">
+                {shortStayDurationHours > 0
+                  ? `${shortStayDurationHours} hour${shortStayDurationHours === 1 ? "" : "s"}`
+                  : "set check-in & check-out times"}
+              </span>
             </>
           ) : (
             <>
@@ -2202,7 +2066,7 @@ export default function NewReservation() {
                     <div className="mt-2 text-xs text-textSecondary flex flex-wrap items-center gap-x-2 gap-y-0.5">
                       <span className="font-mono font-semibold text-brand-dark">
                         {inr(selected.ratePerNight)}
-                        {isShortStay ? `/${shortStayHours}h` : "/night"}
+                        {isShortStay ? `/${shortStayDurationHours}h` : "/night"}
                       </span>
                       {selected.soldAsType && (
                         <span>
@@ -2259,7 +2123,7 @@ export default function NewReservation() {
                       </div>
                       <div>
                         <label className="label block mb-1">
-                          {isShortStay ? `Rate for ${shortStayHours} hrs` : "Rate/night"}
+                          {isShortStay ? `Rate for ${shortStayDurationHours} hrs` : "Rate/night"}
                         </label>
                         <input
                           className="input !h-8 text-sm"
@@ -2542,7 +2406,7 @@ export default function NewReservation() {
             <span className="text-textSecondary">
               Quoted rate (
               {isShortStay
-                ? `${shortStayHours} hrs × ${selectedRooms.length}`
+                ? `${shortStayDurationHours} hrs × ${selectedRooms.length}`
                 : `${nights} × ${selectedRooms.length}`}{" "}
               room{selectedRooms.length === 1 ? "" : "s"}) — GST included
             </span>
@@ -2556,7 +2420,7 @@ export default function NewReservation() {
             <span>
               Extra beds (
               {selectedRooms.reduce((a, r) => a + r.extraBeds, 0)} ×{" "}
-              {isShortStay ? `${shortStayHours} hrs` : `${nights} night${nights === 1 ? "" : "s"}`})
+              {isShortStay ? `${shortStayDurationHours} hrs` : `${nights} night${nights === 1 ? "" : "s"}`})
             </span>
             <span className="font-mono">{inr(extraBedAmount)}</span>
           </div>
@@ -2564,7 +2428,7 @@ export default function NewReservation() {
         <div className="flex justify-between text-sm">
           <span>
             {isShortStay
-              ? `Subtotal (${shortStayHours} hrs × ${selectedRooms.length} room${selectedRooms.length === 1 ? "" : "s"})`
+              ? `Subtotal (${shortStayDurationHours} hrs × ${selectedRooms.length} room${selectedRooms.length === 1 ? "" : "s"})`
               : `Subtotal (${nights} × ${selectedRooms.length} room${selectedRooms.length === 1 ? "" : "s"})`}
             {gstMode === "inclusive" && (
               <span className="text-[10px] text-textSecondary"> · net, after GST extracted</span>
@@ -2608,7 +2472,7 @@ export default function NewReservation() {
             )}
             <div className="text-[11px] text-textSecondary mt-2">
               GST {gstRate}% applied via slab (avg rate ₹{avgRatePerNight.toFixed(2)}
-              {isShortStay ? `/${shortStayHours} hrs` : "/night"}
+              {isShortStay ? `/${shortStayDurationHours} hrs` : "/night"}
               {gstMode === "inclusive" ? ", GST-inclusive" : ", GST extra"}). Final tax
               recomputed at check-out if charges change.
             </div>
