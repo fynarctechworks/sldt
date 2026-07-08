@@ -145,9 +145,23 @@ pub fn start(resource_dir: Option<&Path>) -> Result<DbHandle> {
     let bin_dir = resolve_bin_dir(resource_dir)?;
 
     let pw_file = secrets_dir.join("pg_superuser");
+    // A cluster is "complete" only if PG_VERSION exists. If pgdata exists but
+    // has no PG_VERSION, a previous initdb crashed partway (e.g. the app was
+    // killed mid-init) — the directory is a non-empty half-init that initdb
+    // refuses to run into ("directory exists but is not empty"). That produces
+    // a start-fails-every-launch loop. So: treat missing PG_VERSION as fresh
+    // AND wipe any partial pgdata first so initdb gets a clean directory.
     let is_fresh = !data_dir.join("PG_VERSION").exists();
 
     if is_fresh {
+        if data_dir.exists() {
+            log::warn!(
+                "partial/incomplete pgdata at {} (no PG_VERSION) — removing before initdb",
+                data_dir.display()
+            );
+            fs::remove_dir_all(&data_dir)
+                .with_context(|| format!("remove partial pgdata {}", data_dir.display()))?;
+        }
         log::info!("no cluster found — running initdb at {}", data_dir.display());
         let password = generate_password();
         // Persist the superuser password so restarts reuse the cluster. It
