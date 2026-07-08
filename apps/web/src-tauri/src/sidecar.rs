@@ -39,10 +39,12 @@ impl Sidecar {
     pub fn stop(&mut self) {
         #[cfg(windows)]
         {
+            use std::os::windows::process::CommandExt;
             let pid = self.child.id();
             // /T = terminate the process and its child tree, /F = force.
             let _ = Command::new("taskkill")
                 .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
@@ -156,8 +158,17 @@ pub fn spawn(_app: &AppHandle, resource_dir: Option<&Path>, db: &DbHandle) -> Op
         // Avoid pino-pretty (dev-only, unbundled) and pick prod log level.
         .env("NODE_ENV", "production")
         .stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        // Discard the sidecar's stdout/stderr — inheriting them pops up a
+        // console window in the packaged app. Its own pino logs still go to the
+        // app log file via tauri-plugin-log on the Rust side where relevant.
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // Spawn without a console window on Windows (CREATE_NO_WINDOW).
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
     if let Some(dir) = &exe_dir {
         cmd.current_dir(dir);
     }

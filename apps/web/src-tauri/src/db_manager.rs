@@ -27,6 +27,21 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use rand::Rng;
 
+/// Build a Command that spawns WITHOUT a console window on Windows. Every pg
+/// tool (initdb, pg_ctl, postgres, psql, ...) is a console program, so without
+/// this a black terminal flashes up on each call in the packaged app. No-op on
+/// other platforms.
+fn cmd(program: &Path) -> Command {
+    let mut c = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW
+        c.creation_flags(0x0800_0000);
+    }
+    c
+}
+
 /// Loopback address + port the embedded cluster listens on. 5433 avoids
 /// colliding with a system Postgres on 5432 or the Supabase-CLI dev stack.
 pub const PG_HOST: &str = "127.0.0.1";
@@ -177,10 +192,25 @@ pub fn start(resource_dir: Option<&Path>) -> Result<DbHandle> {
         log::info!("existing cluster found at {}", data_dir.display());
     }
 
-    // A stale postmaster.pid from a power loss is safe: pg_ctl start replays
-    // WAL and clears it (proven in the spike). We do not delete it ourselves —
-    // that would risk clobbering a genuinely running instance.
-    start_cluster(&bin_dir, &data_dir)?;
+    // Start the cluster, tolerating an already-running or stale instance.
+    //
+    //   - If our port is ALREADY accepting connections, a prior instance is
+    //     live (e.g. a previous app run that didn't shut down cleanly, or two
+    //     launches racing). Reuse it — DON'T run pg_ctl start, which would hang
+    //     on "another server might be running; trying to start server anyway".
+    //   - Otherwise, a leftover postmaster.pid with no live server is stale
+    //     (hard power-off / kill). Remove it so pg_ctl start doesn't wait on a
+    //     dead PID, then start.
+    if is_ready(&bin_dir) {
+        log::info!("embedded Postgres already running on {PG_PORT} — reusing it");
+    } else {
+        let pid_file = data_dir.join("postmaster.pid");
+        if pid_file.exists() {
+            log::warn!("stale postmaster.pid with no live server — removing before start");
+            let _ = fs::remove_file(&pid_file);
+        }
+        start_cluster(&bin_dir, &data_dir)?;
+    }
 
     // From here Postgres is RUNNING. If any subsequent step fails we must stop
     // it before returning Err — otherwise the cluster is left live, and the
@@ -255,7 +285,7 @@ fn load_or_create_hex_key(path: &Path) -> Result<String> {
 
 /// Stop a cluster by data dir (used by the error-recovery path in start()).
 fn stop_cluster(bin_dir: &Path, data_dir: &Path) -> Result<()> {
-    let status = Command::new(tool(bin_dir, "pg_ctl"))
+    let status = cmd(&tool(bin_dir, "pg_ctl"))
         .arg("-D")
         .arg(data_dir)
         .arg("stop")
@@ -271,7 +301,7 @@ fn stop_cluster(bin_dir: &Path, data_dir: &Path) -> Result<()> {
 /// Clean shutdown. `fast` mode rolls back in-flight txns and checkpoints, so
 /// the next start needs no WAL replay. Safe to call if already stopped.
 pub fn stop(handle: &DbHandle) -> Result<()> {
-    let status = Command::new(tool(&handle.bin_dir, "pg_ctl"))
+    let status = cmd(&tool(&handle.bin_dir, "pg_ctl"))
         .arg("-D")
         .arg(&handle.data_dir)
         .arg("stop")
@@ -285,7 +315,7 @@ pub fn stop(handle: &DbHandle) -> Result<()> {
 }
 
 fn run_initdb(bin_dir: &Path, data_dir: &Path, pw_file: &Path) -> Result<()> {
-    let out = Command::new(tool(bin_dir, "initdb"))
+    let out = cmd(&tool(bin_dir, "initdb"))
         .arg("-D")
         .arg(data_dir)
         .args(["-U", PG_SUPERUSER])
@@ -325,7 +355,7 @@ fn start_cluster(bin_dir: &Path, data_dir: &Path) -> Result<()> {
     // No -w: pg_ctl on Windows can block the parent waiting on a console
     // handle (this bit us in the spike). We start detached and poll
     // pg_isready ourselves for a deterministic readiness gate.
-    let status = Command::new(tool(bin_dir, "pg_ctl"))
+    let status = cmd(&tool(bin_dir, "pg_ctl"))
         .arg("-D")
         .arg(data_dir)
         .arg("-l")
@@ -339,17 +369,22 @@ fn start_cluster(bin_dir: &Path, data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Single non-blocking readiness probe — true if a server is accepting
+/// connections on our loopback port right now.
+fn is_ready(bin_dir: &Path) -> bool {
+    cmd(&tool(bin_dir, "pg_isready"))
+        .args(["-h", PG_HOST])
+        .args(["-p", &PG_PORT.to_string()])
+        .arg("-q")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 fn wait_ready(bin_dir: &Path, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
-        let ok = Command::new(tool(bin_dir, "pg_isready"))
-            .args(["-h", PG_HOST])
-            .args(["-p", &PG_PORT.to_string()])
-            .arg("-q")
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ok {
+        if is_ready(bin_dir) {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -365,7 +400,7 @@ fn ensure_database(bin_dir: &Path, password: &str) -> Result<()> {
     // APP_DB is a compile-time const so this can't actually be injected, but
     // bind it as a psql variable rather than interpolating into SQL — correct
     // by construction and robust if APP_DB ever becomes dynamic.
-    let exists = Command::new(tool(bin_dir, "psql"))
+    let exists = cmd(&tool(bin_dir, "psql"))
         .env("PGPASSWORD", password)
         .args(["-h", PG_HOST])
         .args(["-p", &PG_PORT.to_string()])
@@ -378,7 +413,7 @@ fn ensure_database(bin_dir: &Path, password: &str) -> Result<()> {
     if String::from_utf8_lossy(&exists.stdout).trim() == "1" {
         return Ok(());
     }
-    let out = Command::new(tool(bin_dir, "createdb"))
+    let out = cmd(&tool(bin_dir, "createdb"))
         .env("PGPASSWORD", password)
         .args(["-h", PG_HOST])
         .args(["-p", &PG_PORT.to_string()])
