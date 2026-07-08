@@ -57,9 +57,8 @@ impl Sidecar {
     }
 }
 
-/// The stdin handshake payload. Extended in later tasks with LOCAL_JWT_SECRET
-/// and ENCRYPTION_KEY (Task 3); DATABASE_URL and the schema-build flag are all
-/// Task 1 needs.
+/// The stdin handshake payload the API reads (see apps/api/src/config/
+/// handshake.ts). Secrets go over stdin, never argv/env.
 #[derive(Serialize)]
 struct Handshake<'a> {
     database_url: &'a str,
@@ -68,6 +67,9 @@ struct Handshake<'a> {
     /// migrations. Derived from whether Postgres was freshly initialized.
     schema_bootstrap: bool,
     port: u16,
+    /// Offline session-signing secret + at-rest AES key.
+    local_jwt_secret: &'a str,
+    encryption_key: &'a str,
 }
 
 /// Locate api.exe. Release: bundled resource. Dev/CI: overridable via
@@ -82,6 +84,27 @@ fn resolve_api_exe(resource_dir: Option<&Path>) -> Option<std::path::PathBuf> {
     let name = if cfg!(windows) { "api.exe" } else { "api" };
     if let Some(res) = resource_dir {
         let bundled = res.join("api").join(name);
+        if bundled.exists() {
+            return Some(bundled);
+        }
+    }
+    None
+}
+
+/// Locate the bundled Chromium for Puppeteer. Ships under the sidecar resource
+/// dir as chromium/chrome.exe next to api.exe. Overridable via
+/// PUPPETEER_EXECUTABLE_PATH (already respected by the API). Returns None if not
+/// bundled — PDF rendering then fails gracefully but the rest of the app works.
+fn resolve_chromium(resource_dir: Option<&Path>) -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("PUPPETEER_EXECUTABLE_PATH") {
+        let p = std::path::PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let name = if cfg!(windows) { "chrome.exe" } else { "chrome" };
+    if let Some(res) = resource_dir {
+        let bundled = res.join("api").join("chromium").join(name);
         if bundled.exists() {
             return Some(bundled);
         }
@@ -105,6 +128,8 @@ pub fn spawn(_app: &AppHandle, resource_dir: Option<&Path>, db: &DbHandle) -> Op
         database_url: &db.database_url,
         schema_bootstrap: db.fresh,
         port: API_PORT,
+        local_jwt_secret: &db.local_jwt_secret,
+        encryption_key: &db.encryption_key,
     };
     let payload = match serde_json::to_string(&handshake) {
         Ok(s) => s,
@@ -114,13 +139,29 @@ pub fn spawn(_app: &AppHandle, resource_dir: Option<&Path>, db: &DbHandle) -> Op
         }
     };
 
-    let mut child = match Command::new(&exe)
-        .env("SLDT_HANDSHAKE_STDIN", "1")
+    // Run from the exe's own directory so sharp resolves its native @img
+    // module from ./node_modules (shipped alongside api.exe). Point Chromium
+    // at the bundled build for PDF rendering. Secrets still go over stdin — only
+    // non-secret runtime config is set via env here.
+    let exe_dir = exe.parent().map(|p| p.to_path_buf());
+    let chromium = resolve_chromium(resource_dir);
+
+    let mut cmd = Command::new(&exe);
+    cmd.env("SLDT_HANDSHAKE_STDIN", "1")
+        .env("OFFLINE_MODE", "1")
+        // Avoid pino-pretty (dev-only, unbundled) and pick prod log level.
+        .env("NODE_ENV", "production")
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-    {
+        .stderr(Stdio::inherit());
+    if let Some(dir) = &exe_dir {
+        cmd.current_dir(dir);
+    }
+    if let Some(chrome) = &chromium {
+        cmd.env("PUPPETEER_EXECUTABLE_PATH", chrome);
+    }
+
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             log::error!("failed to spawn api sidecar {}: {e}", exe.display());

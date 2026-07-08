@@ -7,7 +7,7 @@
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5180",
     "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build"
+    "beforeBuildCommand": "npm run desktop:web:build"
   },
   "app": {
     "windows": [
@@ -36,6 +36,10 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "resources": {
+      "resources/pgsql": "pgsql",
+      "resources/api": "api"
+    },
     "android": {
       "debugApplicationIdSuffix": ".debug"
     }

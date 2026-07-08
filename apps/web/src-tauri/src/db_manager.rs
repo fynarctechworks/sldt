@@ -44,6 +44,10 @@ pub struct DbHandle {
     /// to decide whether the sidecar must run the first-time schema build
     /// (drizzle push + migrate) vs. only pending migrations.
     pub fresh: bool,
+    /// Session-signing secret for offline auth (persisted on first run).
+    pub local_jwt_secret: String,
+    /// AES key for at-rest encryption (KYC ciphertext, TOTP secrets). 64-hex.
+    pub encryption_key: String,
 }
 
 /// Root data directory: %LOCALAPPDATA%\SLDT on Windows, ~/.local/share/SLDT
@@ -176,12 +180,43 @@ pub fn start(resource_dir: Option<&Path>) -> Result<DbHandle> {
         db = APP_DB,
     );
 
+    // Offline secrets — generated once and persisted alongside the DB password.
+    // LOCAL_JWT_SECRET signs session tokens + peppers the PIN hash;
+    // ENCRYPTION_KEY (64-hex / 32 bytes) is the at-rest AES key. Keeping them
+    // stable across launches is required so existing sessions/hashes/ciphertext
+    // stay valid.
+    let local_jwt_secret = load_or_create_secret(&secrets_dir.join("local_jwt"), 48)?;
+    let encryption_key = load_or_create_hex_key(&secrets_dir.join("encryption_key"))?;
+
     Ok(DbHandle {
         data_dir,
         bin_dir,
         database_url,
         fresh: is_fresh,
+        local_jwt_secret,
+        encryption_key,
     })
+}
+
+/// Load a persisted secret, or create a fresh random one (hex) of `bytes`
+/// length on first run. Trims whitespace on read.
+fn load_or_create_secret(path: &Path, bytes: usize) -> Result<String> {
+    if let Ok(existing) = fs::read_to_string(path) {
+        let s = existing.trim().to_string();
+        if !s.is_empty() {
+            return Ok(s);
+        }
+    }
+    let mut rng = rand::thread_rng();
+    let secret: String = (0..bytes).map(|_| format!("{:02x}", rng.gen::<u8>())).collect();
+    fs::write(path, &secret).with_context(|| format!("write secret {}", path.display()))?;
+    Ok(secret)
+}
+
+/// Like load_or_create_secret but always exactly 64 hex chars (32 bytes) to
+/// satisfy the ENCRYPTION_KEY format.
+fn load_or_create_hex_key(path: &Path) -> Result<String> {
+    load_or_create_secret(path, 32)
 }
 
 /// Stop a cluster by data dir (used by the error-recovery path in start()).
