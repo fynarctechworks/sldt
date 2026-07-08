@@ -17,6 +17,7 @@ import auditRoutes from "./routes/audit.js";
 import authRoutes from "./routes/auth.js";
 import authLocalRoutes from "./routes/authLocal.js";
 import localFilesRoutes from "./routes/localFiles.js";
+import syncRoutes from "./routes/sync.js";
 import calendarRoutes from "./routes/calendar.js";
 import creditsRoutes from "./routes/credits.js";
 import dashboardRoutes from "./routes/dashboard.js";
@@ -182,6 +183,12 @@ v1.use("/calendar", calendarRoutes);
 v1.use("/search", searchRoutes);
 v1.use("/", ledgerRoutes);
 
+// Cloud replica ingest endpoint. Lives on the CLOUD/online API (the passive
+// replica the desk pushes to), never on the offline desk itself.
+if (!env.OFFLINE_MODE) {
+  v1.use("/sync", syncRoutes);
+}
+
 app.use("/api/v1", v1);
 
 app.use(notFound);
@@ -192,11 +199,15 @@ startDashboardSubscriber().catch((err) =>
 );
 
 // Offline desk: start the message-outbox drainer so queued WhatsApp/email
-// messages deliver whenever connectivity returns.
+// messages deliver whenever connectivity returns, and the sync pusher so
+// business changes replicate to the cloud backup when online.
 if (env.OFFLINE_MODE) {
   import("./lib/outbox.js")
     .then(({ startOutboxDrainer }) => startOutboxDrainer())
     .catch((err) => logger.warn({ err }, "outbox drainer failed to start"));
+  import("./lib/sync/pusher.js")
+    .then(({ startSyncPusher }) => startSyncPusher())
+    .catch((err) => logger.warn({ err }, "sync pusher failed to start"));
 }
 
 const server = app.listen(env.PORT, () => {
