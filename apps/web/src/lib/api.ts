@@ -1,10 +1,17 @@
 import { UI_PREVIEW, mockGet, mockMutation } from "./mock-data";
+import { clearLocalSession, getLocalToken, isOfflineMode } from "./offlineMode";
 import { supabase } from "./supabase";
 
 const RAW_BASE = (import.meta.env.VITE_API_URL as string) ?? "";
 const BASE = RAW_BASE.replace(/\/+$/, "");
 
 async function authHeader(): Promise<HeadersInit> {
+  // Desktop/offline: use the local JWT minted by the sidecar's /auth/login.
+  // Online: use the Supabase session token.
+  if (isOfflineMode()) {
+    const token = getLocalToken();
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  }
   const { data } = await supabase.auth.getSession();
   const token = data.session?.access_token;
   return token ? { Authorization: `Bearer ${token}` } : {};
@@ -38,6 +45,16 @@ let signingOutFor401 = false;
 async function handle401(): Promise<void> {
   if (signingOutFor401) return;
   signingOutFor401 = true;
+  if (isOfflineMode()) {
+    // Desktop: the local JWT expired/invalid. Clear it and bounce to the PIN
+    // login — no Supabase involved.
+    clearLocalSession();
+    if (typeof window !== "undefined" && !window.location.pathname.startsWith("/login")) {
+      const from = window.location.pathname + window.location.search;
+      window.location.replace(`/login?expired=1&from=${encodeURIComponent(from)}`);
+    }
+    return;
+  }
   try {
     await supabase.auth.signOut();
   } catch {

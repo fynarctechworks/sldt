@@ -19,7 +19,7 @@ import { supabase } from "@/lib/supabase";
 const Silk = lazy(() => import("@/components/Silk"));
 
 export default function Login() {
-  const { signIn, verifyMfa, session, mfaPending } = useAuth();
+  const { signIn, signInOffline, offline, verifyMfa, session, mfaPending } = useAuth();
   const dialog = useDialog();
   const location = useLocation();
   const emailId = useId();
@@ -71,7 +71,9 @@ export default function Login() {
   }
 
   const emailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-  const pwValid = password.length >= 6;
+  // Offline unlock accepts a PIN (min 4) or the password; online requires the
+  // full password (min 6).
+  const pwValid = offline ? password.length >= 4 : password.length >= 6;
   const formValid = emailValid && pwValid;
 
   async function onSubmit(e: React.FormEvent) {
@@ -81,9 +83,16 @@ export default function Login() {
     setError(null);
     setBusy(true);
     try {
-      const { mfaRequired } = await signIn(email, password);
       if (remember) localStorage.setItem("hd:lastEmail", email);
       else localStorage.removeItem("hd:lastEmail");
+      if (offline) {
+        // Desktop: verify against the local sidecar with the PIN/password. No
+        // MFA — the desk is physically secured; the `session` redirect fires
+        // once the profile loads.
+        await signInOffline(email, password);
+        return;
+      }
+      const { mfaRequired } = await signIn(email, password);
       // If a second factor is owed, show the code step. Otherwise the
       // `session && !mfaPending` redirect above takes over on re-render.
       if (mfaRequired) {
@@ -372,15 +381,18 @@ export default function Login() {
           <div>
             <div className="flex items-center justify-between mb-1">
               <label htmlFor={pwId} className="label">
-                Password
+                {offline ? "Desk PIN or password" : "Password"}
               </label>
-              <button
-                type="button"
-                className="text-xs text-accentBlue hover:underline"
-                onClick={onForgotPassword}
-              >
-                Forgot password?
-              </button>
+              {/* No email reset offline — the PIN is provisioned online. */}
+              {!offline && (
+                <button
+                  type="button"
+                  className="text-xs text-accentBlue hover:underline"
+                  onClick={onForgotPassword}
+                >
+                  Forgot password?
+                </button>
+              )}
             </div>
             <div className="relative">
               <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-textSecondary pointer-events-none" />
@@ -390,7 +402,7 @@ export default function Login() {
                   touched.pw && !pwValid ? "border-danger focus:border-danger focus:ring-danger/30" : ""
                 }`}
                 type={showPw ? "text" : "password"}
-                placeholder="Enter your password"
+                placeholder={offline ? "Enter your desk PIN" : "Enter your password"}
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 onBlur={() => setTouched((t) => ({ ...t, pw: true }))}
