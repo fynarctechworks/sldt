@@ -9,6 +9,8 @@ import { env } from "./config/env.js";
 import { closeBrowser } from "./lib/pdf.js";
 import { logger } from "./lib/logger.js";
 import { startDashboardSubscriber } from "./lib/redis.js";
+import { startOutboxDrainer } from "./lib/outbox.js";
+import { startSyncPusher } from "./lib/sync/pusher.js";
 import { errorHandler, notFound } from "./middleware/error.js";
 import { loginLimiter, readLimiter, writeLimiter } from "./middleware/rateLimit.js";
 import activityRoutes from "./routes/activity.js";
@@ -200,13 +202,15 @@ startDashboardSubscriber().catch((err) =>
 
 // Offline desk: start the message-outbox drainer so queued WhatsApp/email
 // messages deliver whenever connectivity returns, and the sync pusher so
-// business changes replicate to the cloud backup when online.
+// business changes replicate to the cloud backup when online. Static-imported
+// (not dynamic import()) so the pkg-bundled sidecar can resolve them — they're
+// inert online anyway.
 if (env.OFFLINE_MODE) {
-  import("./lib/outbox.js")
-    .then(({ startOutboxDrainer }) => startOutboxDrainer())
+  Promise.resolve()
+    .then(() => startOutboxDrainer())
     .catch((err) => logger.warn({ err }, "outbox drainer failed to start"));
-  import("./lib/sync/pusher.js")
-    .then(({ startSyncPusher }) => startSyncPusher())
+  Promise.resolve()
+    .then(() => startSyncPusher())
     .catch((err) => logger.warn({ err }, "sync pusher failed to start"));
 }
 

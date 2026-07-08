@@ -1,5 +1,6 @@
 import { env } from "../config/env.js";
 import { logger } from "./logger.js";
+import { enqueueMessage } from "./outbox.js";
 
 export interface SmsMessage {
   to: string;
@@ -206,9 +207,8 @@ export const messaging = {
   async sendSms(msg: SmsMessage): Promise<SendResult> {
     if (env.OFFLINE_MODE) {
       // No internet in the hot path: enqueue and return success. The drainer
-      // delivers when the desk reconnects. Dynamic import avoids a cycle
-      // (outbox → messaging types).
-      const { enqueueMessage } = await import("./outbox.js");
+      // delivers when the desk reconnects. (outbox imports messaging only as
+      // a type, so a static import here is cycle-free and pkg-compatible.)
       await enqueueMessage("sms", msg.to, msg);
       return { ok: true, provider: "outbox", id: "queued" };
     }
@@ -219,7 +219,6 @@ export const messaging = {
   // turns the channel on; absence keeps it disabled.
   async sendEmail(msg: EmailMessage): Promise<SendResult> {
     if (env.OFFLINE_MODE) {
-      const { enqueueMessage } = await import("./outbox.js");
       await enqueueMessage("email", msg.to, msg);
       return { ok: true, provider: "outbox", id: "queued" };
     }

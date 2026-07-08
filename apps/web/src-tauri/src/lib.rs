@@ -61,13 +61,17 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 let procs = window.state::<AppProcs>();
-                // Stop the sidecar first so no new writes hit Postgres, then
-                // stop Postgres cleanly (fast checkpoint → no WAL replay next
-                // launch).
-                if let Some(mut sc) = procs.sidecar.lock().unwrap().take() {
+                // Take both out of their mutexes FIRST so the lock guards drop
+                // before we run the (potentially slow) stop logic, and before
+                // `procs` itself drops — otherwise a guard would outlive the
+                // State borrow. Stop the sidecar first so no new writes hit
+                // Postgres, then stop Postgres cleanly.
+                let sidecar = procs.sidecar.lock().unwrap().take();
+                let db = procs.db.lock().unwrap().take();
+                if let Some(mut sc) = sidecar {
                     sc.stop();
                 }
-                if let Some(db) = procs.db.lock().unwrap().take() {
+                if let Some(db) = db {
                     if let Err(e) = db_manager::stop(&db) {
                         log::warn!("error stopping Postgres: {e:#}");
                     }

@@ -1,6 +1,6 @@
 import { format } from "date-fns";
 import { asc, eq } from "drizzle-orm";
-import puppeteer, { type Browser, type PaperFormat } from "puppeteer";
+import { type Browser, type PaperFormat } from "puppeteer";
 import { env } from "../config/env.js";
 import { db } from "../db/client.js";
 import type { InvoiceLineItem, Invoice, Payment } from "../db/schema/invoices.js";
@@ -68,6 +68,11 @@ let browserPromise: Promise<Browser> | null = null;
 
 async function getBrowser() {
   if (!browserPromise) {
+    // Lazy-load so the pkg-bundled offline sidecar boots without puppeteer's
+    // full module graph being resolvable at import time; Chromium itself is a
+    // separate binary launched via PUPPETEER_EXECUTABLE_PATH (set by the Rust
+    // sidecar to the bundled build).
+    const { default: puppeteer } = await import("puppeteer");
     browserPromise = puppeteer.launch({
       headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,

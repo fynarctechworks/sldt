@@ -1,5 +1,4 @@
 import { randomBytes } from "node:crypto";
-import sharp from "sharp";
 import { env } from "../config/env.js";
 import { logger } from "./logger.js";
 import {
@@ -10,6 +9,24 @@ import {
 import { supabaseAdmin } from "./supabase.js";
 
 const BUCKET = "kyc-docs";
+
+// Lazy sharp loader. Cached after the first attempt. Returns null if the native
+// module can't load (so callers degrade gracefully in a stripped offline
+// bundle). Top-level importing sharp would crash the pkg-bundled exe at boot.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let sharpModule: any | null | undefined;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function loadSharp(): Promise<any | null> {
+  if (sharpModule !== undefined) return sharpModule;
+  try {
+    const mod = await import("sharp");
+    sharpModule = mod.default ?? mod;
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : err }, "sharp failed to load");
+    sharpModule = null;
+  }
+  return sharpModule;
+}
 
 export type KycSide = "front" | "back" | "photo";
 
@@ -85,6 +102,18 @@ async function sanitizeImage(
     throw new Error(
       `File header says ${headerType} but content is ${sniffed}; refusing upload`,
     );
+  }
+
+  // Lazy-load sharp so the pkg-bundled offline sidecar boots even if sharp's
+  // native module isn't present. If it can't load (missing native binary in a
+  // stripped offline bundle), fall back to storing the already-sniffed +
+  // size-capped image as-is: no resize / EXIF-strip, but still a validated
+  // image. The full sanitizer is used everywhere sharp IS available (online,
+  // and offline once @img is bundled).
+  const sharp = await loadSharp();
+  if (!sharp) {
+    logger.warn("sharp unavailable — storing KYC image without resize/EXIF-strip");
+    return { buffer, mimetype: sniffed === "jpeg" ? "image/jpeg" : `image/${sniffed}` };
   }
 
   const out = await sharp(buffer, { failOn: "warning" })
