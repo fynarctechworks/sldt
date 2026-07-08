@@ -11,6 +11,8 @@ import { logger } from "./lib/logger.js";
 import { startDashboardSubscriber } from "./lib/redis.js";
 import { startOutboxDrainer } from "./lib/outbox.js";
 import { startSyncPusher } from "./lib/sync/pusher.js";
+import { bootstrapSchemaIfNeeded } from "./db/bootstrap/index.js";
+import { ensureOfflineAdmin } from "./db/bootstrap/seedAdmin.js";
 import { errorHandler, notFound } from "./middleware/error.js";
 import { loginLimiter, readLimiter, writeLimiter } from "./middleware/rateLimit.js";
 import activityRoutes from "./routes/activity.js";
@@ -214,9 +216,24 @@ if (env.OFFLINE_MODE) {
     .catch((err) => logger.warn({ err }, "sync pusher failed to start"));
 }
 
+// Offline first-run: build the schema on a fresh embedded cluster and ensure
+// there's an admin to log in with, BEFORE we start serving. No-op online and
+// on already-initialized offline clusters.
+async function offlineFirstRun(): Promise<void> {
+  if (!env.OFFLINE_MODE) return;
+  await bootstrapSchemaIfNeeded();
+  await ensureOfflineAdmin();
+}
+
 const server = app.listen(env.PORT, () => {
   logger.info(`HotelDesk API listening on http://localhost:${env.PORT}`);
 });
+// Run the first-run bootstrap right after binding the port so /health responds
+// immediately (the shell health-gates on it); the schema build completes in
+// well under a second.
+offlineFirstRun().catch((err) =>
+  logger.error({ err }, "offline first-run bootstrap failed"),
+);
 
 async function shutdown(signal: string) {
   logger.info(`${signal} received, shutting down`);

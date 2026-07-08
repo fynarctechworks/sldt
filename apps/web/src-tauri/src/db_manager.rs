@@ -85,7 +85,11 @@ fn resolve_bin_dir(resource_dir: Option<&Path>) -> Result<PathBuf> {
         }
     }
     if let Some(res) = resource_dir {
-        let bundled = res.join("pgsql").join("bin");
+        // Tauri's resource_dir() is a `\\?\` extended-length (verbatim) path on
+        // Windows. Passing initdb.exe with that prefix breaks initdb's own
+        // "find postgres.exe next to me" logic (it can't parse the verbatim
+        // dir). Strip the prefix so the bundled binaries get a normal path.
+        let bundled = strip_verbatim(&res.join("pgsql").join("bin"));
         if bundled.join(exe("postgres")).exists() {
             return Ok(bundled);
         }
@@ -113,6 +117,22 @@ fn exe(name: &str) -> String {
 
 fn tool(bin_dir: &Path, name: &str) -> PathBuf {
     bin_dir.join(exe(name))
+}
+
+/// Strip the Windows `\\?\` verbatim (extended-length) prefix from a path.
+/// Tauri resource paths carry it, and some bundled tools (initdb locating
+/// its sibling postgres.exe) can't handle it. No-op on non-Windows or paths
+/// without the prefix. Also exposed for the sidecar resolver.
+pub fn strip_verbatim(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else if let Some(rest) = s.strip_prefix("//?/") {
+        // Some layers normalize backslashes to forward slashes.
+        PathBuf::from(rest)
+    } else {
+        p.to_path_buf()
+    }
 }
 
 /// Start (and first-run-initialize) the embedded cluster. Returns a handle

@@ -83,7 +83,10 @@ fn resolve_api_exe(resource_dir: Option<&Path>) -> Option<std::path::PathBuf> {
     }
     let name = if cfg!(windows) { "api.exe" } else { "api" };
     if let Some(res) = resource_dir {
-        let bundled = res.join("api").join(name);
+        // Strip the \\?\ verbatim prefix (see db_manager::strip_verbatim) —
+        // the child's cwd + native-module resolution behave better with a
+        // normal path.
+        let bundled = crate::db_manager::strip_verbatim(&res.join("api").join(name));
         if bundled.exists() {
             return Some(bundled);
         }
@@ -104,7 +107,8 @@ fn resolve_chromium(resource_dir: Option<&Path>) -> Option<std::path::PathBuf> {
     }
     let name = if cfg!(windows) { "chrome.exe" } else { "chrome" };
     if let Some(res) = resource_dir {
-        let bundled = res.join("api").join("chromium").join(name);
+        let bundled =
+            crate::db_manager::strip_verbatim(&res.join("api").join("chromium").join(name));
         if bundled.exists() {
             return Some(bundled);
         }
