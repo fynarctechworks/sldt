@@ -564,9 +564,14 @@ router.post(
       }
       otpRowIdToConsume = otpRow.id;
     } else {
-      // OTP is mandatory for every booking. We don't allow an opt-out
-      // because every check-in needs guest acknowledgement (anti-fraud).
-      return fail(res, 400, "OTP_REQUIRED", "OTP verification required before booking");
+      // No OTP code. Allow the create ONLY when the property has OTP turned
+      // off. We read the setting server-side rather than trusting the
+      // client's skipOtp flag, so a caller can't skip OTP the operator
+      // required just by sending skipOtp:true.
+      const { otpRequiredForCheckin } = await getSettings();
+      if (otpRequiredForCheckin) {
+        return fail(res, 400, "OTP_REQUIRED", "OTP verification required before booking");
+      }
     }
 
     // Blacklist guard. Reject before any availability / pricing work
@@ -877,13 +882,19 @@ router.post(
 
         // Consume the OTP row we pre-verified above, and link it to this
         // reservation so the audit trail shows which booking it unlocked.
-        // We do this inside the tx so either the reservation + OTP both
-        // commit or neither does — preventing the OTP being re-used.
+        // The conditional WHERE (isNull consumedAt) makes a concurrent
+        // replay of the same code lose the race: two bookings that both
+        // pre-verified the same valid code can't both consume it — the
+        // loser's update matches zero rows and rolls back its reservation.
         if (otpRowIdToConsume) {
-          await tx
+          const consumed = await tx
             .update(otps)
             .set({ consumedAt: new Date(), reservationId: r!.id })
-            .where(eq(otps.id, otpRowIdToConsume));
+            .where(and(eq(otps.id, otpRowIdToConsume), isNull(otps.consumedAt)))
+            .returning({ id: otps.id });
+          if (consumed.length === 0) {
+            throw new Error("OTP was already used — request a new code");
+          }
         }
 
         return r!;
@@ -1326,25 +1337,34 @@ router.post(
       );
     }
 
-    const otpRow = await db
-      .select({ id: otps.id })
-      .from(otps)
-      .where(
-        and(
-          eq(otps.reservationId, id),
-          eq(otps.purpose, "checkin"),
-          isNotNull(otps.consumedAt),
-          gte(otps.consumedAt, sql`now() - interval '15 minutes'`),
-        ),
-      )
-      .limit(1);
-    if (!otpRow.length) {
-      return fail(
-        res,
-        422,
-        "OTP_REQUIRED",
-        "OTP verification required. Send and verify a code before check-in.",
-      );
+    // OTP gate — only enforced when the property requires it. When OTP is
+    // turned off in Settings, no code is ever sent/verified, so there's no
+    // consumed row to look for; requiring one would make check-in impossible.
+    // We read the setting server-side (not a client flag) so it can't be
+    // bypassed. The purpose="checkin" scope stays so this never touches
+    // auth/password OTP.
+    const { otpRequiredForCheckin } = await getSettings();
+    if (otpRequiredForCheckin) {
+      const otpRow = await db
+        .select({ id: otps.id })
+        .from(otps)
+        .where(
+          and(
+            eq(otps.reservationId, id),
+            eq(otps.purpose, "checkin"),
+            isNotNull(otps.consumedAt),
+            gte(otps.consumedAt, sql`now() - interval '15 minutes'`),
+          ),
+        )
+        .limit(1);
+      if (!otpRow.length) {
+        return fail(
+          res,
+          422,
+          "OTP_REQUIRED",
+          "OTP verification required. Send and verify a code before check-in.",
+        );
+      }
     }
 
     const roomIds = (

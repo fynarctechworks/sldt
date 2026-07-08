@@ -9,6 +9,7 @@ import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { Loader } from "@/components/Loader";
 import { Combobox } from "@/components/Combobox";
 import { EmailInput } from "@/components/EmailInput";
+import { useDialog } from "@/components/Dialog";
 import { ApiError, api } from "@/lib/api";
 import { citiesForState } from "@/lib/indianCities";
 import { INDIAN_STATES, INDIAN_UNION_TERRITORIES } from "@/lib/indianStates";
@@ -180,6 +181,7 @@ function formatTime(hhmm: string | undefined | null): string {
 export default function NewReservation() {
   const navigate = useNavigate();
   const qc = useQueryClient();
+  const dialog = useDialog();
   const [searchParams] = useSearchParams();
   const preselectRoomId = searchParams.get("room");
   const preselectGuestId = searchParams.get("guestId");
@@ -449,8 +451,13 @@ export default function NewReservation() {
         gstSlabLowMax: string;
         gstSlabHighRate: string;
         gstMode: "exclusive" | "inclusive";
+        otpRequiredForCheckin: boolean;
       } | null>("/settings/public"),
   });
+
+  // Property-wide OTP policy. Defaults to on until settings load (and for
+  // rows created before the setting existed) so we never silently skip OTP.
+  const otpEnabled = publicSettings.data?.otpRequiredForCheckin ?? true;
 
   // Wallet balance for the selected existing guest. Skipped when staff is
   // creating a new guest (no history → no credit).
@@ -812,11 +819,21 @@ export default function NewReservation() {
       return { guestId, coGuestIds };
     },
     onSuccess: ({ guestId, coGuestIds }) => {
-      // Open OTP modal. The actual reservation gets created only in the
-      // OTP-verified callback (createAfterOtp.mutate). If staff abandons
-      // the OTP step, no DB write ever happens.
+      // The reservation itself is created in createAfterOtp. Set the guest
+      // context first so that mutation has it either way.
       setPendingOtpGuestId(guestId);
       setPendingCoGuestIds(coGuestIds);
+      if (!otpEnabled) {
+        // OTP disabled for this booking: skip the modal and create the
+        // reservation directly with skipOtp (no code). Guest context is
+        // passed explicitly so we don't depend on the setState above having
+        // flushed yet.
+        createAfterOtp.mutate({ otpCode: null, guestId, coGuestIds });
+        return;
+      }
+      // OTP on: open the modal. The reservation gets created only in the
+      // OTP-verified callback. If staff abandons the OTP step, no
+      // reservation DB write ever happens.
     },
     onError: (e: Error) => {
       // A write failed AFTER we created one or more guest rows (e.g. a KYC
@@ -834,8 +851,12 @@ export default function NewReservation() {
     // OtpModal awaits onVerified → mutateAsync resolves only when this
     // function returns, so the user sees "Creating reservation…" until
     // the receipt modal is ready to render.
-    mutationFn: async (otpCode: string) => {
-      const guestId = pendingOtpGuestId;
+    mutationFn: async (vars: {
+      otpCode: string | null;
+      guestId: string;
+      coGuestIds: string[];
+    }) => {
+      const { otpCode, guestId, coGuestIds } = vars;
       if (!guestId) throw new Error("Missing guest context");
 
       const reservation = await api.post<{
@@ -873,13 +894,14 @@ export default function NewReservation() {
           extraBeds: r.extraBeds > 0 ? r.extraBeds : undefined,
           extraBedRate: r.extraBeds > 0 ? r.extraBedRate : undefined,
         })),
-        coGuestIds: pendingCoGuestIds.length > 0 ? pendingCoGuestIds : undefined,
+        coGuestIds: coGuestIds.length > 0 ? coGuestIds : undefined,
         advancePaid: isCreditBooking ? 0 : advance > 0 ? advance : 0,
         advancePaymentMethod: isCreditBooking ? undefined : advance > 0 ? paymentMethod : undefined,
         useWalletCredit: effectiveWalletApply > 0 ? effectiveWalletApply : undefined,
         bookingSource,
         creditNotes: isCreditBooking && creditNotes ? creditNotes : undefined,
-        otpCode,
+        otpCode: otpCode ?? undefined,
+        skipOtp: otpCode ? undefined : true,
       });
 
       const tookAdvance = !isCreditBooking && advance > 0;
@@ -904,8 +926,32 @@ export default function NewReservation() {
       if (navigateOnly)
         navigate(`/reservations/${reservation.reservationNumber}`);
     },
-    onError: (e: Error) => setError(describeApiError(e)),
+    onError: (e: Error) => {
+      // In the OTP-off branch there's no modal onClose to sweep the guest
+      // rows we minted before this create, so do it here — otherwise a
+      // failed create leaves orphan guests until the abandon-cleanup runs.
+      sweepFreshGuests();
+      setError(describeApiError(e));
+    },
   });
+
+  // Submit handler for the primary button. For a walk-in with OTP disabled,
+  // the guest is checked in immediately without any identity code, so we ask
+  // for an explicit confirmation first. Every other case submits directly
+  // (pre-bookings don't check in on create; OTP-on runs the verify modal).
+  async function handlePrimarySubmit() {
+    if (mode === "walkin" && !otpEnabled) {
+      const ok = await dialog.confirm({
+        title: "Check in without OTP?",
+        message:
+          "OTP verification is turned off, so the guest's identity won't be confirmed with a code. Check in this guest now?",
+        okLabel: "Check in",
+        cancelLabel: "Cancel",
+      });
+      if (!ok) return;
+    }
+    create.mutate();
+  }
 
   async function buildAndShowReceipt(reservationId: string) {
     try {
@@ -2275,13 +2321,23 @@ export default function NewReservation() {
         )}
 
         <div className="flex items-start gap-3 px-3 py-2.5 border border-borderc rounded-sm bg-bg select-none">
-          <div className="w-4 h-4 mt-0.5 rounded-sm bg-brand grid place-items-center">
-            <span className="text-white text-[10px] leading-none">✓</span>
+          <div
+            className={`w-4 h-4 mt-0.5 rounded-sm grid place-items-center ${
+              otpEnabled ? "bg-brand" : "bg-borderc"
+            }`}
+          >
+            <span className="text-white text-[10px] leading-none">
+              {otpEnabled ? "✓" : "—"}
+            </span>
           </div>
           <div className="text-sm">
-            <div className="font-medium text-textPrimary">OTP verification (required)</div>
+            <div className="font-medium text-textPrimary">
+              OTP verification {otpEnabled ? "(required)" : "(disabled)"}
+            </div>
             <div className="text-xs text-textSecondary mt-0.5">
-              A code will be sent to the guest's phone or email and must be entered before check-in is completed.
+              {otpEnabled
+                ? "A code will be sent to the guest's phone or email and must be entered before check-in is completed."
+                : "OTP is turned off for this property (Settings → Guest Check-in). No code will be sent."}
             </div>
           </div>
         </div>
@@ -2525,7 +2581,7 @@ export default function NewReservation() {
           <button
             className="btn-primary"
             disabled={!canSubmit || create.isPending}
-            onClick={() => create.mutate()}
+            onClick={handlePrimarySubmit}
           >
             {create.isPending
               ? mode === "walkin"
@@ -2552,7 +2608,7 @@ export default function NewReservation() {
 
       <OtpModal
         guestId={pendingOtpGuestId ?? undefined}
-        open={!!pendingOtpGuestId}
+        open={!!pendingOtpGuestId && otpEnabled}
         onClose={() => {
           // OTP abandoned. No reservation row was created, but the guest
           // row(s) DID get minted before this step (OTP is anchored on a
@@ -2567,7 +2623,11 @@ export default function NewReservation() {
           // the promise keeps OtpModal's spinner visible until the
           // reservation is fully created and navigation fires.
           if (!code) return;
-          await createAfterOtp.mutateAsync(code);
+          await createAfterOtp.mutateAsync({
+            otpCode: code,
+            guestId: pendingOtpGuestId!,
+            coGuestIds: pendingCoGuestIds,
+          });
         }}
       />
     </div>

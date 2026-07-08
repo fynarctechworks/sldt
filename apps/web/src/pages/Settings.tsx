@@ -726,6 +726,7 @@ interface HotelSettings {
   checkOutTime: string;
   ownerPhone: string | null;
   ownerNotifyEnabled: boolean;
+  otpRequiredForCheckin: boolean;
   wifiSsid: string | null;
   wifiPassword: string | null;
   // Property-wide GST pricing mode. 'inclusive' = rate the staff types
@@ -754,7 +755,13 @@ function HotelTab() {
   const [msg, setMsg] = useState<string | null>(null);
 
   useEffect(() => {
-    if (data?.settings && !form) setForm(data.settings);
+    if (data?.settings && !form)
+      setForm({
+        ...data.settings,
+        // Default to on for rows created before this column existed, so the
+        // toggle never renders in an undefined/indeterminate state.
+        otpRequiredForCheckin: data.settings.otpRequiredForCheckin ?? true,
+      });
   }, [data, form]);
 
   const save = useMutation({
@@ -772,6 +779,7 @@ function HotelTab() {
         hotelEmail: f.hotelEmail && f.hotelEmail.trim() !== "" ? f.hotelEmail : null,
         ownerPhone: f.ownerPhone && f.ownerPhone.trim() !== "" ? f.ownerPhone : null,
         ownerNotifyEnabled: f.ownerNotifyEnabled,
+        otpRequiredForCheckin: f.otpRequiredForCheckin,
         wifiSsid: f.wifiSsid && f.wifiSsid.trim() !== "" ? f.wifiSsid : null,
         wifiPassword: f.wifiPassword && f.wifiPassword.trim() !== "" ? f.wifiPassword : null,
         gstMode: f.gstMode,
@@ -795,6 +803,10 @@ function HotelTab() {
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["settings"] });
+      // NewReservation and ReservationDetail read the public settings under a
+      // separate key with a 5-min staleTime, so without this they'd keep the
+      // old OTP policy (and other public settings) until a hard refresh.
+      qc.invalidateQueries({ queryKey: ["settings-public"] });
       setMsg("Saved");
       setTimeout(() => setMsg(null), 2000);
     },
@@ -997,6 +1009,40 @@ function HotelTab() {
               <span className="text-sm">Enabled</span>
             </label>
           </Field>
+        </div>
+      </div>
+
+      <div className="border-t border-borderc pt-4 mt-2 space-y-3">
+        <h3 className="font-semibold text-brand-dark">Guest Check-in</h3>
+        <p className="text-xs text-textSecondary -mt-2">
+          When OTP verification is on, every new booking sends a code to the
+          guest that must be entered before check-in is completed. Turn it off
+          if guests can't reliably receive a code — bookings will be created
+          without OTP.
+        </p>
+        <div className="flex items-center justify-between px-3 py-2.5 border border-borderc rounded-sm bg-surface select-none">
+          <span className="text-sm font-medium text-textPrimary">
+            Require OTP verification
+            <span className="ml-2 text-xs font-normal text-textSecondary">
+              {form.otpRequiredForCheckin ? "On" : "Off"}
+            </span>
+          </span>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={form.otpRequiredForCheckin}
+            aria-label="Require OTP verification"
+            onClick={() => set("otpRequiredForCheckin", !form.otpRequiredForCheckin)}
+            className={`relative shrink-0 h-6 w-11 rounded-full transition-colors ${
+              form.otpRequiredForCheckin ? "bg-brand" : "bg-borderc"
+            }`}
+          >
+            <span
+              className={`absolute top-0.5 left-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform ${
+                form.otpRequiredForCheckin ? "translate-x-5" : "translate-x-0"
+              }`}
+            />
+          </button>
         </div>
       </div>
 

@@ -16,6 +16,7 @@ export const settingsUpdateSchema = z.object({
   hotelEmail: z.string().email().optional().nullable(),
   ownerPhone: z.string().optional().nullable().transform((v) => (v === "" ? null : v)),
   ownerNotifyEnabled: z.boolean().optional(),
+  otpRequiredForCheckin: z.boolean().optional(),
   wifiSsid: z.string().max(60).optional().nullable().transform((v) => (v === "" ? null : v)),
   wifiPassword: z.string().max(120).optional().nullable().transform((v) => (v === "" ? null : v)),
   hotelGstin: z.string().min(1).optional(),

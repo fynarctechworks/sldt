@@ -67,6 +67,9 @@ router.get("/public", requireAuth, async (_req, res) => {
       gstSlabHighRate: settings.gstSlabHighRate,
       // Drives the rate-vs-grand-total interpretation on NewReservation.
       gstMode: settings.gstMode,
+      // Property-wide OTP policy — NewReservation reads this to decide
+      // whether to run the OTP step before creating a booking.
+      otpRequiredForCheckin: settings.otpRequiredForCheckin,
       // 0024 — only a BOOLEAN of whether the gate is configured. The
       // actual code never leaves the server. The Reports UI uses this
       // to decide whether to open the auth prompt before revealing

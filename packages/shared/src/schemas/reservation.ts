@@ -58,12 +58,17 @@ export const reservationCreateSchema = z
     // at min(guest wallet balance, reservation grand total).
     useWalletCredit: z.coerce.number().min(0).optional().default(0),
     // OTP code, when the create flow uses the "verify first, then create"
-    // pattern (the only way new bookings are made now). The server looks
-    // up the most recent un-consumed checkin-purpose OTP for this guest,
-    // checks the code, marks it consumed inside the same transaction as
-    // the reservation insert, then proceeds. Omitting this rejects the
-    // create unless an admin override flag is added later.
+    // pattern. The server looks up the most recent un-consumed
+    // checkin-purpose OTP for this guest, checks the code, marks it
+    // consumed inside the same transaction as the reservation insert, then
+    // proceeds. Omitting this rejects the create unless skipOtp is set.
     otpCode: z.string().min(4).max(8).optional(),
+    // Explicit opt-out of OTP verification for this booking. Staff toggle
+    // this off on the New Reservation form when the guest can't receive a
+    // code (no phone/OTP failure). Requires this to be an intentional flag
+    // rather than a silently-absent otpCode so a client can't bypass OTP by
+    // just not sending it.
+    skipOtp: z.boolean().optional().default(false),
     // Co-guests (migration 0020). Additional adults whose KYC was
     // captured at booking. At least one is expected when numAdults >= 2,
     // but the desk may record every accompanying adult for larger groups.

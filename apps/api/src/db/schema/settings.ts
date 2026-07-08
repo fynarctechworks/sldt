@@ -30,6 +30,11 @@ export const settings = pgTable("settings", {
   hotelEmail: text("hotel_email"),
   ownerPhone: text("owner_phone"),
   ownerNotifyEnabled: boolean("owner_notify_enabled").notNull().default(true),
+  // Whether guest OTP verification is required before a check-in is
+  // completed. On by default. When off, New Reservation skips the OTP step
+  // entirely (no code sent, no modal) and the create is accepted with
+  // skipOtp. A property-wide policy, not a per-booking choice.
+  otpRequiredForCheckin: boolean("otp_required_for_checkin").notNull().default(true),
   wifiSsid: text("wifi_ssid"),
   wifiPassword: text("wifi_password"),
   hotelGstin: text("hotel_gstin").notNull(),

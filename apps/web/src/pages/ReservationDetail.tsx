@@ -299,9 +299,14 @@ export default function ReservationDetail() {
         hotelLogoUrl: string | null;
         checkInTime: string | null;
         checkOutTime: string | null;
+        otpRequiredForCheckin: boolean;
       }>("/settings/public"),
     staleTime: 5 * 60 * 1000,
   });
+
+  // Property-wide OTP policy. Defaults to on until settings load so we never
+  // silently skip verification on a slow network.
+  const otpEnabled = settingsQ.data?.otpRequiredForCheckin ?? true;
 
   function invalidate() {
     invalidateReservationData(qc, { reservationId: id, guestId: data?.guestId });
@@ -327,14 +332,31 @@ export default function ReservationDetail() {
     );
   }, [data, searchParams, setSearchParams]);
 
-  function handleStartCheckIn() {
+  async function handleStartCheckIn() {
     setErr(null);
     const today = format(new Date(), "yyyy-MM-dd");
     if (r && r.checkInDate > today) {
       // Two-step flow: open the EarlyCheckInModal which shows the financial
       // impact (old vs new totals) and only commits the date shift after the
-      // user confirms a second time. When that finishes, we continue to OTP.
+      // user confirms a second time. When that finishes, we continue to OTP
+      // (or straight to check-in when OTP is disabled — see the modal's
+      // onConfirmed handler below).
       setShowEarlyCheckIn(true);
+      return;
+    }
+    // OTP policy off for this property: skip the verify modal and check in
+    // directly. The server /check-in gate reads the same setting, so with
+    // OTP off it won't demand a consumed OTP row. We still ask for an
+    // explicit confirmation since the guest's identity won't be verified.
+    if (!otpEnabled) {
+      const ok = await dialog.confirm({
+        title: "Check in without OTP?",
+        message:
+          "OTP verification is turned off, so the guest's identity won't be confirmed with a code. Check in this guest now?",
+        okLabel: "Check in",
+        cancelLabel: "Cancel",
+      });
+      if (ok) checkIn.mutate();
       return;
     }
     setShowOtp(true);
@@ -771,7 +793,11 @@ export default function ReservationDetail() {
             disabled={!canCheckIn || checkIn.isPending}
             title={!kycVerified ? "Upload KYC documents first" : undefined}
           >
-            {checkIn.isPending ? "Checking in…" : "Verify & Check In"}
+            {checkIn.isPending
+              ? "Checking in…"
+              : otpEnabled
+                ? "Verify & Check In"
+                : "Check In"}
           </button>
         )}
         {canCheckOut && (
@@ -1439,8 +1465,10 @@ export default function ReservationDetail() {
             setShowEarlyCheckIn(false);
             toast("Booking dates shifted for early check-in", "success");
             invalidate();
-            // Continue straight into the OTP step.
-            setShowOtp(true);
+            // Continue into the OTP step, or straight to check-in when OTP
+            // is disabled for this property.
+            if (otpEnabled) setShowOtp(true);
+            else checkIn.mutate();
           }}
         />
       )}
