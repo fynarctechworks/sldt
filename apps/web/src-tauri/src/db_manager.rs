@@ -397,17 +397,19 @@ fn wait_ready(bin_dir: &Path, timeout: Duration) -> Result<()> {
 /// Create the app database if it doesn't exist. `createdb` errors when the DB
 /// already exists, so we check first via psql.
 fn ensure_database(bin_dir: &Path, password: &str) -> Result<()> {
-    // APP_DB is a compile-time const so this can't actually be injected, but
-    // bind it as a psql variable rather than interpolating into SQL — correct
-    // by construction and robust if APP_DB ever becomes dynamic.
+    // APP_DB is a compile-time const (no injection risk), so interpolate it
+    // directly. psql -c does NOT do :'var' substitution the way an
+    // interactive session does, so a bound variable silently produced a
+    // "syntax error at or near \":\"" — which made the check always fail and
+    // createdb always run. Plain SQL avoids that.
+    let query = format!("select 1 from pg_database where datname = '{APP_DB}'");
     let exists = cmd(&tool(bin_dir, "psql"))
         .env("PGPASSWORD", password)
         .args(["-h", PG_HOST])
         .args(["-p", &PG_PORT.to_string()])
         .args(["-U", PG_SUPERUSER])
         .args(["-d", "postgres"])
-        .args(["-v", &format!("db={APP_DB}")])
-        .args(["-tAc", "select 1 from pg_database where datname = :'db'"])
+        .args(["-tAc", &query])
         .output()
         .context("spawn psql (db check)")?;
     if String::from_utf8_lossy(&exists.stdout).trim() == "1" {
@@ -422,7 +424,14 @@ fn ensure_database(bin_dir: &Path, password: &str) -> Result<()> {
         .output()
         .context("spawn createdb")?;
     if !out.status.success() {
-        bail!("createdb failed: {}", String::from_utf8_lossy(&out.stderr));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Idempotent: if the DB already exists (e.g. the pre-check raced, or we
+        // reused a running cluster whose DB was already created), that's fine —
+        // NOT a fatal error. Only real failures abort.
+        if stderr.contains("already exists") {
+            return Ok(());
+        }
+        bail!("createdb failed: {stderr}");
     }
     Ok(())
 }
