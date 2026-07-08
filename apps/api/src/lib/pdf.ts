@@ -1,6 +1,7 @@
 import { format } from "date-fns";
 import { asc, eq } from "drizzle-orm";
 import puppeteer, { type Browser, type PaperFormat } from "puppeteer";
+import { env } from "../config/env.js";
 import { db } from "../db/client.js";
 import type { InvoiceLineItem, Invoice, Payment } from "../db/schema/invoices.js";
 import { payments } from "../db/schema/invoices.js";
@@ -175,6 +176,38 @@ function layoutFromSettings(s: Settings): DocLayout {
     logoUrl: s.hotelLogoUrl ?? null,
     currency: s.currencySymbol,
   };
+}
+
+// Puppeteer wait strategy. Online, `networkidle0` lets the remote logo finish
+// loading. Offline, there is no reachable remote — we inline the logo as a
+// data: URI first (see inlineLogo) and then wait only for `load`, so a PDF
+// never stalls for the full timeout waiting on a dead network request.
+const PAGE_WAIT_UNTIL: "networkidle0" | "load" = env.OFFLINE_MODE ? "load" : "networkidle0";
+
+// Fetch a logo URL and return a `data:` URI so it renders with no network.
+// ONLY used offline — online keeps the original URL and lets the hardened
+// Chromium page (hardenPage: https/data-only, aborted otherwise, bounded by
+// setContent's 15s) fetch it, so we don't introduce an unbounded server-side
+// fetch / SSRF on the online render path. Returns the original URL on any
+// failure so rendering degrades gracefully rather than dropping the logo.
+async function inlineLogo(logoUrl: string | null): Promise<string | null> {
+  if (!logoUrl) return null;
+  if (logoUrl.startsWith("data:")) return logoUrl;
+  // Online: never fetch server-side — the hardened Chromium page handles it.
+  if (!env.OFFLINE_MODE) return logoUrl;
+  // Offline: only https/http are sensible; a 5s cap keeps a slow/hung host
+  // from stalling the shared Puppeteer thread.
+  try {
+    const scheme = new URL(logoUrl).protocol;
+    if (scheme !== "https:" && scheme !== "http:") return logoUrl;
+    const resp = await fetch(logoUrl, { signal: AbortSignal.timeout(5000) });
+    if (!resp.ok) return logoUrl;
+    const contentType = resp.headers.get("content-type") ?? "image/png";
+    const buf = Buffer.from(await resp.arrayBuffer());
+    return `data:${contentType};base64,${buf.toString("base64")}`;
+  } catch {
+    return logoUrl;
+  }
 }
 
 function commonStyles(L: DocLayout) {
@@ -987,8 +1020,15 @@ export async function renderInvoicePdf(data: {
   const page = await browser.newPage();
   try {
     await hardenPage(page);
-    const html = renderInvoiceHtml(data);
-    await page.setContent(html, { waitUntil: "networkidle0", timeout: 15_000 });
+    // Inline the logo as a data: URI so the doc renders with no network wait
+    // (essential offline; harmless online).
+    const inlinedLogo = await inlineLogo(data.settings.hotelLogoUrl ?? null);
+    const dataWithLogo = {
+      ...data,
+      settings: { ...data.settings, hotelLogoUrl: inlinedLogo },
+    };
+    const html = renderInvoiceHtml(dataWithLogo);
+    await page.setContent(html, { waitUntil: PAGE_WAIT_UNTIL, timeout: 15_000 });
     const pdf = await page.pdf({
       format: asPaper(data.settings.docInvoicePageSize),
       printBackground: true,
@@ -1489,13 +1529,15 @@ export async function renderReceiptPdf(data: {
   const page = await browser.newPage();
   try {
     await hardenPage(page);
+    const inlinedLogo = await inlineLogo(data.settings.hotelLogoUrl ?? null);
     const html = renderReceiptHtml({
       ...data,
+      settings: { ...data.settings, hotelLogoUrl: inlinedLogo },
       rooms: roomsForRender,
       allPayments,
       coGuests: coGuestRows,
     });
-    await page.setContent(html, { waitUntil: "networkidle0", timeout: 15_000 });
+    await page.setContent(html, { waitUntil: PAGE_WAIT_UNTIL, timeout: 15_000 });
     const pdf = await page.pdf({
       format: asPaper(data.settings.docReceiptPageSize),
       printBackground: true,

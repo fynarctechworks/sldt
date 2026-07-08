@@ -1,6 +1,12 @@
 import { randomBytes } from "node:crypto";
 import sharp from "sharp";
+import { env } from "../config/env.js";
 import { logger } from "./logger.js";
+import {
+  localDelete,
+  localPut,
+  localSignedUrl,
+} from "./localStorage.js";
 import { supabaseAdmin } from "./supabase.js";
 
 const BUCKET = "kyc-docs";
@@ -121,6 +127,10 @@ export async function uploadKycPhoto(
   // signed-URL leak doesn't help an attacker enumerate other KYC files.
   const token = randomBytes(16).toString("hex");
   const path = `${guestId}/${side}-${token}.jpg`;
+  if (env.OFFLINE_MODE) {
+    localPut(BUCKET, path, safe.buffer);
+    return path;
+  }
   const { error } = await supabaseAdmin.storage
     .from(BUCKET)
     .upload(path, safe.buffer, {
@@ -136,6 +146,7 @@ export async function uploadKycPhoto(
 
 export async function signedKycUrl(path: string, expiresInSeconds = 300): Promise<string | null> {
   if (!path) return null;
+  if (env.OFFLINE_MODE) return localSignedUrl(BUCKET, path, expiresInSeconds);
   const { data, error } = await supabaseAdmin.storage
     .from(BUCKET)
     .createSignedUrl(path, expiresInSeconds);
@@ -145,6 +156,10 @@ export async function signedKycUrl(path: string, expiresInSeconds = 300): Promis
 
 export async function deleteKycFile(path: string): Promise<void> {
   if (!path) return;
+  if (env.OFFLINE_MODE) {
+    localDelete(BUCKET, path);
+    return;
+  }
   await supabaseAdmin.storage.from(BUCKET).remove([path]);
 }
 
@@ -204,7 +219,7 @@ export async function uploadExpenseAttachment(
   expenseId: string,
   file: { buffer: Buffer; mimetype: string; originalName?: string },
 ): Promise<string> {
-  await ensureExpenseBucket();
+  if (!env.OFFLINE_MODE) await ensureExpenseBucket();
   // Random suffix so even a leaked storage listing doesn't enumerate
   // bills by predictable filename. Extension comes from the mimetype
   // (not the original name) so a renamed `bill.pdf.exe` can't sneak
@@ -219,6 +234,10 @@ export async function uploadExpenseAttachment(
           : "jpg";
   const token = randomBytes(16).toString("hex");
   const path = `${expenseId}/bill-${token}.${ext}`;
+  if (env.OFFLINE_MODE) {
+    localPut(EXPENSE_BUCKET, path, file.buffer);
+    return path;
+  }
   const { error } = await supabaseAdmin.storage
     .from(EXPENSE_BUCKET)
     .upload(path, file.buffer, {
@@ -236,6 +255,7 @@ export async function signedExpenseAttachmentUrl(
   expiresInSeconds = 300,
 ): Promise<string | null> {
   if (!path) return null;
+  if (env.OFFLINE_MODE) return localSignedUrl(EXPENSE_BUCKET, path, expiresInSeconds);
   const { data, error } = await supabaseAdmin.storage
     .from(EXPENSE_BUCKET)
     .createSignedUrl(path, expiresInSeconds);
@@ -245,6 +265,10 @@ export async function signedExpenseAttachmentUrl(
 
 export async function deleteExpenseAttachment(path: string): Promise<void> {
   if (!path) return;
+  if (env.OFFLINE_MODE) {
+    localDelete(EXPENSE_BUCKET, path);
+    return;
+  }
   await supabaseAdmin.storage.from(EXPENSE_BUCKET).remove([path]);
 }
 
@@ -299,8 +323,16 @@ export async function uploadPublicFile(
   contentType: string,
 ): Promise<string | null> {
   try {
-    await ensureDocsBucket();
     const obfuscatedPath = withRandomSuffix(pathInBucket);
+    if (env.OFFLINE_MODE) {
+      // No public CDN offline. Store locally and return a signed local URL
+      // valid long enough for the WhatsApp drainer to fetch + re-host when it
+      // reconnects (the VPS proxy generates the real public URL at drain time
+      // — see Task 7). For on-desk viewing this URL works immediately.
+      localPut(DOCS_BUCKET, obfuscatedPath, body);
+      return localSignedUrl(DOCS_BUCKET, obfuscatedPath, 7 * 24 * 60 * 60);
+    }
+    await ensureDocsBucket();
     const { error } = await supabaseAdmin.storage
       .from(DOCS_BUCKET)
       .upload(obfuscatedPath, body, { contentType, upsert: true });

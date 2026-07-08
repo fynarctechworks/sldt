@@ -203,17 +203,31 @@ async function sendWhatsAppLive(msg: SmsMessage): Promise<SendResult> {
 export const messaging = {
   // Sends via Twilio WhatsApp Business API (or stub in dev mode).
   // Kept the name `sendSms` for backwards-compat with existing call sites.
-  sendSms(msg: SmsMessage): Promise<SendResult> {
+  async sendSms(msg: SmsMessage): Promise<SendResult> {
+    if (env.OFFLINE_MODE) {
+      // No internet in the hot path: enqueue and return success. The drainer
+      // delivers when the desk reconnects. Dynamic import avoids a cycle
+      // (outbox → messaging types).
+      const { enqueueMessage } = await import("./outbox.js");
+      await enqueueMessage("sms", msg.to, msg);
+      return { ok: true, provider: "outbox", id: "queued" };
+    }
     return env.NOTIFICATIONS_PROVIDER === "live" ? sendWhatsAppLive(msg) : sendWhatsAppStub(msg);
   },
   // Email channel — uses Resend when configured, stub otherwise. The
   // switch is purely env-driven: presence of RESEND_API_KEY + RESEND_FROM
   // turns the channel on; absence keeps it disabled.
-  sendEmail(msg: EmailMessage): Promise<SendResult> {
+  async sendEmail(msg: EmailMessage): Promise<SendResult> {
+    if (env.OFFLINE_MODE) {
+      const { enqueueMessage } = await import("./outbox.js");
+      await enqueueMessage("email", msg.to, msg);
+      return { ok: true, provider: "outbox", id: "queued" };
+    }
     if (env.RESEND_API_KEY && env.RESEND_FROM) return sendEmailResend(msg);
     return sendEmailStub(msg);
   },
   isEmailConfigured(): boolean {
-    return !!(env.RESEND_API_KEY && env.RESEND_FROM);
+    // Offline: email is "configured" in the sense that it queues and will send.
+    return env.OFFLINE_MODE || !!(env.RESEND_API_KEY && env.RESEND_FROM);
   },
 };

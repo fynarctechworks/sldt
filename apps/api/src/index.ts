@@ -15,6 +15,8 @@ import activityRoutes from "./routes/activity.js";
 import amenitiesRoutes from "./routes/amenities.js";
 import auditRoutes from "./routes/audit.js";
 import authRoutes from "./routes/auth.js";
+import authLocalRoutes from "./routes/authLocal.js";
+import localFilesRoutes from "./routes/localFiles.js";
 import calendarRoutes from "./routes/calendar.js";
 import creditsRoutes from "./routes/credits.js";
 import dashboardRoutes from "./routes/dashboard.js";
@@ -38,7 +40,11 @@ import { settingsRouter, staffRouter } from "./routes/settings.js";
 
 const app = express();
 
-app.set("trust proxy", 1);
+// Trust the first proxy hop ONLY online (behind nginx/Vercel). Offline the app
+// is a loopback sidecar with no proxy, so trusting XFF would let a loopback
+// caller spoof req.ip and dodge the IP rate-limiter. (The per-account lockout
+// still holds either way, so this isn't a login bypass — defense in depth.)
+app.set("trust proxy", env.OFFLINE_MODE ? false : 1);
 app.set("etag", false);
 
 // Explicit security headers. We extend Helmet's defaults rather than relying
@@ -124,7 +130,25 @@ app.get("/health", (_req, res) => res.json({ status: "ok", time: new Date().toIS
 const v1 = express.Router();
 
 v1.use("/auth/login", loginLimiter);
-v1.use("/auth", authRoutes);
+if (env.OFFLINE_MODE) {
+  // Offline desk: local credential login/refresh REPLACES the cloud login.
+  // Mounted first so its /login and /refresh win over the cloud auth router.
+  v1.use("/auth", authLocalRoutes);
+  v1.use("/auth", authRoutes);
+} else {
+  // Online: cloud auth owns /login etc. authLocal is mounted AFTER so only its
+  // /provision-local (which cloud auth doesn't define) is reachable — letting a
+  // signed-in user set up their desk PIN before going offline.
+  v1.use("/auth", authRoutes);
+  v1.use("/auth", authLocalRoutes);
+}
+
+// Local file serving (offline mode only). Auth is by HMAC signature in the
+// URL, not a bearer token — so mount it BEFORE the auth rate limiter block and
+// leave it un-gated, exactly like a cloud signed URL.
+if (env.OFFLINE_MODE) {
+  v1.use("/local-files", localFilesRoutes);
+}
 
 v1.use((req, _res, next) => {
   if (["GET", "HEAD"].includes(req.method)) return readLimiter(req, _res, next);
@@ -166,6 +190,14 @@ app.use(errorHandler);
 startDashboardSubscriber().catch((err) =>
   logger.warn({ err }, "dashboard subscriber failed to start"),
 );
+
+// Offline desk: start the message-outbox drainer so queued WhatsApp/email
+// messages deliver whenever connectivity returns.
+if (env.OFFLINE_MODE) {
+  import("./lib/outbox.js")
+    .then(({ startOutboxDrainer }) => startOutboxDrainer())
+    .catch((err) => logger.warn({ err }, "outbox drainer failed to start"));
+}
 
 const server = app.listen(env.PORT, () => {
   logger.info(`HotelDesk API listening on http://localhost:${env.PORT}`);

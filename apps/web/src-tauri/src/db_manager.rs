@@ -1,0 +1,345 @@
+//! Embedded PostgreSQL lifecycle for the offline-first desktop app.
+//!
+//! Responsibilities (all validated by the Task-1 spike before this was written):
+//!   1. Locate the portable PostgreSQL 16 binaries (bundled resource in
+//!      release; a dev fallback path in debug).
+//!   2. First run: `initdb` a fresh cluster under %LOCALAPPDATA%\SLDT\pgdata
+//!      with scram-sha-256 auth and a random superuser password; write a
+//!      loopback-only postgresql.conf on port 5433 with synchronous_commit on.
+//!   3. Every run: `pg_ctl start` (self-heals a stale postmaster.pid + replays
+//!      WAL after a power loss — proven in the spike), then poll pg_isready.
+//!   4. Ensure the app database exists.
+//!   5. On shutdown: `pg_ctl stop -m fast` for a clean checkpoint.
+//!
+//! Schema creation (drizzle push + migrate) is NOT done here — it runs inside
+//! the api.exe sidecar which owns the Drizzle toolchain. This module only
+//! guarantees a running, reachable cluster with the database present.
+//!
+//! The superuser password and the derived DATABASE_URL never touch argv or an
+//! inheritable env: they are returned to the caller (lib.rs), which hands them
+//! to the sidecar over a stdin handshake.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+use anyhow::{bail, Context, Result};
+use rand::Rng;
+
+/// Loopback address + port the embedded cluster listens on. 5433 avoids
+/// colliding with a system Postgres on 5432 or the Supabase-CLI dev stack.
+pub const PG_HOST: &str = "127.0.0.1";
+pub const PG_PORT: u16 = 5433;
+pub const PG_SUPERUSER: &str = "hoteldesk";
+pub const APP_DB: &str = "hoteldesk";
+
+/// Everything the sidecar needs to connect, produced by `start()`.
+pub struct DbHandle {
+    pub data_dir: PathBuf,
+    pub bin_dir: PathBuf,
+    /// postgresql://hoteldesk:<pw>@127.0.0.1:5433/hoteldesk
+    pub database_url: String,
+    /// True when this launch just created the cluster — the caller uses this
+    /// to decide whether the sidecar must run the first-time schema build
+    /// (drizzle push + migrate) vs. only pending migrations.
+    pub fresh: bool,
+}
+
+/// Root data directory: %LOCALAPPDATA%\SLDT on Windows, ~/.local/share/SLDT
+/// elsewhere (dev on non-Windows). Created if missing.
+pub fn app_root() -> Result<PathBuf> {
+    let base = dirs_local_data().context("could not resolve a local data dir")?;
+    let root = base.join("SLDT");
+    fs::create_dir_all(&root).with_context(|| format!("create {}", root.display()))?;
+    Ok(root)
+}
+
+#[cfg(windows)]
+fn dirs_local_data() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+}
+
+#[cfg(not(windows))]
+fn dirs_local_data() -> Option<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+}
+
+/// Resolve the directory holding initdb/pg_ctl/postgres/pg_isready.
+///
+/// Release: the binaries are bundled as a Tauri resource under
+/// `<resource_dir>/pgsql/bin`. Debug: fall back to the developer's EDB
+/// binaries-only install (the same one the spike used), overridable via
+/// SLDT_PG_BIN for CI.
+fn resolve_bin_dir(resource_dir: Option<&Path>) -> Result<PathBuf> {
+    if let Some(env_dir) = std::env::var_os("SLDT_PG_BIN") {
+        let p = PathBuf::from(env_dir);
+        if p.join(exe("postgres")).exists() {
+            return Ok(p);
+        }
+    }
+    if let Some(res) = resource_dir {
+        let bundled = res.join("pgsql").join("bin");
+        if bundled.join(exe("postgres")).exists() {
+            return Ok(bundled);
+        }
+    }
+    // Dev fallback: the EDB portable install used during the spike.
+    if let Some(local) = dirs_local_data() {
+        // %LOCALAPPDATA% on Windows already points at ...\Local; the EDB layout
+        // is ...\Local\PostgreSQL\pgsql\bin.
+        let dev = local.join("PostgreSQL").join("pgsql").join("bin");
+        if dev.join(exe("postgres")).exists() {
+            return Ok(dev);
+        }
+    }
+    bail!("could not locate PostgreSQL binaries (set SLDT_PG_BIN or bundle pgsql/bin)")
+}
+
+#[cfg(windows)]
+fn exe(name: &str) -> String {
+    format!("{name}.exe")
+}
+#[cfg(not(windows))]
+fn exe(name: &str) -> String {
+    name.to_string()
+}
+
+fn tool(bin_dir: &Path, name: &str) -> PathBuf {
+    bin_dir.join(exe(name))
+}
+
+/// Start (and first-run-initialize) the embedded cluster. Returns a handle
+/// with the connection URL and whether the cluster was freshly created.
+pub fn start(resource_dir: Option<&Path>) -> Result<DbHandle> {
+    let root = app_root()?;
+    let data_dir = root.join("pgdata");
+    let secrets_dir = root.join("secrets");
+    fs::create_dir_all(&secrets_dir).ok();
+    let bin_dir = resolve_bin_dir(resource_dir)?;
+
+    let pw_file = secrets_dir.join("pg_superuser");
+    let is_fresh = !data_dir.join("PG_VERSION").exists();
+
+    if is_fresh {
+        log::info!("no cluster found — running initdb at {}", data_dir.display());
+        let password = generate_password();
+        // Persist the superuser password so restarts reuse the cluster. It
+        // lives under %LOCALAPPDATA%\SLDT\secrets, readable by the desk user
+        // only via NTFS defaults (this is a single-user desk box; tighten with
+        // icacls if the machine is shared). PGPASSWORD is passed to child psql
+        // processes below — acceptable here since they're same-user loopback
+        // and the alternative (a .pgpass file) has the same at-rest exposure.
+        fs::write(&pw_file, &password).context("write superuser password file")?;
+        run_initdb(&bin_dir, &data_dir, &pw_file)?;
+        write_conf(&data_dir)?;
+    } else {
+        log::info!("existing cluster found at {}", data_dir.display());
+    }
+
+    // A stale postmaster.pid from a power loss is safe: pg_ctl start replays
+    // WAL and clears it (proven in the spike). We do not delete it ourselves —
+    // that would risk clobbering a genuinely running instance.
+    start_cluster(&bin_dir, &data_dir)?;
+
+    // From here Postgres is RUNNING. If any subsequent step fails we must stop
+    // it before returning Err — otherwise the cluster is left live, and the
+    // next launch's pg_ctl start would bail on the running postmaster,
+    // bricking startup. Do the fallible work in a closure and stop-on-error.
+    let finish = || -> Result<String> {
+        wait_ready(&bin_dir, Duration::from_secs(30))?;
+        let password = fs::read_to_string(&pw_file)
+            .context("read superuser password")?
+            .trim()
+            .to_string();
+        ensure_database(&bin_dir, &password)?;
+        Ok(password)
+    };
+
+    let password = match finish() {
+        Ok(pw) => pw,
+        Err(e) => {
+            log::error!("post-start step failed, stopping cluster: {e:#}");
+            let _ = stop_cluster(&bin_dir, &data_dir);
+            return Err(e);
+        }
+    };
+
+    let database_url = format!(
+        "postgresql://{user}:{pw}@{host}:{port}/{db}",
+        user = PG_SUPERUSER,
+        pw = urlencode(&password),
+        host = PG_HOST,
+        port = PG_PORT,
+        db = APP_DB,
+    );
+
+    Ok(DbHandle {
+        data_dir,
+        bin_dir,
+        database_url,
+        fresh: is_fresh,
+    })
+}
+
+/// Stop a cluster by data dir (used by the error-recovery path in start()).
+fn stop_cluster(bin_dir: &Path, data_dir: &Path) -> Result<()> {
+    let status = Command::new(tool(bin_dir, "pg_ctl"))
+        .arg("-D")
+        .arg(data_dir)
+        .arg("stop")
+        .args(["-m", "fast"])
+        .status()
+        .context("spawn pg_ctl stop (recovery)")?;
+    if !status.success() {
+        log::warn!("pg_ctl stop (recovery) exited with {status}");
+    }
+    Ok(())
+}
+
+/// Clean shutdown. `fast` mode rolls back in-flight txns and checkpoints, so
+/// the next start needs no WAL replay. Safe to call if already stopped.
+pub fn stop(handle: &DbHandle) -> Result<()> {
+    let status = Command::new(tool(&handle.bin_dir, "pg_ctl"))
+        .arg("-D")
+        .arg(&handle.data_dir)
+        .arg("stop")
+        .args(["-m", "fast"])
+        .status()
+        .context("spawn pg_ctl stop")?;
+    if !status.success() {
+        log::warn!("pg_ctl stop exited with {status} (may already be stopped)");
+    }
+    Ok(())
+}
+
+fn run_initdb(bin_dir: &Path, data_dir: &Path, pw_file: &Path) -> Result<()> {
+    let out = Command::new(tool(bin_dir, "initdb"))
+        .arg("-D")
+        .arg(data_dir)
+        .args(["-U", PG_SUPERUSER])
+        .args(["--auth", "scram-sha-256"])
+        .arg("--pwfile")
+        .arg(pw_file)
+        .args(["-E", "UTF8"])
+        .output()
+        .context("spawn initdb")?;
+    if !out.status.success() {
+        bail!(
+            "initdb failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// Append the SLDT-specific settings the spike validated: loopback-only,
+/// port 5433, durable commits. Idempotent enough for first run (only called
+/// when the cluster is fresh).
+fn write_conf(data_dir: &Path) -> Result<()> {
+    let conf = data_dir.join("postgresql.conf");
+    let mut body = fs::read_to_string(&conf).unwrap_or_default();
+    body.push_str(
+        "\n# --- SLDT embedded config ---\n\
+         listen_addresses = '127.0.0.1'\n\
+         port = 5433\n\
+         synchronous_commit = on\n",
+    );
+    fs::write(&conf, body).context("write postgresql.conf")?;
+    Ok(())
+}
+
+fn start_cluster(bin_dir: &Path, data_dir: &Path) -> Result<()> {
+    let log_file = data_dir.join("startup.log");
+    // No -w: pg_ctl on Windows can block the parent waiting on a console
+    // handle (this bit us in the spike). We start detached and poll
+    // pg_isready ourselves for a deterministic readiness gate.
+    let status = Command::new(tool(bin_dir, "pg_ctl"))
+        .arg("-D")
+        .arg(data_dir)
+        .arg("-l")
+        .arg(&log_file)
+        .arg("start")
+        .status()
+        .context("spawn pg_ctl start")?;
+    if !status.success() {
+        bail!("pg_ctl start exited with {status}");
+    }
+    Ok(())
+}
+
+fn wait_ready(bin_dir: &Path, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let ok = Command::new(tool(bin_dir, "pg_isready"))
+            .args(["-h", PG_HOST])
+            .args(["-p", &PG_PORT.to_string()])
+            .arg("-q")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("cluster did not become ready within {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// Create the app database if it doesn't exist. `createdb` errors when the DB
+/// already exists, so we check first via psql.
+fn ensure_database(bin_dir: &Path, password: &str) -> Result<()> {
+    // APP_DB is a compile-time const so this can't actually be injected, but
+    // bind it as a psql variable rather than interpolating into SQL — correct
+    // by construction and robust if APP_DB ever becomes dynamic.
+    let exists = Command::new(tool(bin_dir, "psql"))
+        .env("PGPASSWORD", password)
+        .args(["-h", PG_HOST])
+        .args(["-p", &PG_PORT.to_string()])
+        .args(["-U", PG_SUPERUSER])
+        .args(["-d", "postgres"])
+        .args(["-v", &format!("db={APP_DB}")])
+        .args(["-tAc", "select 1 from pg_database where datname = :'db'"])
+        .output()
+        .context("spawn psql (db check)")?;
+    if String::from_utf8_lossy(&exists.stdout).trim() == "1" {
+        return Ok(());
+    }
+    let out = Command::new(tool(bin_dir, "createdb"))
+        .env("PGPASSWORD", password)
+        .args(["-h", PG_HOST])
+        .args(["-p", &PG_PORT.to_string()])
+        .args(["-U", PG_SUPERUSER])
+        .arg(APP_DB)
+        .output()
+        .context("spawn createdb")?;
+    if !out.status.success() {
+        bail!("createdb failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    Ok(())
+}
+
+fn generate_password() -> String {
+    let mut rng = rand::thread_rng();
+    // 32 hex chars of entropy; no shell-special or URL-special chars so it is
+    // safe in DATABASE_URL and PGPASSWORD.
+    (0..32)
+        .map(|_| format!("{:x}", rng.gen_range(0..16u8)))
+        .collect()
+}
+
+/// Minimal percent-encoding for the password in DATABASE_URL. Our generated
+/// password is hex-only so this is belt-and-suspenders, but keep it correct in
+/// case the generator changes.
+fn urlencode(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+            _ => format!("%{:02X}", c as u8),
+        })
+        .collect()
+}
